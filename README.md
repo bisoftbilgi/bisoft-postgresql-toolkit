@@ -1,5 +1,5 @@
 
-# Advanced Password Policy Extension for PostgreSQL (`password_check`)
+# Advanced Password Policy Extension for PostgreSQL (`password_profile`)
 
 This PostgreSQL extension provides enterprise-grade password security by enforcing customizable and robust password policies. It significantly enhances the default authentication mechanism, helping administrators comply with strict security standards.
 
