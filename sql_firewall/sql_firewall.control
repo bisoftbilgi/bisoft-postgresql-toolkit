@@ -1,0 +1,5 @@
+# sql_firewall extension control file
+comment = 'Provides a multi-layer SQL Firewall for PostgreSQL'
+default_version = '0.1.0'
+module_pathname = '$libdir/sql_firewall'
+relocatable = true
