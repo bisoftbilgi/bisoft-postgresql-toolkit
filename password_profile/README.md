@@ -163,15 +163,3 @@ INSERT INTO password_profile.blacklist (word) VALUES
    sudo make uninstall
    ```
 
----
-
-## 📜 License
-
-This project is licensed under the PostgreSQL License.
-
----
-
-## 📬 Contact
-
-For issues, improvements, or contributions, please submit a GitHub issue or pull request.
-
