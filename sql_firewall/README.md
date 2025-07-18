@@ -1,3 +1,4 @@
+
 # SQL Firewall for PostgreSQL
 
 `sql_firewall` is an extension for PostgreSQL that provides multi-layered protection against SQL injection, unauthorized data access, and misuse of database services.
@@ -51,8 +52,33 @@ make
 sudo make install
 ```
 
-### Activate the Extension:
-Connect to the target database using `psql` or any database client and run:
+---
+
+## 🔧 PostgreSQL Configuration (IMPORTANT)
+
+Before using the extension, it must be preloaded via `postgresql.conf`:
+
+```ini
+# postgresql.conf
+
+# If empty:
+shared_preload_libraries = 'sql_firewall'
+
+# If other extensions exist:
+# shared_preload_libraries = 'pg_stat_statements,sql_firewall'
+```
+
+Then restart PostgreSQL:
+
+```bash
+sudo systemctl restart postgresql-16
+```
+
+---
+
+## 🧩 Activate the Extension
+
+After restarting the server, connect to the target database and run:
 
 ```sql
 CREATE EXTENSION sql_firewall;
@@ -62,9 +88,7 @@ This will create the required tables: `sql_firewall_rules`, `sql_firewall_activi
 
 ---
 
-## 🛠 Configuration
-
-`sql_firewall` provides several GUC parameters configurable via `postgresql.conf` or `ALTER SYSTEM`.
+## 🛠 Configuration Parameters
 
 | Parameter | Description | Default |
 |----------|-------------|---------|
@@ -87,10 +111,7 @@ This will create the required tables: `sql_firewall_rules`, `sql_firewall_activi
 
 ### Example:
 ```sql
--- Set mode to 'enforce'
 ALTER SYSTEM SET sql_firewall.mode = 'enforce';
-
--- Reload configuration
 SELECT pg_reload_conf();
 ```
 
@@ -99,7 +120,7 @@ SELECT pg_reload_conf();
 ## 🚦 Usage
 
 ### 1. Learn Mode
-When installed, the firewall defaults to `learn` mode. All unseen queries are saved in `sql_firewall_rules` with `is_approved = false`. This helps collect query fingerprints used during normal operation.
+When installed, the firewall defaults to `learn` mode. All unseen queries are saved in `sql_firewall_rules` with `is_approved = false`.
 
 ### 2. Approving Rules
 After a learning period, the DBA should review and approve safe query patterns.
@@ -118,21 +139,18 @@ WHERE role_name = 'app_user';
 ```
 
 ### 3. Enforce Mode
-Once rules are approved, switch to `enforce` mode.
-
 ```sql
 ALTER SYSTEM SET sql_firewall.mode = 'enforce';
 SELECT pg_reload_conf();
 ```
 
-Only queries marked `is_approved = true` will be executed. Others will be blocked and logged.
+Only queries marked `is_approved = true` will be executed.
 
 ---
 
 ## 🗃️ Database Tables
 
 ### `sql_firewall_rules`
-Stores learned and approved query rules.
 
 - `rule_id`: Unique rule ID
 - `role_name`: Role executing the query
@@ -143,7 +161,6 @@ Stores learned and approved query rules.
 - `created_at`: Timestamp of rule creation
 
 ### `sql_firewall_activity_log`
-Stores all firewall events.
 
 - `log_id`: Unique log ID
 - `log_time`: Timestamp
@@ -153,7 +170,4 @@ Stores all firewall events.
 - `reason`: Explanation (e.g., “Rule not approved”, “Blacklisted keyword”)
 - `query_text`: Full SQL query
 - `command_type`: Type of command
-
----
-
 
