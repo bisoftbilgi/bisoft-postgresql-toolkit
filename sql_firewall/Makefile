@@ -1,13 +1,13 @@
-# Makefile
+# Extension name
+EXTENSION = sql_firewall
 
-# Name of the module to be built (the shared library name)
+# SQL file to be installed with the extension
+DATA = sql_firewall--1.0.sql
+
+# Shared library to be built from the C source file
 MODULES = sql_firewall
 
-# Files associated with the extension
-EXTENSION = sql_firewall
-DATA = sql_firewall--0.1.0.sql
-
-# Include the PostgreSQL build infrastructure (PGXS)
-PG_CONFIG = pg_config
+# PostgreSQL build infrastructure
+PG_CONFIG = /usr/pgsql-16/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)

@@ -30,11 +30,12 @@ PG_MODULE_MAGIC;
 void _PG_init(void);
 void _PG_fini(void);
 
-// Pointers to save the previous hook functions
+// Pointers to save the previous hook functions, allowing us to chain calls.
 static ExecutorStart_hook_type prev_executor_start_hook = NULL;
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
 
 // --- Global Configuration Variables (GUCs) ---
+// These variables are set by PostgreSQL based on postgresql.conf settings.
 
 // Firewall operational mode (learn, permissive, enforce)
 static int sql_firewall_mode;
@@ -56,6 +57,8 @@ static bool enable_rate_limiting;
 static int rate_limit_count;
 // Time window in seconds for the general rate limit
 static int rate_limit_seconds;
+// Flag to enable or disable regex-based scanning
+static bool enable_regex_scan;
 
 // Per-command rate limit counts
 static int select_limit_count;
@@ -77,7 +80,7 @@ typedef enum {
     SQL_FIREWALL_MODE_ENFORCE     // Block unknown or unapproved queries
 } SqlFirewallMode;
 
-// Options for the sql_firewall.mode GUC
+// Options for the sql_firewall.mode GUC, displayed in pg_settings
 static const struct config_enum_entry mode_options[] = {
     {"learn", SQL_FIREWALL_MODE_LEARN, false},
     {"permissive", SQL_FIREWALL_MODE_PERMISSIVE, false},
@@ -129,6 +132,7 @@ static const char* contains_blacklisted_keyword(const char *query_string)
         end = token + strlen(token) - 1;
         while (end > token && isspace((unsigned char)*end)) *end-- = '\0';
 
+        // If the keyword is found in the query, return it
         if (strstr(copy, token))
         {
             strncpy(found, token, sizeof(found)-1);
@@ -145,8 +149,6 @@ static const char* contains_blacklisted_keyword(const char *query_string)
 
 /**
  * @brief Checks if the current time is within the configured quiet hours.
- * This function uses SPI to get the current time from the database.
- * It correctly handles time ranges that span across midnight.
  * @return True if it's currently quiet hours, false otherwise.
  */
 static bool is_in_quiet_hours(void)
@@ -165,7 +167,7 @@ static bool is_in_quiet_hours(void)
         if (SPI_connect() == SPI_OK_CONNECT)
         {
             spi_started = true;
-            // Get current time as 'HH24:MI'
+            // Get current time from the database as 'HH24:MI'
             if (SPI_execute("SELECT to_char(now(), 'HH24:MI')", true, 0) == SPI_OK_SELECT && SPI_processed > 0)
             {
                 time_str = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
@@ -180,7 +182,7 @@ static bool is_in_quiet_hours(void)
                     start = sh * 60 + sm;
                     end = eh * 60 + em;
                     
-                    // Handle overnight ranges (e.g., 22:00 to 06:00)
+                    // Handle overnight ranges (e.g., 22:00 to 06:00) where end time is earlier than start time
                     result = (start < end) ? (curr >= start && curr < end) : (curr >= start || curr < end);
                 }
             }
@@ -219,7 +221,7 @@ static const char* is_application_blocked(const char* current_app_name)
 
     while (token)
     {
-        // Trim whitespace
+        // Trim whitespace from the token
         while (isspace((unsigned char)*token)) token++;
         end = token + strlen(token) - 1;
         while (end > token && isspace((unsigned char)*end)) *end-- = '\0';
@@ -255,7 +257,6 @@ static int get_command_limit(const char *cmd)
 
 /**
  * @brief Logs firewall activity to the sql_firewall_activity_log table.
- * Uses SPI to perform the database insert.
  * @param role The user role performing the action.
  * @param action The action taken by the firewall (e.g., "ALLOWED", "BLOCKED", "LEARNED").
  * @param reason The reason for the action.
@@ -275,7 +276,7 @@ static void log_firewall_action(const char *role, const char *action, const char
         if (SPI_connect() == SPI_OK_CONNECT)
         {
             spi_is_inside = true;
-            // Get the current database name
+            // Get the current database name for logging
             if (SPI_execute("SELECT current_database()", true, 1) == SPI_OK_SELECT && SPI_processed > 0)
                 db_name = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 
@@ -289,7 +290,7 @@ static void log_firewall_action(const char *role, const char *action, const char
 
             if (!reason) nulls[3] = 'n'; // Mark reason as NULL if not provided
 
-            // Insert the log record
+            // Insert the log record using a parameterized query to prevent SQL injection
             SPI_execute_with_args("INSERT INTO sql_firewall_activity_log (role_name, database_name, action, reason, query_text, command_type) VALUES ($1, $2, $3, $4, $5, $6)",
                                   6, types, vals, nulls, false, 0);
             SPI_finish();
@@ -305,15 +306,95 @@ static void log_firewall_action(const char *role, const char *action, const char
     PG_END_TRY();
 }
 
+
 /**
- * @brief The main firewall logic function. It is called for every query.
- * It performs a series of checks: superuser, application name, rate limits,
- * quiet hours, keywords, and finally the ruleset.
+ * @brief Checks the incoming query against regex rules from the database.
+ * @param query_string The SQL query string to check.
+ * @return True if the query matches a blocking rule, false otherwise.
+ */
+static bool query_matches_regex_block_rule(const char *query_string)
+{
+    bool match_found = false;
+    char *sql_get_patterns;
+    bool spi_started = false;
+    int ret;
+    int i;
+
+    // Don't check if the feature is disabled via GUC
+    if (!enable_regex_scan)
+        return false;
+
+    PG_TRY();
+    {
+        if (SPI_connect() != SPI_OK_CONNECT)
+            elog(ERROR, "SPI_connect failed in regex check");
+
+        spi_started = true;
+
+        // Fetch only active rules with the 'BLOCK' action
+        sql_get_patterns = "SELECT pattern FROM sql_firewall_regex_rules WHERE is_active = true AND action = 'BLOCK'";
+
+        ret = SPI_execute(sql_get_patterns, true, 0);
+
+        if (ret != SPI_OK_SELECT)
+            elog(ERROR, "SPI_execute failed to get regex rules");
+
+        // Check the query against each rule
+        for (i = 0; i < SPI_processed; i++)
+        {
+            char *pattern;
+            Datum match_datum;
+            bool is_null;
+            char *check_sql;
+
+            // Get the pattern from the table tuple
+            pattern = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+
+            if (pattern)
+            {
+                // Safely check using PostgreSQL's case-insensitive regex operator (~*)
+                check_sql = psprintf("SELECT %s ~* %s", quote_literal_cstr(query_string), quote_literal_cstr(pattern));
+
+                ret = SPI_execute(check_sql, true, 1);
+                pfree(check_sql); // Free memory allocated by psprintf
+
+                if (ret == SPI_OK_SELECT && SPI_processed > 0)
+                {
+                    match_datum = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &is_null);
+                    if (!is_null && DatumGetBool(match_datum))
+                    {
+                        // Match found!
+                        match_found = true;
+                        pfree(pattern);
+                        break; // End the loop once a match is found
+                    }
+                }
+                pfree(pattern);
+            }
+        }
+
+        SPI_finish();
+    }
+    PG_CATCH();
+    {
+        if (spi_started)
+            SPI_finish();
+        FlushErrorState();
+        // In case of an error, returning false is the safest default.
+        return false;
+    }
+    PG_END_TRY();
+
+    return match_found;
+}
+
+/**
+ * @brief The main firewall logic function, called for every query.
+ * It performs a series of checks in a specific order.
  * @param query The SQL query string to be checked.
  */
 static void check_firewall(const char *query)
 {
-    // FIX: All variable declarations moved to the top of the function for C89 compliance.
     const char *cmd = "OTHER";
     List *tree = NULL;
     char *role = GetUserNameFromId(GetUserId(), false);
@@ -329,18 +410,28 @@ static void check_firewall(const char *query)
     const char *blocked_app = NULL;
     char *cmd_sql = NULL;
 
-    // Prevent re-entrant calls to avoid infinite loops
+    // Prevent re-entrant calls to avoid infinite loops (e.g., from our own logging queries).
     if (inside_firewall) return;
     inside_firewall = true;
 
-    // Superusers are always exempt from firewall checks
+    // RULE 0: Superusers are always exempt from firewall checks. This is a critical safety bypass.
     if (superuser())
     {
         inside_firewall = false;
         return;
     }
+
+    // RULE 1: Check for malicious patterns using regular expressions.
+    if (query_matches_regex_block_rule(query))
+    {
+        log_firewall_action(role, "BLOCKED", "Regex pattern match", query, "UNKNOWN");
+        inside_firewall = false; // Reset flag before erroring out
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("sql_firewall: Query blocked due to matching a security regex pattern.")));
+    }
     
-    // Parse the query to determine its type (SELECT, INSERT, etc.)
+    // Parse the query to determine its type (SELECT, INSERT, etc.) for logging and rule matching.
     tree = pg_parse_query(query);
     if (tree && list_length(tree) == 1)
     {
@@ -351,7 +442,7 @@ static void check_firewall(const char *query)
         else if (IsA(stmt->stmt, SelectStmt)) cmd = "SELECT";
     }
 
-    // 1. Check for blocked applications
+    // RULE 2: Check for blocked applications.
     if (enable_application_blocking)
     {
         current_app_name = GetConfigOptionByName("application_name", NULL, false);
@@ -366,7 +457,7 @@ static void check_firewall(const char *query)
         }
     }
 
-    // 2. Check for general rate limiting
+    // RULE 3: Check for general rate limiting.
     if (enable_rate_limiting)
     {
         char *ratelimit_sql;
@@ -396,7 +487,7 @@ static void check_firewall(const char *query)
         }
     }
 
-    // 3. Check for per-command rate limiting
+    // RULE 4: Check for per-command rate limiting.
     if (command_limit_seconds > 0)
     {
         int command_limit = get_command_limit(cmd);
@@ -406,7 +497,6 @@ static void check_firewall(const char *query)
         {
             if (SPI_connect() == SPI_OK_CONNECT)
             {
-                // FIX: cmd_sql is defined above, only assignment happens here
                 cmd_sql = psprintf(
                     "SELECT COUNT(*) FROM sql_firewall_activity_log "
                     "WHERE role_name = '%s' AND command_type = '%s' "
@@ -432,7 +522,7 @@ static void check_firewall(const char *query)
         }
     }
 
-    // 4. Check for quiet hours
+    // RULE 5: Check for quiet hours.
     if (is_in_quiet_hours())
     {
         log_firewall_action(role, "BLOCKED", "Quiet hours", query, cmd);
@@ -440,7 +530,7 @@ static void check_firewall(const char *query)
         ereport(ERROR, (errmsg("sql_firewall: Blocked during quiet hours")));
     }
     
-    // 5. Check for blacklisted keywords
+    // RULE 6: Check for blacklisted keywords.
     kw = contains_blacklisted_keyword(query);
     if (kw)
     {
@@ -449,7 +539,7 @@ static void check_firewall(const char *query)
         ereport(ERROR, (errmsg("sql_firewall: Blocked due to keyword '%s'", kw)));
     }
     
-    // 6. Check against the ruleset using the query hash
+    // RULE 7: Check against the hash-based ruleset.
     hash = hash_query(query);
     PG_TRY();
     {
@@ -462,7 +552,7 @@ static void check_firewall(const char *query)
             vals[0] = CStringGetDatum(role);
             vals[1] = CStringGetTextDatum(cmd);
             vals[2] = UInt64GetDatum(hash);
-            vals[3] = CStringGetDatum(db_name);
+            vals[3] = CStringGetDatum(db_name ? db_name : "unknown");
 
             // Check if a rule for this query hash already exists
             ret = SPI_execute_with_args(
@@ -471,11 +561,14 @@ static void check_firewall(const char *query)
 
             if (ret == SPI_OK_SELECT && SPI_processed > 0)
             {
+                bool is_null;
                 rule_exists = true;
-                rule_is_approved = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &rule_is_approved));
+                // Correctly get the boolean value, checking for nulls.
+                rule_is_approved = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &is_null));
+                if (is_null) rule_is_approved = false;
             }
 
-            // --- Firewall Logic ---
+            // --- Main Firewall Logic (Hash-based) ---
             if (rule_exists && rule_is_approved)
             {
                 // Case 1: Rule exists and is approved. Allow the query.
@@ -483,16 +576,21 @@ static void check_firewall(const char *query)
             }
             else if (!rule_exists && sql_firewall_mode == SQL_FIREWALL_MODE_LEARN)
             {
-                // Case 2: No rule exists and we are in LEARN mode. Add the rule and allow.
+                // Case 2: No rule exists and we are in LEARN mode. Add the new query as a rule and allow.
                 log_firewall_action(role, "LEARNED", "New rule", query, cmd);
                 SPI_execute_with_args(
                     "INSERT INTO sql_firewall_rules (role_name, command_type, query_fingerprint, database_name) "
                     "VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
                     4, types, vals, NULL, false, 0);
             }
-            else
+            else if (sql_firewall_mode == SQL_FIREWALL_MODE_PERMISSIVE)
             {
-                // Case 3: Block the query. This happens if:
+                 // Case 3: PERMISSIVE mode. Log the unapproved/unknown query but allow it.
+                log_firewall_action(role, "ALLOWED (PERMISSIVE)", rule_exists ? "Rule not approved" : "No rule found", query, cmd);
+            }
+            else // This defaults to ENFORCE mode
+            {
+                // Case 4: Block the query. This happens if:
                 // - The mode is ENFORCE and no rule is found.
                 // - A rule exists, but it is not approved (is_approved = false).
                 log_firewall_action(role, "BLOCKED", rule_exists ? "Rule not approved" : "No rule found", query, cmd);
@@ -513,7 +611,7 @@ static void check_firewall(const char *query)
     }
     PG_END_TRY();
 
-    // Reset re-entrancy flag before exiting
+    // Reset re-entrancy flag before exiting normally
     inside_firewall = false;
 }
 
@@ -524,6 +622,7 @@ static void check_firewall(const char *query)
  */
 static void sql_firewall_executor_start_hook(QueryDesc *queryDesc, int eflags)
 {
+    // Pass the query text to the main firewall logic
     check_firewall(queryDesc->sourceText);
 
     // Chain to the previous hook or standard executor start
@@ -543,6 +642,7 @@ static void sql_firewall_process_utility_hook(PlannedStmt *pstmt, const char *qu
                                               ParamListInfo params, QueryEnvironment *queryEnv,
                                               DestReceiver *dest, QueryCompletion *qc)
 {
+    // Pass the query text to the main firewall logic
     check_firewall(queryString);
     
     // Chain to the previous hook or standard utility processor
@@ -559,23 +659,31 @@ static void sql_firewall_process_utility_hook(PlannedStmt *pstmt, const char *qu
  */
 void _PG_init(void)
 {
-    // Define all custom configuration parameters (GUCs) for the firewall
-    DefineCustomEnumVariable("sql_firewall.mode", "Sets the firewall operation mode.", NULL, &sql_firewall_mode, SQL_FIREWALL_MODE_LEARN, mode_options, PGC_SUSET, 0, NULL, NULL, NULL);
-    DefineCustomBoolVariable("sql_firewall.enable_keyword_scan", "Enables scanning for blacklisted keywords.", NULL, &enable_keyword_scan, true, PGC_SUSET, 0, NULL, NULL, NULL);
-    DefineCustomStringVariable("sql_firewall.blacklisted_keywords", "Comma-separated list of keywords to block.", NULL, &blacklisted_keywords, "drop,truncate,delete", PGC_SUSET, 0, NULL, NULL, NULL);
+    // Register all custom configuration parameters (GUCs) for the firewall
+    DefineCustomEnumVariable("sql_firewall.mode", "Sets the firewall operation mode (learn, permissive, enforce).", NULL, &sql_firewall_mode, SQL_FIREWALL_MODE_LEARN, mode_options, PGC_SUSET, 0, NULL, NULL, NULL);
+    
+    DefineCustomBoolVariable("sql_firewall.enable_keyword_scan", "Enables scanning for blacklisted keywords.", NULL, &enable_keyword_scan, false, PGC_SUSET, 0, NULL, NULL, NULL);
+    DefineCustomStringVariable("sql_firewall.blacklisted_keywords", "Comma-separated list of keywords to block.", NULL, &blacklisted_keywords, "drop,truncate", PGC_SUSET, 0, NULL, NULL, NULL);
+    
     DefineCustomBoolVariable("sql_firewall.enable_quiet_hours", "Enables quiet hours during which queries are blocked.", NULL, &enable_quiet_hours, false, PGC_SUSET, 0, NULL, NULL, NULL);
     DefineCustomStringVariable("sql_firewall.quiet_hours_start", "Start time for quiet hours (HH:MM).", NULL, &quiet_hours_start, "22:00", PGC_SUSET, 0, NULL, NULL, NULL);
     DefineCustomStringVariable("sql_firewall.quiet_hours_end", "End time for quiet hours (HH:MM).", NULL, &quiet_hours_end, "06:00", PGC_SUSET, 0, NULL, NULL, NULL);
+    
     DefineCustomBoolVariable("sql_firewall.enable_rate_limiting", "Enables query rate limiting.", NULL, &enable_rate_limiting, false, PGC_SUSET, 0, NULL, NULL, NULL);
-    DefineCustomIntVariable("sql_firewall.rate_limit_count", "Number of queries allowed.", NULL, &rate_limit_count, 100, 1, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("sql_firewall.rate_limit_count", "Number of queries allowed per window.", NULL, &rate_limit_count, 100, 1, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("sql_firewall.rate_limit_seconds", "Time window for rate limit in seconds.", NULL, &rate_limit_seconds, 60, 1, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
-    DefineCustomIntVariable("sql_firewall.select_limit_count", "Max SELECT per window", NULL, &select_limit_count, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
-    DefineCustomIntVariable("sql_firewall.insert_limit_count", "Max INSERT per window", NULL, &insert_limit_count, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
-    DefineCustomIntVariable("sql_firewall.update_limit_count", "Max UPDATE per window", NULL, &update_limit_count, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
-    DefineCustomIntVariable("sql_firewall.delete_limit_count", "Max DELETE per window", NULL, &delete_limit_count, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
-    DefineCustomIntVariable("sql_firewall.command_limit_seconds", "Time window in seconds for per-command rate limit", NULL, &command_limit_seconds, 60, 1, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
+    
+    DefineCustomIntVariable("sql_firewall.select_limit_count", "Max SELECTs per window for per-command limit.", NULL, &select_limit_count, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("sql_firewall.insert_limit_count", "Max INSERTs per window for per-command limit.", NULL, &insert_limit_count, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("sql_firewall.update_limit_count", "Max UPDATEs per window for per-command limit.", NULL, &update_limit_count, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("sql_firewall.delete_limit_count", "Max DELETEs per window for per-command limit.", NULL, &delete_limit_count, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("sql_firewall.command_limit_seconds", "Time window in seconds for per-command rate limit.", NULL, &command_limit_seconds, 60, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
+    
     DefineCustomBoolVariable("sql_firewall.enable_application_blocking", "Enables blocking based on application_name.", NULL, &enable_application_blocking, false, PGC_SUSET, 0, NULL, NULL, NULL);
     DefineCustomStringVariable("sql_firewall.blocked_applications", "Comma-separated list of application_names to block.", NULL, &blocked_applications, "", PGC_SUSET, 0, NULL, NULL, NULL);
+    
+    DefineCustomBoolVariable("sql_firewall.enable_regex_scan", "Enables scanning queries against regex rules.", NULL, &enable_regex_scan, true, PGC_SUSET, 0, NULL, NULL, NULL);
+
 
     // Install the hooks into the query processing pipeline
     prev_executor_start_hook = ExecutorStart_hook;
@@ -591,7 +699,7 @@ void _PG_init(void)
  */
 void _PG_fini(void)
 {
-    // Uninstall the hooks, restoring the previous ones
+    // Uninstall the hooks, restoring the previous ones to ensure clean unload.
     ExecutorStart_hook = prev_executor_start_hook;
     ProcessUtility_hook = prev_process_utility_hook;
 }
