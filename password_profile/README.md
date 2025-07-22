@@ -161,6 +161,4 @@ INSERT INTO password_profile.blacklist (word) VALUES
 4. Optionally uninstall files:
    ```bash
    sudo make uninstall
-   ```
-
-
+   
