@@ -1,4 +1,4 @@
-
+# sql_firewall
 
 `sql_firewall` is an extension for PostgreSQL that provides multi-layered protection against SQL injection, unauthorized data access, and misuse of database services.
 
@@ -59,13 +59,9 @@ make
 sudo make install
 ```
 
-<<<<<<< HEAD
-**Activate the Extension:**
-Connect to the target database and run:
-=======
 ---
 
-## 🔧 PostgreSQL Configuration (IMPORTANT)
+### 🔧 PostgreSQL Configuration (IMPORTANT)
 
 Before using the extension, it must be preloaded via `postgresql.conf`:
 
@@ -87,25 +83,21 @@ sudo systemctl restart postgresql-16
 
 ---
 
-## 🧩 Activate the Extension
+### 🧩 Activate the Extension
 
 After restarting the server, connect to the target database and run:
 
->>>>>>> 5bbf0a714703dcb585ebfa7ee73087d0e2ebf66b
 ```sql
 CREATE EXTENSION sql_firewall;
 ```
+
 This will create the required tables: `sql_firewall_rules`, `sql_firewall_activity_log`, and `sql_firewall_regex_rules`.
 
 ---
 
-<<<<<<< HEAD
 ### 🛠️ Configuration
 
 Several GUC parameters can be set in `postgresql.conf` or using `ALTER SYSTEM`:
-=======
-## 🛠 Configuration Parameters
->>>>>>> 5bbf0a714703dcb585ebfa7ee73087d0e2ebf66b
 
 | Parameter | Description | Default |
 |----------|-------------|---------|
@@ -129,15 +121,11 @@ Several GUC parameters can be set in `postgresql.conf` or using `ALTER SYSTEM`:
 
 **Example:**
 ```sql
-<<<<<<< HEAD
 -- Set mode to 'enforce' and enable regex scanning
 ALTER SYSTEM SET sql_firewall.mode = 'enforce';
 ALTER SYSTEM SET sql_firewall.enable_regex_scan = 'on';
 
 -- Reload configuration
-=======
-ALTER SYSTEM SET sql_firewall.mode = 'enforce';
->>>>>>> 5bbf0a714703dcb585ebfa7ee73087d0e2ebf66b
 SELECT pg_reload_conf();
 ```
 
@@ -145,16 +133,8 @@ SELECT pg_reload_conf();
 
 ### 🚦 Usage
 
-<<<<<<< HEAD
 #### 1. Learn Mode
 On installation, firewall defaults to `learn` mode. All unseen queries are saved in `sql_firewall_rules` with `is_approved = false`.
-=======
-### 1. Learn Mode
-When installed, the firewall defaults to `learn` mode. All unseen queries are saved in `sql_firewall_rules` with `is_approved = false`.
-
-### 2. Approving Rules
-After a learning period, the DBA should review and approve safe query patterns.
->>>>>>> 5bbf0a714703dcb585ebfa7ee73087d0e2ebf66b
 
 #### 2. Approving Rules
 Review and approve safe query patterns:
@@ -173,75 +153,45 @@ INSERT INTO sql_firewall_regex_rules (pattern, description, action)
 VALUES ('or\s+1\s*=\s*1', 'Classic SQLi attack vector', 'BLOCK');
 ```
 
-<<<<<<< HEAD
 #### 4. Enforce Mode
-=======
-### 3. Enforce Mode
->>>>>>> 5bbf0a714703dcb585ebfa7ee73087d0e2ebf66b
+
 ```sql
 ALTER SYSTEM SET sql_firewall.mode = 'enforce';
 SELECT pg_reload_conf();
 ```
 
-<<<<<<< HEAD
-=======
 Only queries marked `is_approved = true` will be executed.
 
->>>>>>> 5bbf0a714703dcb585ebfa7ee73087d0e2ebf66b
 ---
 
 ### 🗃️ Database Tables
 
-<<<<<<< HEAD
 #### `sql_firewall_rules`
 Stores learned/approved query rules.
-- rule_id
-- role_name
-- database_name
-- command_type
-- query_fingerprint
-- is_approved
-- created_at
+- `rule_id`
+- `role_name`
+- `database_name`
+- `command_type`
+- `query_fingerprint`
+- `is_approved`
+- `created_at`
 
 #### `sql_firewall_regex_rules`
 Stores regex patterns for malicious query detection.
-- id
-- pattern
-- description
-- action (BLOCK or ALLOW)
-- is_active
-- created_at
+- `id`
+- `pattern`
+- `description`
+- `action` (BLOCK or ALLOW)
+- `is_active`
+- `created_at`
 
 #### `sql_firewall_activity_log`
 Audit log for firewall activity.
-- log_id
-- log_time
-- role_name
-- database_name
-- action (ALLOWED, BLOCKED, LEARNED)
-- reason
-- query_text
-- command_type
-=======
-### `sql_firewall_rules`
-
-- `rule_id`: Unique rule ID
-- `role_name`: Role executing the query
-- `database_name`: Database name
-- `command_type`: Query type (SELECT, INSERT, etc.)
-- `query_fingerprint`: Query hash
-- `is_approved`: Whether the query is allowed
-- `created_at`: Timestamp of rule creation
-
-### `sql_firewall_activity_log`
-
-- `log_id`: Unique log ID
-- `log_time`: Timestamp
-- `role_name`: Role executing the query
-- `database_name`: Database
-- `action`: `ALLOWED`, `BLOCKED`, or `LEARNED`
-- `reason`: Explanation (e.g., “Rule not approved”, “Blacklisted keyword”)
-- `query_text`: Full SQL query
-- `command_type`: Type of command
->>>>>>> 5bbf0a714703dcb585ebfa7ee73087d0e2ebf66b
-
+- `log_id`
+- `log_time`
+- `role_name`
+- `database_name`
+- `action` (`ALLOWED`, `BLOCKED`, `LEARNED`)
+- `reason`
+- `query_text`
+- `command_type`
