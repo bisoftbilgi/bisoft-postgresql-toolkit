@@ -19,11 +19,18 @@ This PostgreSQL extension provides enterprise-grade password security by enforci
 
 ---
 
-## 📦 Requirements
+## Requirements
 
-- **PostgreSQL**: Version 16 or later (including development headers)
-- **pgcrypto**: Required for password hashing
-- **C Compiler and Build Tools**
+* **PostgreSQL:** Version 16 or newer, including the server, development, and contrib packages.
+    * On **Rocky Linux**, you can install all necessary packages with a single command:
+        ```bash
+        sudo dnf install postgresql16-server postgresql16-devel postgresql16-contrib
+        ```
+* **C Compiler and Build Tools:** A standard C compiler like `gcc` and `make`.
+    * On **Rocky Linux**, you can install these with:
+        ```bash
+        sudo dnf groupinstall "Development Tools"
+        ```
 
 ### Installation on Rocky Linux
 

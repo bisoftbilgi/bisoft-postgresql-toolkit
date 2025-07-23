@@ -1,4 +1,4 @@
-# sql_firewall
+## SQL Firewall for PostgreSQL
 
 `sql_firewall` is an extension for PostgreSQL that provides multi-layered protection against SQL injection, unauthorized data access, and misuse of database services.
 
@@ -59,38 +59,11 @@ make
 sudo make install
 ```
 
----
-
-### 🔧 PostgreSQL Configuration (IMPORTANT)
-
-Before using the extension, it must be preloaded via `postgresql.conf`:
-
-```ini
-# postgresql.conf
-
-# If empty:
-shared_preload_libraries = 'sql_firewall'
-
-# If other extensions exist:
-# shared_preload_libraries = 'pg_stat_statements,sql_firewall'
-```
-
-Then restart PostgreSQL:
-
-```bash
-sudo systemctl restart postgresql-16
-```
-
----
-
-### 🧩 Activate the Extension
-
-After restarting the server, connect to the target database and run:
-
+**Activate the Extension:**
+Connect to the target database and run:
 ```sql
 CREATE EXTENSION sql_firewall;
 ```
-
 This will create the required tables: `sql_firewall_rules`, `sql_firewall_activity_log`, and `sql_firewall_regex_rules`.
 
 ---
@@ -154,13 +127,10 @@ VALUES ('or\s+1\s*=\s*1', 'Classic SQLi attack vector', 'BLOCK');
 ```
 
 #### 4. Enforce Mode
-
 ```sql
 ALTER SYSTEM SET sql_firewall.mode = 'enforce';
 SELECT pg_reload_conf();
 ```
-
-Only queries marked `is_approved = true` will be executed.
 
 ---
 
@@ -168,30 +138,31 @@ Only queries marked `is_approved = true` will be executed.
 
 #### `sql_firewall_rules`
 Stores learned/approved query rules.
-- `rule_id`
-- `role_name`
-- `database_name`
-- `command_type`
-- `query_fingerprint`
-- `is_approved`
-- `created_at`
+- rule_id
+- role_name
+- database_name
+- command_type
+- query_fingerprint
+- is_approved
+- created_at
 
 #### `sql_firewall_regex_rules`
 Stores regex patterns for malicious query detection.
-- `id`
-- `pattern`
-- `description`
-- `action` (BLOCK or ALLOW)
-- `is_active`
-- `created_at`
+- id
+- pattern
+- description
+- action (BLOCK or ALLOW)
+- is_active
+- created_at
 
 #### `sql_firewall_activity_log`
 Audit log for firewall activity.
-- `log_id`
-- `log_time`
-- `role_name`
-- `database_name`
-- `action` (`ALLOWED`, `BLOCKED`, `LEARNED`)
-- `reason`
-- `query_text`
-- `command_type`
+- log_id
+- log_time
+- role_name
+- database_name
+- action (ALLOWED, BLOCKED, LEARNED)
+- reason
+- query_text
+- command_type
+
