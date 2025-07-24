@@ -65,6 +65,8 @@ typedef struct LoginAttempt
 {
     char        username[NAMEDATALEN];      // The user's name (key for the hash table).
     int         fail_count;                 // The number of consecutive failed login attempts.
+int last_backend_pid;
+
     TimestampTz lockout_start_time;       // Stores the exact time the lockout began.
 } LoginAttempt;
 
@@ -171,14 +173,12 @@ check_login_attempts(Port *port, int status)
     LoginAttempt *attempt;
     bool        found;
 
-    // If there's no username, we can't do anything.
     if (!username)
     {
         if (prev_client_auth_hook) prev_client_auth_hook(port, status);
         return;
     }
-    
-    // Do not apply lockout policy to superusers.
+
     user_oid = get_role_oid(username, true);
     if (!OidIsValid(user_oid) || superuser_arg(user_oid))
     {
@@ -186,75 +186,81 @@ check_login_attempts(Port *port, int status)
         return;
     }
 
-    // Acquire an exclusive lock to ensure safe concurrent access to shared memory.
     LWLockAcquire(login_state->lock, LW_EXCLUSIVE);
 
-    // Look for the user in our hash table of failed login attempts.
     attempt = (LoginAttempt *) hash_search(login_state->login_attempts_hash,
                                            username, HASH_FIND, &found);
 
-    /* Step 1: Check if the user is currently locked and if the lockout has expired. */
     if (found && attempt->fail_count >= password_failed_login_max)
     {
-        // Calculate when the lockout period ends.
-        TimestampTz lock_until = TimestampTzPlusMilliseconds(attempt->lockout_start_time,
-                                                             (long) password_lockout_time_mins * 60 * 1000);
+        TimestampTz lock_until = TimestampTzPlusMilliseconds(
+            attempt->lockout_start_time,
+            (long) password_lockout_time_mins * 60 * 1000);
 
-        // Compare with the current time.
         if (GetCurrentTimestamp() < lock_until)
         {
-            /* Still locked. Reject connection. This block prevents the timer from resetting. */
+            elog(LOG, "Login blocked: %s is currently locked (fail_count=%d, PID=%d)",
+                 username, attempt->fail_count, MyProcPid);
+
             LWLockRelease(login_state->lock);
-            // Report a FATAL error, which terminates the connection attempt.
             ereport(FATAL, (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
                             errmsg("User account is temporarily locked. Please try again later.")));
         }
         else
         {
-            /* Lockout has expired. Delete the record and allow the login attempt to proceed. */
             hash_search(login_state->login_attempts_hash, username, HASH_REMOVE, NULL);
-            found = false; /* The record no longer exists */
+            found = false;
         }
     }
 
-    /* Step 2: After resolving lock status, process the current login attempt. */
     if (status == STATUS_OK)
     {
-        /* Successful login. Clean up any old non-locking failure records for this user. */
         if (found)
-        {
             hash_search(login_state->login_attempts_hash, username, HASH_REMOVE, NULL);
-        }
     }
-    else /* status != STATUS_OK, FAILED LOGIN */
+    else
     {
-        /* Find or create the record for the user. HASH_ENTER will create if not found. */
+        TimestampTz now = GetCurrentTimestamp();
+
         attempt = (LoginAttempt *) hash_search(login_state->login_attempts_hash,
                                                username, HASH_ENTER, &found);
         if (!found)
         {
-            /* This is the first failed attempt for this user, so initialize the record. */
-            attempt->fail_count = 0;
-            attempt->lockout_start_time = 0; /* Initialize timestamp to zero */
+            attempt->fail_count = 1;
+            attempt->lockout_start_time = now;
+            attempt->last_backend_pid = MyProcPid;
         }
-
-        // Increment the failure count.
-        attempt->fail_count++;
-
-        /* If THIS attempt triggers the lockout, SET the lockout start time ONCE. */
-        if (attempt->fail_count == password_failed_login_max)
+        else
         {
-            attempt->lockout_start_time = GetCurrentTimestamp();
+            long diff_ms = (long)((now - attempt->lockout_start_time) / 1000);
+
+            if (diff_ms >= 1000)
+            {
+                attempt->fail_count++;
+                attempt->lockout_start_time = now;
+
+                elog(LOG, "[POST] User: %s | fail_count incremented to %d | PID = %d",
+                     username, attempt->fail_count, MyProcPid);
+            }
+            else
+            {
+                elog(LOG, "[SKIP] Rapid retry ignored for user: %s (diff_ms = %ld)",
+                     username, diff_ms);
+            }
+
+            if (attempt->fail_count >= password_failed_login_max)
+            {
+                elog(LOG, "Account lock triggered for user: %s", username);
+            }
         }
     }
 
-    // Always release the lock.
     LWLockRelease(login_state->lock);
 
-    // Call the next hook in the chain to continue the authentication process.
     if (prev_client_auth_hook)
         prev_client_auth_hook(port, status);
 }
+
 
 /*
  * Checks a password against basic complexity policies.
