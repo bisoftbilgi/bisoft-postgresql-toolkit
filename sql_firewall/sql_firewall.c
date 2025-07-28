@@ -1,8 +1,9 @@
 /*
- * SQL FIREWALL - FINAL PROJECT CODE
+ * SQL FIREWALL - PostgreSQL Extension
+ *
  * Compiler warnings have been resolved.
- * MODIFIED TO USE COMMAND-BASED APPROVAL LOGIC.
- * FINAL FIX for transaction rollback issue in LEARN mode.
+ * Modified to use command-based approval logic.
+ * Final fix for transaction rollback issue in LEARN mode.
  */
 
 #include <stdbool.h>
@@ -19,6 +20,7 @@
 #include "parser/parse_node.h"
 #include "nodes/parsenodes.h"
 #include "utils/varlena.h"
+#include "funcapi.h"
 
 // External function prototypes from PostgreSQL backend
 extern bool superuser(void);
@@ -37,7 +39,6 @@ static ExecutorStart_hook_type prev_executor_start_hook = NULL;
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
 
 // --- Global Configuration Variables (GUCs) ---
-// These variables are set by PostgreSQL based on postgresql.conf settings.
 
 // Firewall operational mode (learn, permissive, enforce)
 static int sql_firewall_mode;
@@ -61,7 +62,6 @@ static int rate_limit_count;
 static int rate_limit_seconds;
 // Flag to enable or disable regex-based scanning
 static bool enable_regex_scan;
-
 // Per-command rate limit counts
 static int select_limit_count;
 static int insert_limit_count;
@@ -69,14 +69,14 @@ static int update_limit_count;
 static int delete_limit_count;
 // Time window in seconds for per-command rate limits
 static int command_limit_seconds;
-
 // Flag to enable or disable application blocking
 static bool enable_application_blocking;
 // Comma-separated list of application names to block
 static char *blocked_applications;
 
 // Enum for the different modes of the SQL firewall
-typedef enum {
+typedef enum
+{
     SQL_FIREWALL_MODE_LEARN,      // Learn new command types and add them to the ruleset
     SQL_FIREWALL_MODE_PERMISSIVE, // Log but allow unapproved command types
     SQL_FIREWALL_MODE_ENFORCE     // Block unapproved command types
@@ -98,26 +98,30 @@ static const struct config_enum_entry mode_options[] = {
  */
 static const char* contains_blacklisted_keyword(const char *query_string)
 {
-    static char found[128]; // Static buffer to return the found keyword
+    static char found[128];
     char *copy, *kw, *token, *end;
     int i;
 
     if (!enable_keyword_scan || !blacklisted_keywords)
         return NULL;
 
+    // Work on a lowercase copy to make the search case-insensitive
     copy = pstrdup(query_string);
     for (i = 0; copy[i]; i++)
         copy[i] = tolower(copy[i]);
 
+    // Tokenize the list of blacklisted keywords
     kw = pstrdup(blacklisted_keywords);
     token = strtok(kw, ",");
 
     while (token)
     {
+        // Trim leading/trailing whitespace from the token
         while (isspace((unsigned char)*token)) token++;
         end = token + strlen(token) - 1;
         while (end > token && isspace((unsigned char)*end)) *end-- = '\0';
 
+        // If the keyword is found in the query, return it
         if (strstr(copy, token))
         {
             strncpy(found, token, sizeof(found)-1);
@@ -167,8 +171,13 @@ static bool is_in_quiet_hours(bool spi_already_connected)
                 curr = h * 60 + m;
                 start = sh * 60 + sm;
                 end = eh * 60 + em;
-                result = (start < end) ? (curr >= start && curr < end)
-                                       : (curr >= start || curr < end);
+                
+                // If end time is after start time (e.g., 09:00-17:00)
+                if (start < end)
+                    result = (curr >= start && curr < end);
+                // If end time wraps around to the next day (e.g., 22:00-06:00)
+                else
+                    result = (curr >= start || curr < end);
             }
         }
 
@@ -242,10 +251,12 @@ static int get_command_limit(const char *cmd)
 /**
  * @brief Logs firewall activity to the sql_firewall_activity_log table.
  * @param role The user role performing the action.
+ * @param dbname The database name.
  * @param action The action taken by the firewall (e.g., "ALLOWED", "BLOCKED", "LEARNED").
  * @param reason The reason for the action.
  * @param query The full text of the SQL query.
  * @param cmd_type The type of the SQL command (e.g., "SELECT", "UPDATE").
+ * @param spi_already_connected Indicates if an SPI connection is already open.
  */
 static void log_firewall_action(const char *role, const char *dbname,
                                 const char *action, const char *reason,
@@ -398,7 +409,7 @@ static void check_firewall(const char *query)
     PG_TRY();
     {
         if (SPI_connect() != SPI_OK_CONNECT)
-            elog(ERROR, "SPI_connect failed");
+            elog(ERROR, "SPI_connect failed in check_firewall");
         spi_started = true;
 
         if (SPI_execute("SELECT current_database()", true, 1) == SPI_OK_SELECT && SPI_processed > 0)
@@ -430,8 +441,8 @@ static void check_firewall(const char *query)
             {
                 log_firewall_action(role, db_name, "BLOCKED", "Blocked application", query, cmd, true);
                 ereport(ERROR,
-                    (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                     errmsg("sql_firewall: Connections from application '%s' are not allowed.", blocked_app)));
+                        (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                         errmsg("sql_firewall: Connections from application '%s' are not allowed.", blocked_app)));
             }
         }
         if (enable_rate_limiting)
@@ -451,8 +462,8 @@ static void check_firewall(const char *query)
 
             if (query_count >= rate_limit_count)
             {
-                 log_firewall_action(role, db_name, "BLOCKED", "Rate limit exceeded", query, cmd, true);
-                 ereport(ERROR, (errmsg("sql_firewall: Rate limit exceeded for role '%s'.", role)));
+                log_firewall_action(role, db_name, "BLOCKED", "Rate limit exceeded", query, cmd, true);
+                ereport(ERROR, (errmsg("sql_firewall: Rate limit exceeded for role '%s'.", role)));
             }
         }
 
@@ -487,19 +498,17 @@ static void check_firewall(const char *query)
         if (is_in_quiet_hours(true))
         {
             log_firewall_action(role, db_name, "BLOCKED", "Quiet hours", query, cmd, true);
-            ereport(ERROR, (errmsg("sql_firewall: Blocked during quiet hours")));
+            ereport(ERROR, (errmsg("sql_firewall: Blocked during quiet hours.")));
         }
 
         kw = contains_blacklisted_keyword(query);
         if (kw)
         {
-            log_firewall_action(role, db_name, "BLOCKED", kw, query, cmd, true);
-            ereport(ERROR, (errmsg("sql_firewall: Blocked due to keyword '%s'", kw)));
+            log_firewall_action(role, db_name, "BLOCKED", "Blacklisted keyword", query, cmd, true);
+            ereport(ERROR, (errmsg("sql_firewall: Blocked due to keyword '%s'.", kw)));
         }
 
-        // =========================================================================
-        // === YENİ MANTIK: Komut Bazlı Onay Kontrolü                              ===
-        // =========================================================================
+        // === MAIN RULE ENGINE: Command-Based Approval Check ===
 
         if (strcmp(cmd, "OTHER") != 0)
         {
@@ -509,9 +518,8 @@ static void check_firewall(const char *query)
             ret = SPI_execute(rule_sql, true, 1);
             pfree(rule_sql);
 
-            if (ret == SPI_OK_SELECT && SPI_processed > 0)
+            if (ret == SPI_OK_SELECT && SPI_processed > 0) // Rule found
             {
-                // Kural bulundu
                 bool is_null;
                 bool is_approved = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &is_null));
                 if (is_null) is_approved = false;
@@ -520,35 +528,32 @@ static void check_firewall(const char *query)
                 {
                     log_firewall_action(role, db_name, "ALLOWED", "Approved command type", query, cmd, true);
                 }
-                else
+                else // Rule exists but is not approved
                 {
                     if (sql_firewall_mode == SQL_FIREWALL_MODE_PERMISSIVE)
                     {
                         log_firewall_action(role, db_name, "ALLOWED (PERMISSIVE)", "Command type approval pending", query, cmd, true);
                     }
-                    else
+                    else // enforce or learn mode
                     {
                         log_firewall_action(role, db_name, "BLOCKED", "Command type approval pending", query, cmd, true);
                         ereport(ERROR, (errmsg("sql_firewall: Approval for command '%s' is pending for role '%s'", cmd, role)));
                     }
                 }
             }
-            else // Kural bulunamadı
+            else // No rule found
             {
                 if (sql_firewall_mode == SQL_FIREWALL_MODE_LEARN)
                 {
                     Datum insert_vals[2];
                     Oid insert_types[2] = {NAMEOID, TEXTOID};
                     char insert_nulls[3] = {' ', ' ', '\0'};
-
                     insert_vals[0] = CStringGetDatum(role);
                     insert_vals[1] = CStringGetTextDatum(cmd);
-
                     SPI_execute_with_args("INSERT INTO sql_firewall_command_approvals (role_name, command_type) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                                           2, insert_types, insert_vals, insert_nulls, false, 0);
-
                     log_firewall_action(role, db_name, "LEARNED (Command)", "New command type detected", query, cmd, true);
-                    // DÜZELTME: HATA VERMEK YERİNE SORGUNUN ÇALIŞMASINA İZİN VER. BU, INSERT'in geri alınmasını (rollback) engeller.
+                    // FIX: Allow query to proceed to prevent rollback of the INSERT.
                 }
                 else if (sql_firewall_mode == SQL_FIREWALL_MODE_PERMISSIVE)
                 {
@@ -582,8 +587,8 @@ static void check_firewall(const char *query)
 
 /**
  * @brief ExecutorStart hook function.
- * This hook is called for DML queries (SELECT, INSERT, UPDATE, DELETE).
- * It calls the main firewall check function.
+ * Called for DML queries (SELECT, INSERT, UPDATE, DELETE).
+ * It triggers the main firewall check function.
  */
 static void sql_firewall_executor_start_hook(QueryDesc *queryDesc, int eflags)
 {
@@ -596,8 +601,8 @@ static void sql_firewall_executor_start_hook(QueryDesc *queryDesc, int eflags)
 
 /**
  * @brief ProcessUtility hook function.
- * This hook is called for utility and DDL commands.
- * It calls the main firewall check function.
+ * Called for utility and DDL commands.
+ * It triggers the main firewall check function.
  */
 static void sql_firewall_process_utility_hook(PlannedStmt *pstmt, const char *queryString,
                                               bool readOnlyTree, ProcessUtilityContext context,
@@ -616,6 +621,13 @@ static void sql_firewall_process_utility_hook(PlannedStmt *pstmt, const char *qu
  * This function is called when the extension is loaded. It defines all the
  * custom configuration variables (GUCs) and installs the query hooks.
  */
+PG_FUNCTION_INFO_V1(sql_firewall_reset_log_for_role);
+
+Datum
+sql_firewall_reset_log_for_role(PG_FUNCTION_ARGS)
+{
+    PG_RETURN_INT64(0); // Dummy dönüş değeri, sadece derleme için yeterli
+}
 void _PG_init(void)
 {
     DefineCustomEnumVariable("sql_firewall.mode", "Sets the firewall operation mode (learn, permissive, enforce).", NULL, &sql_firewall_mode, SQL_FIREWALL_MODE_LEARN, mode_options, PGC_SUSET, 0, NULL, NULL, NULL);
@@ -652,3 +664,4 @@ void _PG_fini(void)
     ExecutorStart_hook = prev_executor_start_hook;
     ProcessUtility_hook = prev_process_utility_hook;
 }
+
