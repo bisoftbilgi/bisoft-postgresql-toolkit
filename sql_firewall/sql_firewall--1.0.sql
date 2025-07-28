@@ -53,3 +53,7 @@ CREATE TABLE sql_firewall_regex_rules (
 ---
 GRANT SELECT ON TABLE sql_firewall_rules TO PUBLIC;
 GRANT SELECT ON TABLE sql_firewall_regex_rules TO PUBLIC;
+CREATE FUNCTION sql_firewall_reset_log_for_role(rolename name)
+RETURNS bigint
+AS '$libdir/sql_firewall', 'sql_firewall_reset_log_for_role'
+LANGUAGE C STRICT;

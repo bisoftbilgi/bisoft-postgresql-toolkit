@@ -2,8 +2,7 @@
 comment = 'A simple SQL firewall to block queries based on rules.'
 default_version = '1.0'
 module_pathname = '$libdir/sql_firewall'
-relocatable = true
+relocatable = false
 requires = 'pgcrypto'
 superuser = true
 schema = public
-

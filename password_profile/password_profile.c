@@ -164,6 +164,8 @@ password_profile_shmem_startup(void)
  * Main authentication hook function. Checks for lockouts and records failures.
  * This function is called by the postmaster for every connection attempt.
  * REVISION: Logic was rewritten to prevent the lockout timer from resetting on subsequent failed attempts.
+ * REVISION 2: Switched from using global C variables for GUCs to dynamically fetching them
+ * with GetConfigOption() to ensure pg_reload_conf() changes are applied instantly.
  */
 static void
 check_login_attempts(Port *port, int status)
@@ -173,6 +175,21 @@ check_login_attempts(Port *port, int status)
     LoginAttempt *attempt;
     bool        found;
 
+    /* ---- YENİ EKLENEN KOD BAŞLANGICI ---- */
+    int         current_max_logins;
+    int         current_lockout_mins;
+    const char *guc_value_str;
+
+    /* Anlık olarak 'failed_login_max' GUC değerini çekiyoruz. */
+    guc_value_str = GetConfigOption("password_profile.failed_login_max", false, false);
+    current_max_logins = atoi(guc_value_str);
+
+    /* Anlık olarak 'lockout_time_mins' GUC değerini çekiyoruz. */
+    guc_value_str = GetConfigOption("password_profile.lockout_time_mins", false, false);
+    current_lockout_mins = atoi(guc_value_str);
+    /* ---- YENİ EKLENEN KOD SONU ---- */
+
+    /* Kullanıcı adı yoksa veya süper kullanıcı ise kontrolü atla */
     if (!username)
     {
         if (prev_client_auth_hook) prev_client_auth_hook(port, status);
@@ -186,17 +203,20 @@ check_login_attempts(Port *port, int status)
         return;
     }
 
+    /* Paylaşılan bellek üzerinde işlem yapmak için kilit alıyoruz */
     LWLockAcquire(login_state->lock, LW_EXCLUSIVE);
 
     attempt = (LoginAttempt *) hash_search(login_state->login_attempts_hash,
                                            username, HASH_FIND, &found);
 
-    if (found && attempt->fail_count >= password_failed_login_max)
+    /* Kullanıcı bulunduysa ve deneme sayısı limiti aştıysa kilit kontrolü yap */
+    if (found && attempt->fail_count >= current_max_logins) /* <- DEĞİŞİKLİK */
     {
         TimestampTz lock_until = TimestampTzPlusMilliseconds(
             attempt->lockout_start_time,
-            (long) password_lockout_time_mins * 60 * 1000);
+            (long) current_lockout_mins * 60 * 1000); /* <- DEĞİŞİKLİK */
 
+        /* Kilit süresi hala devam ediyor mu? */
         if (GetCurrentTimestamp() < lock_until)
         {
             elog(LOG, "Login blocked: %s is currently locked (fail_count=%d, PID=%d)",
@@ -206,38 +226,42 @@ check_login_attempts(Port *port, int status)
             ereport(FATAL, (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
                             errmsg("User account is temporarily locked. Please try again later.")));
         }
-        else
+        else /* Kilit süresi dolmuş, kaydı temizle */
         {
             hash_search(login_state->login_attempts_hash, username, HASH_REMOVE, NULL);
             found = false;
         }
     }
 
+    /* Giriş başarılı olduysa (status == STATUS_OK) */
     if (status == STATUS_OK)
     {
+        /* Kullanıcının geçmiş bir hata kaydı varsa temizle */
         if (found)
             hash_search(login_state->login_attempts_hash, username, HASH_REMOVE, NULL);
     }
-    else
+    else /* Giriş başarısız olduysa */
     {
         TimestampTz now = GetCurrentTimestamp();
 
+        /* Kullanıcı için hash tablosunda bir kayıt oluştur veya bul */
         attempt = (LoginAttempt *) hash_search(login_state->login_attempts_hash,
                                                username, HASH_ENTER, &found);
-        if (!found)
+        if (!found) /* Bu, kullanıcının ilk hatalı denemesi */
         {
             attempt->fail_count = 1;
             attempt->lockout_start_time = now;
             attempt->last_backend_pid = MyProcPid;
         }
-        else
+        else /* Kullanıcının daha önceden de hatalı denemeleri var */
         {
+            /* Çok hızlı tekrar denemelerini (brute-force) engellemek için zaman farkı kontrolü */
             long diff_ms = (long)((now - attempt->lockout_start_time) / 1000);
 
-            if (diff_ms >= 1000)
+            if (diff_ms >= 1000) /* Son denemeden bu yana en az 1 saniye geçmişse sayacı artır */
             {
                 attempt->fail_count++;
-                attempt->lockout_start_time = now;
+                attempt->lockout_start_time = now; /* Zaman damgasını güncelle */
 
                 elog(LOG, "[POST] User: %s | fail_count incremented to %d | PID = %d",
                      username, attempt->fail_count, MyProcPid);
@@ -248,19 +272,21 @@ check_login_attempts(Port *port, int status)
                      username, diff_ms);
             }
 
-            if (attempt->fail_count >= password_failed_login_max)
+            /* Hata sayısı limiti aştıysa loga kilitlendiği bilgisini yaz */
+            if (attempt->fail_count >= current_max_logins) /* <- DEĞİŞİKLİK */
             {
                 elog(LOG, "Account lock triggered for user: %s", username);
             }
         }
     }
 
+    /* Kilidi serbest bırak */
     LWLockRelease(login_state->lock);
 
+    /* Varsa, bir sonraki hook'u zincirleme olarak çağır */
     if (prev_client_auth_hook)
         prev_client_auth_hook(port, status);
 }
-
 
 /*
  * Checks a password against basic complexity policies.
@@ -333,18 +359,17 @@ is_password_blacklisted(const char *password)
 {
     char        query[1024];
 
-    // Construct the SQL query. quote_literal_cstr prevents SQL injection.
+    // Case-insensitive içerik karşılaştırması yapmak için ILIKE kullanıyoruz.
     snprintf(query, sizeof(query),
-             "SELECT 1 FROM password_profile.blacklist WHERE word = %s",
+             "SELECT 1 FROM password_profile.blacklist WHERE %s ILIKE '%%' || word || '%%'",
              quote_literal_cstr(password));
 
-    // Execute the query.
     if (SPI_execute(query, true, 1) != SPI_OK_SELECT)
         elog(ERROR, "SPI_execute failed (blacklist)");
 
-    // If any rows are returned, the password is in the blacklist.
     return (SPI_processed > 0);
 }
+
 
 /*
  * Uses SPI to check if the user's password has expired.
