@@ -1,10 +1,7 @@
--- Create a dedicated schema for the extension.
--- The user who runs CREATE EXTENSION will be the owner.
+-- Create dedicated schema for the extension
 CREATE SCHEMA IF NOT EXISTS password_profile AUTHORIZATION CURRENT_USER;
 
----
--- Table to store password history.
--- A primary key is added for better data integrity.
+-- Table to store password history with metadata
 CREATE TABLE IF NOT EXISTS password_profile.history (
     id SERIAL PRIMARY KEY,
     username TEXT NOT NULL,
@@ -12,26 +9,23 @@ CREATE TABLE IF NOT EXISTS password_profile.history (
     change_date TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
----
--- Table to store a blacklist of common or forbidden passwords.
+-- Table to store blacklisted (forbidden/commonly used) passwords
 CREATE TABLE IF NOT EXISTS password_profile.blacklist (
     word TEXT PRIMARY KEY
 );
 
----
--- Set permissions for the schema and its objects.
-
--- Allow all roles to see the schema, but not necessarily its contents.
+-- Restrict general access
 GRANT USAGE ON SCHEMA password_profile TO PUBLIC;
 
--- IMPORTANT: Only the owner (the extension itself via the backend) should be
--- able to read and write to the password history.
--- DO NOT grant SELECT to PUBLIC on this table as it exposes password hashes.
--- The owner automatically has all privileges, so no further grants are needed
--- for the extension to function. We explicitly revoke public access for security.
+-- For security: Revoke everything from PUBLIC on the history table
 REVOKE ALL ON password_profile.history FROM PUBLIC;
 
--- The blacklist can be readable by everyone.
--- Only the owner should be able to modify the blacklist.
+-- Optionally, allow only SELECT to PUBLIC on blacklist (read-only access)
 REVOKE ALL ON password_profile.blacklist FROM PUBLIC;
 GRANT SELECT ON password_profile.blacklist TO PUBLIC;
+
+-- Optional: Comment on objects for better \dd support
+COMMENT ON SCHEMA password_profile IS 'Schema for password policy enforcement';
+COMMENT ON TABLE password_profile.history IS 'Stores password hashes and change timestamps per user';
+COMMENT ON TABLE password_profile.blacklist IS 'Stores disallowed password words (blacklist)';
+
