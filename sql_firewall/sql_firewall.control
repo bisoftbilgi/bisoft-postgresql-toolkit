@@ -1,8 +1,8 @@
-# sql_firewall extension
 comment = 'A simple SQL firewall to block queries based on rules.'
 default_version = '1.0'
 module_pathname = '$libdir/sql_firewall'
 relocatable = false
-requires = 'pgcrypto'
-superuser = true
 schema = public
+superuser = true
+requires = 'pgcrypto'
+

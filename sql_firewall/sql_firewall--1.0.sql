@@ -1,56 +1,64 @@
--- complain if script is sourced in psql, rather than via CREATE EXTENSION
-\echo Use "CREATE EXTENSION sql_firewall" to load this file. \quit
-
--- Table for logging firewall activity.
--- This table records every action taken by the firewall.
-CREATE TABLE sql_firewall_activity_log (
-    log_id SERIAL PRIMARY KEY,
-    log_time TIMESTAMPTZ NOT NULL DEFAULT now(),
-    role_name NAME,
+-- TABLES
+CREATE TABLE public.sql_firewall_activity_log (
+    id BIGSERIAL PRIMARY KEY,
+    log_time TIMESTAMPTZ DEFAULT now() NOT NULL,
+    role_name NAME NOT NULL,
     database_name NAME,
-    action TEXT,
+    action TEXT NOT NULL,
     reason TEXT,
-    query_text TEXT,
-    command_type TEXT
+    query_text TEXT NOT NULL,
+    command_type TEXT NOT NULL
 );
 
--- Table for a user's command type approvals (NEW LOGIC).
--- Stores approvals for command types (SELECT, INSERT, etc.) for each role.
-CREATE TABLE sql_firewall_command_approvals (
+COMMENT ON TABLE public.sql_firewall_activity_log IS 'Log of all actions performed by the SQL Firewall.';
+COMMENT ON COLUMN public.sql_firewall_activity_log.action IS 'Action performed: ALLOWED, BLOCKED, LEARNED, etc.';
+COMMENT ON COLUMN public.sql_firewall_activity_log.reason IS 'Reason for the action: Rate limit, Blacklisted keyword, etc.';
+
+CREATE TABLE public.sql_firewall_command_approvals (
     id SERIAL PRIMARY KEY,
     role_name NAME NOT NULL,
     command_type TEXT NOT NULL,
-    is_approved BOOLEAN NOT NULL DEFAULT false,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    is_approved BOOLEAN DEFAULT false NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     UNIQUE (role_name, command_type)
 );
 
--- Table for regular expression-based rules.
--- Stores regex patterns to detect and block threats like SQL injection.
-CREATE TABLE sql_firewall_regex_rules (
+COMMENT ON TABLE public.sql_firewall_command_approvals IS 'Approval status of command types per role.';
+COMMENT ON COLUMN public.sql_firewall_command_approvals.is_approved IS 'If true, this role is allowed to execute the command type.';
+
+CREATE TABLE public.sql_firewall_regex_rules (
     id SERIAL PRIMARY KEY,
     pattern TEXT NOT NULL UNIQUE,
     description TEXT,
-    action TEXT NOT NULL DEFAULT 'BLOCK' CHECK (action = 'BLOCK'),
-    is_active BOOLEAN NOT NULL DEFAULT true,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    action TEXT NOT NULL DEFAULT 'BLOCK' CHECK (action IN ('BLOCK')),
+    is_active BOOLEAN DEFAULT true NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now() NOT NULL
 );
 
--- Function to reset activity logs for a specific role.
--- Useful for resetting rate-limit counters.
-CREATE FUNCTION sql_firewall_reset_log_for_role(rolename name)
-RETURNS bigint
+COMMENT ON TABLE public.sql_firewall_regex_rules IS 'Regex rules used to match and block SQL queries.';
+COMMENT ON COLUMN public.sql_firewall_regex_rules.pattern IS 'Regex pattern to apply on the query text.';
+COMMENT ON COLUMN public.sql_firewall_regex_rules.action IS 'Action to perform when the pattern matches.';
+
+INSERT INTO public.sql_firewall_regex_rules (pattern, description)
+VALUES ('(or|--|#)\s+\d+\s*=\s*\d+', 'Block simple SQL injection pattern')
+ON CONFLICT (pattern) DO NOTHING;
+
+-- C-function declarations
+CREATE OR REPLACE FUNCTION sql_firewall_reset_log_for_role(role_name NAME)
+RETURNS BIGINT
 AS '$libdir/sql_firewall', 'sql_firewall_reset_log_for_role'
 LANGUAGE C STRICT;
 
--- Permissions
--- Granting permissions to PUBLIC allows the extension's C code, running with
--- the privileges of any user, to read and write to these tables via SPI.
-GRANT SELECT, INSERT ON TABLE sql_firewall_command_approvals TO PUBLIC;
-GRANT USAGE ON SEQUENCE sql_firewall_command_approvals_id_seq TO PUBLIC;
+COMMENT ON FUNCTION sql_firewall_reset_log_for_role(NAME) IS
+'Superuser only. Clears the activity log for the given role.';
 
-GRANT SELECT, INSERT ON TABLE sql_firewall_activity_log TO PUBLIC;
-GRANT USAGE ON SEQUENCE sql_firewall_activity_log_log_id_seq TO PUBLIC;
+CREATE OR REPLACE FUNCTION sql_firewall_approve_all_for_role(role_name NAME)
+RETURNS BIGINT
+AS '$libdir/sql_firewall', 'sql_firewall_approve_all_for_role'
+LANGUAGE C STRICT;
 
-GRANT SELECT ON TABLE sql_firewall_regex_rules TO PUBLIC;
+CREATE OR REPLACE FUNCTION sql_firewall_reject_all_for_role(role_name NAME)
+RETURNS BIGINT
+AS '$libdir/sql_firewall', 'sql_firewall_reject_all_for_role'
+LANGUAGE C STRICT;
 
