@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS public.sql_firewall_activity_log (
     application_name TEXT,
     client_ip TEXT,
     command TEXT,
-    action TEXT
+    action TEXT,
+    reason TEXT
 );
 
 COMMENT ON TABLE public.sql_firewall_activity_log IS 'Log of all actions performed by the SQL Firewall.';
