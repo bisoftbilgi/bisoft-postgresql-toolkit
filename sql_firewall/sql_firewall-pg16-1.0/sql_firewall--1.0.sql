@@ -1,14 +1,13 @@
 -- TABLES
-CREATE TABLE IF NOT EXISTS public.sql_firewall_activity_log (
-    log_id SERIAL PRIMARY KEY,
-    log_time TIMESTAMPTZ DEFAULT now(),
-    role TEXT,
-    db_name TEXT,
-    query TEXT,
-    application_name TEXT,
-    client_ip TEXT,
-    command TEXT,
-    action TEXT
+CREATE TABLE public.sql_firewall_activity_log (
+    id BIGSERIAL PRIMARY KEY,
+    log_time TIMESTAMPTZ DEFAULT now() NOT NULL,
+    role_name NAME NOT NULL,
+    database_name NAME,
+    action TEXT NOT NULL,
+    reason TEXT,
+    query_text TEXT NOT NULL,
+    command_type TEXT NOT NULL
 );
 
 COMMENT ON TABLE public.sql_firewall_activity_log IS 'Log of all actions performed by the SQL Firewall.';

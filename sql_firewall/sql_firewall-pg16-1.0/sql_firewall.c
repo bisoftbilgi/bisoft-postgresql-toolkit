@@ -242,25 +242,17 @@ static bool is_in_quiet_hours(void)
     int curr_mins = 0, start_mins = 0, end_mins = 0;
     TimestampTz now;
     struct pg_tm tm;
-    fsec_t fsec;
-    const char *tz_name;
     int tz;
 
     if (!enable_quiet_hours)
         return false;
 
-    if (!quiet_hours_start || !quiet_hours_end ||
-        quiet_hours_start[0] == '\0' || quiet_hours_end[0] == '\0')
-        return false;
-
     if (sscanf(quiet_hours_start, "%d:%d", &sh, &sm) != 2 ||
         sscanf(quiet_hours_end, "%d:%d", &eh, &em) != 2)
-        return false;
+        return false; /* Invalid format, default to not in quiet hours */
 
     now = GetCurrentTimestamp();
-
-    if (timestamp2tm(now, &tz, &tm, &fsec, &tz_name, NULL) != 0)
-        return false;  // timestamp dönüşümü başarısızsa sessizce reddet
+    timestamp2tm(now, &tz, &tm, NULL, NULL, NULL);
 
     h = tm.tm_hour;
     m = tm.tm_min;
@@ -269,13 +261,11 @@ static bool is_in_quiet_hours(void)
     start_mins = sh * 60 + sm;
     end_mins = eh * 60 + em;
 
-    if (start_mins < end_mins)
+    if (start_mins < end_mins) /* e.g., 22:00 - 23:59 */
         return (curr_mins >= start_mins && curr_mins < end_mins);
-    else
+    else /* e.g., 22:00 - 06:00 (spans midnight) */
         return (curr_mins >= start_mins || curr_mins < end_mins);
 }
-
-
 
 /**
  * @brief Checks if the current application name is in the block list.
@@ -486,17 +476,16 @@ static bool query_matches_regex_block_rule(const char *query_string, bool spi_al
 
 /* ----------------------- Firewall Core ----------------------- */
 
-/* ----------------------- Firewall Core ----------------------- */
-
 /**
  * @brief The main firewall logic function, called by the query hooks.
- * It performs all checks in a specific order for robustness.
- * Checks that do not require an SPI connection are performed first.
+ * It performs all checks in a specific order.
+ * @param query The SQL query string to be checked.
  */
 static void check_firewall(const char *query)
 {
     const char *cmd = "OTHER";
     const char *kw = NULL;
+    List *tree = NULL;
     char *role = NULL;
     char *db_name = NULL;
     bool spi_started = false;
@@ -517,59 +506,8 @@ static void check_firewall(const char *query)
         return;
     }
 
-    /*
-     * ====================================================================
-     * STAGE 1: Checks NOT requiring an SPI connection.
-     * These are checked first to avoid opening a DB connection unless
-     * absolutely necessary. This makes error handling simpler and safer.
-     * ====================================================================
-     */
-
-    if (is_in_quiet_hours())
-{
-    inside_firewall = false;
-
-    // Çökme engelleyici NULL kontrolleri
-    if (quiet_hours_start && quiet_hours_end)
-    {
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                        errmsg("sql_firewall: Blocked during quiet hours (%s - %s).",
-                               quiet_hours_start, quiet_hours_end)));
-    }
-    else
-    {
-        ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                        errmsg("sql_firewall: Blocked during quiet hours (invalid time config).")));
-    }
-
-    return;
-}
-
-
-
-    kw = contains_blacklisted_keyword(query);
-    if (kw)
-    {
-        /* Same as above: report error before connecting to SPI */
-        inside_firewall = false; /* Release re-entrancy guard */
-        ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION),
-                        errmsg("sql_firewall: Blocked due to blacklisted keyword '%s'.", kw)));
-        return; /* Should not be reached */
-    }
-
-
-    /*
-     * ====================================================================
-     * STAGE 2: Checks that DO require an SPI connection.
-     * All subsequent operations are wrapped in a PG_TRY block to safely
-     * manage the SPI connection state in case of errors.
-     * ====================================================================
-     */
-
     PG_TRY();
     {
-        List *tree = NULL;
-
         /* Establish connection to the database for running checks */
         if (SPI_connect() != SPI_OK_CONNECT)
             elog(ERROR, "SPI_connect failed in check_firewall");
@@ -591,7 +529,7 @@ static void check_firewall(const char *query)
         if (tree)
             list_free_deep(tree); /* Avoid memory leak */
 
-        /* --- STAGE 2A: Regex Check --- */
+        /* --- STAGE 1: Hard Block Rules (Highest Priority) --- */
         if (query_matches_regex_block_rule(query, true))
         {
             log_firewall_action(role, db_name, "BLOCKED", "Regex pattern match", query, cmd, true);
@@ -599,7 +537,7 @@ static void check_firewall(const char *query)
                             errmsg("sql_firewall: Query blocked by security regex pattern.")));
         }
 
-        /* --- STAGE 2B: Rate Limiting --- */
+        /* --- STAGE 2: Rate Limiting --- */
         if (enable_rate_limiting)
         {
             int query_count = 0;
@@ -611,7 +549,11 @@ static void check_firewall(const char *query)
             if (SPI_execute(ratelimit_sql, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
             {
                 char *count_str = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-                if (count_str) { query_count = atoi(count_str); pfree(count_str); }
+                if (count_str)
+                {
+                    query_count = atoi(count_str);
+                    pfree(count_str);
+                }
             }
             pfree(ratelimit_sql);
 
@@ -641,7 +583,11 @@ static void check_firewall(const char *query)
                 if (SPI_execute(cmd_sql, true, 1) == SPI_OK_SELECT && SPI_processed > 0)
                 {
                     char *count_str = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-                    if (count_str) { cmd_count = atoi(count_str); pfree(count_str); }
+                    if (count_str)
+                    {
+                        cmd_count = atoi(count_str);
+                        pfree(count_str);
+                    }
                 }
                 pfree(cmd_sql);
 
@@ -657,7 +603,28 @@ static void check_firewall(const char *query)
             }
         }
 
-        /* --- STAGE 2C: Main Rule Engine (Learn/Permissive/Enforce) --- */
+        /* --- STAGE 3: Environmental and Content Rules --- */
+        if (is_in_quiet_hours())
+        {
+            char *reason = psprintf("Attempted access during quiet hours (%s - %s)",
+                                    quiet_hours_start, quiet_hours_end);
+            log_firewall_action(role, db_name, "BLOCKED", reason, query, cmd, true);
+            pfree(reason);
+            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                            errmsg("sql_firewall: Blocked during quiet hours.")));
+        }
+
+        kw = contains_blacklisted_keyword(query);
+        if (kw)
+        {
+            char *reason = psprintf("Blacklisted keyword: '%s'", kw);
+            log_firewall_action(role, db_name, "BLOCKED", reason, query, cmd, true);
+            pfree(reason);
+            ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION),
+                            errmsg("sql_firewall: Blocked due to keyword '%s'.", kw)));
+        }
+
+        /* --- STAGE 4: Main Rule Engine (Learn/Permissive/Enforce) --- */
         if (strcmp(cmd, "OTHER") != 0)
         {
             char *rule_sql = psprintf("SELECT is_approved FROM public.sql_firewall_command_approvals "
@@ -717,9 +684,9 @@ static void check_firewall(const char *query)
         }
 
         /* --- Cleanup --- */
-	SPI_finish();
         if (db_name)
             pfree(db_name);
+        SPI_finish();
         inside_firewall = false;
     }
     PG_CATCH();
@@ -787,11 +754,20 @@ static void sql_firewall_client_auth_hook(Port *port, int status)
 {
     if (port)
     {
+        const char *user = port->user_name;
         const char *addr = (port->remote_host && port->remote_host[0]) ? port->remote_host : NULL;
         const char *app  = port->application_name;
-        const char *user = port->user_name; // Kullanıcı adını port'tan alıyoruz
 
-        /* --- IP Adresine Göre Engelleme --- */
+        /* Check 1: Role-IP binding (most specific rule) */
+        if (!is_role_ip_allowed_binding(user, addr))
+        {
+            ereport(FATAL,
+                    (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+                     errmsg("sql_firewall: Role '%s' is not allowed to connect from IP '%s'.",
+                            user ? user : "(unknown)", addr ? addr : "(unknown)")));
+        }
+
+        /* Check 2: Generic IP block list */
         if (addr && is_ip_blocked(addr))
         {
             ereport(FATAL,
@@ -799,22 +775,16 @@ static void sql_firewall_client_auth_hook(Port *port, int status)
                      errmsg("sql_firewall: Connection from blocked IP address '%s' is not allowed.", addr)));
         }
 
-        /* --- Uygulama Adına Göre Engelleme --- */
+        /* Check 3: Application name block list */
         if (app && is_application_blocked(app))
         {
             ereport(FATAL,
                     (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
                      errmsg("sql_firewall: Connections from application '%s' are not allowed.", app)));
         }
-
-        if (user && addr && !is_role_ip_allowed_binding(user, addr))
-        {
-            ereport(FATAL,
-                    (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-                     errmsg("sql_firewall: Role '%s' is not allowed to connect from IP address '%s'.", user, addr)));
-        }
     }
 
+    /* If all checks pass, chain to any previous authentication hook */
     if (prev_client_auth_hook)
         prev_client_auth_hook(port, status);
 }
