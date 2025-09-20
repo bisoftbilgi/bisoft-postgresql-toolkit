@@ -77,7 +77,7 @@ log_destination = 'csvlog'
 
 
 # Optional but recommended rotation
-log_filename = 'postgresql-%Y-%m-%d.csv'        # or include time if you prefer
+log_filename = 'postgresql-%Y-%m-%d'        # or include time if you prefer
 log_rotation_age = '1d'                          # rotate daily
 log_rotation_size = '100MB'                      # or your size threshold
 
