@@ -50,45 +50,51 @@ psql -c "CREATE EXTENSION password_profile_pure;"
 
 ## Quick Start
 
-### Automatic Password Validation (via Hook)
+### Automatic Password Validation (Hook-based)
 
-The extension automatically validates passwords during user creation and password changes:
+The extension automatically validates passwords during `CREATE ROLE`, `ALTER ROLE`, and `\password` commands:
 
 ```sql
--- Password validation happens automatically via check_password_hook
+-- Weak password is automatically rejected
 CREATE ROLE john WITH LOGIN PASSWORD 'weak';
 -- ERROR: Password validation failed: Password too short
 
+-- Valid password is accepted
 CREATE ROLE john WITH LOGIN PASSWORD 'MySecurePass123!';
 -- SUCCESS: Password validated and user created
 
-ALTER ROLE john PASSWORD 'password123';
--- ERROR: Password is in blacklist (too common)
-
--- Also works with psql \password command
-\password john
--- Enter password: (will be validated automatically)
+-- Hash injection attempts are blocked
+CREATE ROLE hacker WITH LOGIN PASSWORD 'md5c4ca4238a0b923820dcc509a6f75849b';
+-- ERROR: Security violation: Password looks like a precomputed hash
 ```
 
-### Manual Functions (for Testing and Management)
+### Manual Password Validation
+
+You can also validate passwords programmatically:
 
 ```sql
--- Test password policy (without creating user)
+-- Check if a password meets policy requirements
 SELECT check_password('john', 'MySecurePass123!');
 -- Returns: Password accepted
 
--- Record a password change manually (stores bcrypt hash)
+-- Record a password change (stores bcrypt hash)
 SELECT record_password_change('john', 'MySecurePass123!');
 
 -- Check failed login attempts
 SELECT check_user_access('john');
 
--- Clear login attempts (requires superuser or same user)
-SELECT clear_login_attempts('john');
+-- Record failed login
+SELECT record_failed_login('john');
 
 -- Check if user is locked out
 SELECT is_user_locked('john');
 ```
+
+## Configuration (GUC Parameters)
+
+### Global Configuration
+
+```sql
 -- Set minimum password length
 ALTER SYSTEM SET password_profile.min_length = 12;
 
@@ -134,6 +140,22 @@ SELECT usename, useconfig FROM pg_user WHERE useconfig IS NOT NULL;
 
 
 ## Security Features
+
+### Hash Bypass Prevention (Anti-Injection)
+- **Defense-in-depth protection** against precomputed hash attacks
+- Rejects password strings that match known hash formats:
+  - PostgreSQL MD5: `md5` + 32 hex characters
+  - bcrypt: `$2a$`, `$2b$`, `$2x$`, `$2y$` formats
+  - SCRAM-SHA-256: `SCRAM-SHA-256$...`
+  - argon2: `$argon2i$`, `$argon2id$`, `$argon2d$`
+  - PBKDF2: `$pbkdf2-sha256$`, `pbkdf2:...`
+  - crypt(3): `$1$` (MD5), `$5$` (SHA-256), `$6$` (SHA-512)
+  - Raw hashes: 40 (SHA-1), 64 (SHA-256), 128 (SHA-512) hex chars
+- **Two-layer protection**:
+  1. Hook level: Checks before PostgreSQL processes the password type
+  2. Function level: Validates in `check_password()` for defense-in-depth
+- Prevents attacks like: `CREATE ROLE hacker WITH PASSWORD 'md5c4ca4238a0b...'`
+- Security logging: All rejection attempts are logged with prefix detection
 
 ### bcrypt Password Hashing
 - All new passwords use bcrypt with cost factor 12

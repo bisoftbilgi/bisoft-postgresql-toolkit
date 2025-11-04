@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 ::pgrx::pg_module_magic!();
 
 static BLACKLIST_INIT: Once = Once::new();
+// TODO: Consider using PostgreSQL's native shared memory instead of Rust Mutex for better integration
 static BLACKLIST_CACHE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 // Authentication event cache to prevent duplicate processing
@@ -91,13 +92,11 @@ static LOG_DIRECTORY: pgrx::GucSetting<Option<CString>> =
     pgrx::GucSetting::<Option<CString>>::new(None);
 static LOG_MONITOR_ENABLED: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
 
-// ============================================================================
-// Background Worker Safe SPI Execution
-// ============================================================================
+// ====================================================================================
+// Background Worker SPI Execution
+// ====================================================================================
 
-/// Background worker içinde güvenli SPI çağrısı (raw C SPI)
-/// Bu fonksiyon PostgreSQL'in native C API'sini kullanarak
-/// background worker context'inde güvenli SQL execution sağlar  
+/// Execute SQL safely from background worker context using raw PostgreSQL SPI
 unsafe fn bg_execute_sql(sql: &str) {
     let c_sql = match CString::new(sql) {
         Ok(s) => s,
@@ -107,16 +106,16 @@ unsafe fn bg_execute_sql(sql: &str) {
         }
     };
 
-    // Transaction başlat
+    // Begin transaction and connect to SPI
     pg_sys::SetCurrentStatementStartTimestamp();
     pg_sys::StartTransactionCommand();
     pg_sys::SPI_connect();
     pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
 
-    // SQL'i çalıştır
+    // Execute SQL statement
     let result = pg_sys::SPI_execute(c_sql.as_ptr(), false, 0);
 
-    // SPI'den çık ve transaction'ı tamamla
+    // Cleanup and commit/rollback
     pg_sys::SPI_finish();
     pg_sys::PopActiveSnapshot();
 
@@ -130,9 +129,9 @@ unsafe fn bg_execute_sql(sql: &str) {
     pg_sys::pgstat_report_stat(false);
 }
 
-// ============================================================================
+// ====================================================================================
 // PostgreSQL Hook Integration
-// ============================================================================
+// ====================================================================================
 
 /// Register the check_password_hook to automatically validate passwords
 /// This hook is called whenever a user password is set via CREATE USER, ALTER USER, or \password
@@ -159,6 +158,16 @@ unsafe fn register_password_check_hook() {
         } else {
             CStr::from_ptr(shadow_pass).to_str().unwrap_or("")
         };
+
+        // CRITICAL SECURITY: Check for hash-like input BEFORE password_type check
+        // PostgreSQL auto-detects "md5..." as PASSWORD_TYPE_MD5, bypassing our PLAINTEXT check
+        // We must reject hash-formatted strings even if PostgreSQL thinks they're already hashed
+        if !password_str.is_empty() && is_hash_like(password_str) {
+            pgrx::error!(
+                "Security violation: Password looks like a precomputed hash. \
+                 Direct hash input is not allowed. Use plain text passwords only."
+            );
+        }
 
         // Only validate plaintext passwords (PASSWORD_TYPE_PLAINTEXT)
         // Skip already hashed passwords (PASSWORD_TYPE_MD5, PASSWORD_TYPE_SCRAM_SHA_256)
@@ -196,9 +205,9 @@ unsafe fn register_password_check_hook() {
     pg_sys::check_password_hook = Some(password_check_hook);
 }
 
-// ============================================================================
+// ====================================================================================
 // Client Authentication Hook Integration
-// ============================================================================
+// ====================================================================================
 
 extern "C" {
     fn password_profile_port_username(port: *mut pg_sys::Port) -> *const std::os::raw::c_char;
@@ -446,9 +455,9 @@ fn register_client_auth_hook() {
     });
 }
 
-// ============================================================================
+// ====================================================================================
 // Hook Initialization - Ensures hooks are registered exactly once
-// ============================================================================
+// ====================================================================================
 
 /// Ensures all hooks are registered. Safe to call multiple times.
 /// This is called from SQL functions since _PG_init doesn't work with pgrx + CREATE EXTENSION
@@ -462,9 +471,9 @@ pub fn ensure_hooks_registered() {
     });
 }
 
-// ============================================================================
+// ====================================================================================
 // Log Hook - Track Failed Logins via PostgreSQL Logs
-// ============================================================================
+// ====================================================================================
 
 extern "C" {
     #[link_name = "emit_log_hook"]
@@ -473,7 +482,7 @@ extern "C" {
 
 /// Register emit_log_hook to intercept PostgreSQL logs and detect failed logins
 unsafe fn register_log_hook() {
-    pgrx::log!("🔍 register_log_hook: Starting registration...");
+    pgrx::log!("Registering PostgreSQL log hook for authentication monitoring");
 
     static mut PREV_LOG_HOOK: Option<unsafe extern "C" fn(edata: *mut pg_sys::ErrorData)> = None;
 
@@ -505,47 +514,29 @@ unsafe fn register_log_hook() {
             }
         };
 
-        // Turkish: "password authentication failed for user"
-        // English: "password authentication failed for user"
-        // Both contain these keywords
-        if !message.contains("password authentication failed")
-            && !message.contains("parola doğrulaması başarısız")
-        {
-            return; // Not a failed login
+        // Detect failed authentication from log message
+        if !message.contains("password authentication failed") {
+            return;
         }
 
-        // Extract username from message
-        // English: "password authentication failed for user \"username\""
-        // Turkish: "kullanıcısı için parola doğrulaması başarısız: \"username\""
+        // Extract username from authentication error message
+        // Format: 'password authentication failed for user "username"'
         let username = if let Some(start_idx) = message.find("user \"") {
-            let start = start_idx + 6; // After "user \""
+            let start = start_idx + 6;
             if let Some(end_idx) = message[start..].find('"') {
                 &message[start..start + end_idx]
             } else {
                 return;
             }
-        } else if let Some(start_idx) = message.find("kullanıcısı için") {
-            // Turkish format - username is before "kullanıcısı için"
-            // Find it by searching backwards for quote
-            if let Some(end_idx) = message[..start_idx].rfind('"') {
-                if let Some(start_idx) = message[..end_idx].rfind('"') {
-                    &message[start_idx + 1..end_idx]
-                } else {
-                    return;
-                }
-            } else {
-                return;
-            }
         } else {
-            return; // Can't extract username
+            return;
         };
 
-        pgrx::log!("🚨 Failed login detected for user: {}", username);
+        pgrx::log!("Failed login attempt detected for user: {}", username);
 
         // Record the failed login attempt
-        // Use direct SPI call - we're in a log hook context where SPI should be available
-        // We use catch_unwind to prevent panics from crashing PostgreSQL
-        let _ = std::panic::catch_unwind(|| {
+        // Use catch_unwind to prevent panics from crashing PostgreSQL
+        let result = std::panic::catch_unwind(|| {
             // Try to record using SPI if available
             // SPI might not be initialized in all contexts, so we gracefully handle errors
             if let Ok(_) = pgrx::Spi::run(&format!(
@@ -555,6 +546,11 @@ unsafe fn register_log_hook() {
                 pgrx::log!("Recorded failed login for user: {}", username);
             }
         });
+        
+        // Log panic if catch_unwind caught one
+        if let Err(e) = result {
+            pgrx::warning!("Log hook: Failed to record login attempt: {:?}", e);
+        }
     }
 
     // Save previous hook and install ours
@@ -566,8 +562,8 @@ unsafe fn register_log_hook() {
 
 #[no_mangle]
 pub unsafe extern "C" fn _PG_init() {
-    // CRITICAL TEST: Is _PG_init being called at all?
-    pgrx::warning!(" _PG_init ÇAĞRILDI - BAŞLADI ");
+    // CRITICAL: Verify that _PG_init is being called during library load
+    pgrx::warning!("password_profile_pure: _PG_init called - extension loading");
 
     // Register shmem_request_hook to request shared memory space
     static mut PREV_SHMEM_REQUEST_HOOK: Option<unsafe extern "C-unwind" fn()> = None;
@@ -655,8 +651,8 @@ pub unsafe extern "C" fn _PG_init() {
     // Password history
     pgrx::GucRegistry::define_int_guc(
         c"password_profile.password_history_count",
-        c"Number of previous passwords to check",
-        c"Prevent reuse of last N passwords",
+        c"Number of previous passwords to check (0=disabled)",
+        c"Prevent reuse of last N passwords. Set to 0 to disable history checking.",
         &PASSWORD_HISTORY_COUNT,
         0,
         24,
@@ -666,8 +662,8 @@ pub unsafe extern "C" fn _PG_init() {
 
     pgrx::GucRegistry::define_int_guc(
         c"password_profile.password_reuse_days",
-        c"Days before password can be reused",
-        c"Prevent reuse within time window",
+        c"Days before password can be reused (0=disabled)",
+        c"Prevent reuse within time window. Set to 0 to disable time-based checking.",
         &PASSWORD_REUSE_DAYS,
         0,
         3650,
@@ -678,8 +674,8 @@ pub unsafe extern "C" fn _PG_init() {
     // Password expiration
     pgrx::GucRegistry::define_int_guc(
         c"password_profile.password_expiry_days",
-        c"Days before password expires",
-        c"Force password change after N days (0=disabled)",
+        c"Days before password expires (0=disabled)",
+        c"Force password change after N days. Set to 0 to disable expiration.",
         &PASSWORD_EXPIRY_DAYS,
         0,
         3650,
@@ -712,8 +708,8 @@ pub unsafe extern "C" fn _PG_init() {
 
     pgrx::GucRegistry::define_int_guc(
         c"password_profile.lockout_minutes",
-        c"Account lockout duration",
-        c"Minutes to lock account after max failures",
+        c"Account lockout duration (minutes)",
+        c"Minutes to lock account after max failures. Must be at least 1 minute.",
         &LOCKOUT_MINUTES,
         1,
         1440,
@@ -779,8 +775,118 @@ fn add_timing_jitter() {
     let mut rng = rand::thread_rng();
     // Random delay between 10-50ms to mask timing variations
     let delay_ms = rng.gen_range(10..50);
-    pgrx::log!("⏰ Adding {}ms timing jitter", delay_ms);
+    pgrx::log!("Adding {}ms timing jitter for security", delay_ms);
     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+}
+
+/// SECURITY: Detect if a password string looks like a precomputed hash
+/// This prevents attackers from bypassing validation by entering hash strings directly
+/// 
+/// Detects:
+/// 1. PostgreSQL MD5: md5 + 32 hex chars (e.g., md5c4ca4238a0b923820dcc509a6f75849b)
+/// 2. bcrypt: $2a$, $2b$, $2x$, $2y$ formats (typically 60 chars)
+/// 3. argon2: $argon2i$, $argon2id$, $argon2d$ formats
+/// 4. SCRAM-SHA-256: SCRAM-SHA-256$ prefix
+/// 5. PBKDF2: $pbkdf2-sha256$ and similar
+/// 6. Raw MD5: exactly 32 hex chars (OPTIONAL - may cause false positives)
+/// 7. SHA-1: exactly 40 hex chars (OPTIONAL)
+/// 8. SHA-256: exactly 64 hex chars (OPTIONAL)
+/// 9. SHA-512: exactly 128 hex chars (OPTIONAL)
+/// 10. Generic hash pattern: long strings with $ delimiters
+fn is_hash_like(password: &str) -> bool {
+    if password.is_empty() {
+        return false;
+    }
+
+    let len = password.len();
+    let lower = password.to_lowercase();
+
+    // 1. PostgreSQL MD5 format: "md5" + 32 hex = 35 chars total
+    // Example: md5c4ca4238a0b923820dcc509a6f75849b
+    if len == 35 && lower.starts_with("md5") {
+        let hex_part = &password[3..];
+        if hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return true;
+        }
+    }
+
+    // 2. bcrypt formats: $2a$, $2b$, $2x$, $2y$
+    // Typical format: $2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW
+    // Length usually ~60 chars, but can be shorter in some implementations
+    // Format: $2[abxy]$<cost>$<salt+hash>
+    if (lower.starts_with("$2a$") 
+        || lower.starts_with("$2b$") 
+        || lower.starts_with("$2x$") 
+        || lower.starts_with("$2y$"))
+        && len >= 20  // Minimum reasonable bcrypt length (relaxed from 59)
+    {
+        return true;
+    }
+
+    // 3. argon2 formats: $argon2i$, $argon2id$, $argon2d$
+    // Example: $argon2id$v=19$m=65536,t=2,p=1$...
+    if lower.starts_with("$argon2i$") 
+        || lower.starts_with("$argon2id$") 
+        || lower.starts_with("$argon2d$") 
+    {
+        return true;
+    }
+
+    // 4. SCRAM-SHA-256 format
+    // Example: SCRAM-SHA-256$4096:salt$hash:proof
+    if lower.starts_with("scram-sha-256$") 
+        || lower.starts_with("scram-sha-1$") 
+    {
+        return true;
+    }
+
+    // 5. PBKDF2 formats
+    // Example: $pbkdf2-sha256$29000$...
+    if lower.starts_with("$pbkdf2") {
+        return true;
+    }
+
+    // 6. Django/Werkzeug formats
+    // Example: pbkdf2:sha256:... or sha1$salt$hash
+    if lower.starts_with("pbkdf2:") || lower.starts_with("sha1$") || lower.starts_with("sha256$") {
+        return true;
+    }
+
+    // 7. Raw MD5: exactly 32 hex chars (OPTIONAL - may reject valid hex passwords)
+    // Disabled by default to avoid false positives
+    // Uncomment if you want to strictly reject all 32-char hex strings
+    // if len == 32 && password.chars().all(|c| c.is_ascii_hexdigit()) {
+    //     return true;
+    // }
+
+    // 8. Common hash lengths (OPTIONAL - commented out to avoid false positives)
+    // SHA-1: 40 hex, SHA-256: 64 hex, SHA-512: 128 hex
+    // These might be legitimate passwords, so we're conservative here
+    if (len == 40 || len == 64 || len == 128) 
+        && password.chars().all(|c| c.is_ascii_hexdigit()) 
+    {
+        // Only reject if it looks TOO much like a hash (all lowercase/uppercase hex)
+        // Real passwords with these lengths are unlikely to be pure hex
+        return true;
+    }
+
+    // 9. Generic hash pattern: starts with $, has multiple $ delimiters, and is long
+    // This catches many other hash formats we might have missed
+    if password.starts_with('$') 
+        && len > 50 
+        && password.matches('$').count() >= 3 
+    {
+        return true;
+    }
+
+    // 10. crypt(3) formats: $1$ (MD5), $5$ (SHA-256), $6$ (SHA-512)
+    if (lower.starts_with("$1$") || lower.starts_with("$5$") || lower.starts_with("$6$")) 
+        && len > 20 
+    {
+        return true;
+    }
+
+    false
 }
 
 fn init_blacklist() {
@@ -809,6 +915,24 @@ fn is_blacklisted(password: &str) -> bool {
 
 #[pg_extern]
 fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // SECURITY LAYER 1: Defense-in-depth - reject hash-formatted input
+    // This is a second layer of protection (first is in the hook)
+    // Prevents attackers from bypassing validation by entering precomputed hashes
+    if is_hash_like(password) {
+        add_timing_jitter();
+        pgrx::log!(
+            "Security: Rejected hash-like password for user '{}' (length: {}, prefix: {})",
+            username,
+            password.len(),
+            if password.len() > 10 { &password[..10] } else { password }
+        );
+        return Err(
+            "Security violation: Password looks like a precomputed hash. \
+             Plain text passwords cannot be in hash format (bcrypt, MD5, SCRAM, etc.)"
+                .into(),
+        );
+    }
+
     // 1. Length check
     if password.len() < PASSWORD_MIN_LENGTH.get() as usize {
         add_timing_jitter(); // Prevent timing attacks
@@ -1526,26 +1650,24 @@ pub unsafe extern "C" fn log_monitor_main(_arg: pg_sys::Datum) {
                         for line in reader.lines().flatten() {
                             last_position += line.len() as u64 + 1; // +1 for newline
 
-                            // Parse authentication events:
-                            // Priority 1: Hook-based logs (clean, reliable)
-                            // Priority 2: Legacy FATAL logs (fallback for compatibility)
+                            // Parse authentication events from log line
+                            // Prefer hook-based logs (explicit), fallback to FATAL messages
                             let hook_failed = line.contains("password_profile: auth_failure");
                             let hook_success = line.contains("password_profile: auth_success");
 
-                            // Legacy FATAL patterns (English and Turkish)
+                            // Legacy fallback: FATAL authentication errors
                             let legacy_failed = !hook_failed
-                                && ((line.contains("FATAL") || line.contains("ÖLÜMCÜL"))
-                                    && (line.contains("password authentication failed")
-                                        || line.contains("şifre doğrulaması başarısız")));
+                                && line.contains("FATAL")
+                                && line.contains("password authentication failed");
                             let legacy_success =
                                 !hook_success && line.contains("connection authorized");
 
                             if hook_failed || legacy_failed {
                                 if let Some(username) = extract_username_from_log(&line) {
-                                    // Check for duplicate event
+                                    // Prevent duplicate processing of same event
                                     if !should_process_auth_event(&username, AuthEventKind::Failed)
                                     {
-                                        continue; // Skip duplicate
+                                        continue;
                                     }
 
                                     pgrx::log!("Failed login detected for user: {}", username);
@@ -1613,13 +1735,10 @@ pub unsafe extern "C" fn log_monitor_main(_arg: pg_sys::Datum) {
 }
 
 /// Extract username from PostgreSQL log line
+/// Supports multiple log formats and locales
 fn extract_username_from_log(line: &str) -> Option<String> {
-    // Try to match patterns like:
-    // English: "password authentication failed for user \"username\""
-    // English: "connection authorized: user=username"
-    // Turkish: "\"username\" kullanıcısı için şifre doğrulaması başarısız oldu"
-    // Custom hook log: "password_profile: auth_failure user=username"
-
+    // Pattern 1: Hook-generated logs (preferred)
+    // Format: "password_profile: auth_failure user=username"
     if let Some(pos) = line.find("password_profile: auth_") {
         if let Some(user_pos) = line[pos..].find("user=") {
             let after_user = &line[pos + user_pos + 5..];
@@ -1633,7 +1752,7 @@ fn extract_username_from_log(line: &str) -> Option<String> {
         }
     }
 
-    // Pattern 1: user="username" or user=\"username\"
+    // Pattern 2: Quoted username (user="username")
     if let Some(pos) = line.find("user=\"") {
         let after_user = &line[pos + 6..];
         if let Some(end_pos) = after_user.find('"') {
@@ -1641,7 +1760,7 @@ fn extract_username_from_log(line: &str) -> Option<String> {
         }
     }
 
-    // Pattern 2: user=username (no quotes)
+    // Pattern 3: Unquoted username (user=username)
     if let Some(pos) = line.find("user=") {
         let after_user = &line[pos + 5..];
         let username: String = after_user
@@ -1653,7 +1772,7 @@ fn extract_username_from_log(line: &str) -> Option<String> {
         }
     }
 
-    // Pattern 3: for user "username" (English)
+    // Pattern 4: English format (for user "username")
     if let Some(pos) = line.find("for user ") {
         let after_user = &line[pos + 9..];
         if after_user.starts_with('"') {
@@ -1668,36 +1787,6 @@ fn extract_username_from_log(line: &str) -> Option<String> {
                 .collect();
             if !username.is_empty() {
                 return Some(username);
-            }
-        }
-    }
-
-    // Pattern 4: "username" kullanıcısı için (Turkish)
-    // Example: "test_auto_login" kullanıcısı için şifre doğrulaması başarısız oldu
-    if line.contains("kullanıcısı") {
-        // Find all quoted strings in the line
-        let mut in_quotes = false;
-        let mut username = String::new();
-        let mut chars = line.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            if c == '"' {
-                if in_quotes {
-                    // End of quoted string - check if followed by " kullanıcısı"
-                    let remaining: String = chars.clone().collect();
-                    if remaining.trim_start().starts_with("kullanıcısı") {
-                        if !username.is_empty() {
-                            return Some(username);
-                        }
-                    }
-                    username.clear();
-                    in_quotes = false;
-                } else {
-                    in_quotes = true;
-                    username.clear();
-                }
-            } else if in_quotes {
-                username.push(c);
             }
         }
     }
