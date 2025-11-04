@@ -50,29 +50,45 @@ psql -c "CREATE EXTENSION password_profile_pure;"
 
 ## Quick Start
 
+### Automatic Password Validation (via Hook)
+
+The extension automatically validates passwords during user creation and password changes:
+
 ```sql
--- Check if a password meets policy requirements
+-- Password validation happens automatically via check_password_hook
+CREATE ROLE john WITH LOGIN PASSWORD 'weak';
+-- ERROR: Password validation failed: Password too short
+
+CREATE ROLE john WITH LOGIN PASSWORD 'MySecurePass123!';
+-- SUCCESS: Password validated and user created
+
+ALTER ROLE john PASSWORD 'password123';
+-- ERROR: Password is in blacklist (too common)
+
+-- Also works with psql \password command
+\password john
+-- Enter password: (will be validated automatically)
+```
+
+### Manual Functions (for Testing and Management)
+
+```sql
+-- Test password policy (without creating user)
 SELECT check_password('john', 'MySecurePass123!');
 -- Returns: Password accepted
 
--- Record a password change (stores bcrypt hash)
+-- Record a password change manually (stores bcrypt hash)
 SELECT record_password_change('john', 'MySecurePass123!');
 
 -- Check failed login attempts
 SELECT check_user_access('john');
 
--- Record failed login
-SELECT record_failed_login('john');
+-- Clear login attempts (requires superuser or same user)
+SELECT clear_login_attempts('john');
 
 -- Check if user is locked out
 SELECT is_user_locked('john');
 ```
-
-## Configuration (GUC Parameters)
-
-### Global Configuration
-
-```sql
 -- Set minimum password length
 ALTER SYSTEM SET password_profile.min_length = 12;
 
