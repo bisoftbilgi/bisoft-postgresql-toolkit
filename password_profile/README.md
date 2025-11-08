@@ -1,4 +1,4 @@
-# Password Profile Pure
+# Password Profile
 
 Enterprise‑grade password policy and authentication hardening for PostgreSQL.  
 Built with Rust + pgrx (v0.16.1). Tested primarily on PostgreSQL 16 and compatible with 14–15.
