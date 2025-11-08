@@ -1,41 +1,25 @@
-use bcrypt::{hash, verify, DEFAULT_COST};
+use bcrypt::{hash, verify};
 use pgrx::bgworkers::{BackgroundWorker, BackgroundWorkerBuilder, SignalWakeFlags};
 use pgrx::pg_sys;
 use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
 use pgrx::prelude::*;
+// SpiClient removed - using direct Spi calls instead of parameterized queries
 use rand::Rng;
-use std::collections::HashSet;
+use siphasher::sip::SipHasher13;
 use std::ffi::{CStr, CString};
+use std::hash::{Hash, Hasher};
 use std::os::raw::c_int;
 use std::ptr;
-use std::sync::{Mutex, Once};
-use std::time::{Duration, Instant};
+use std::sync::Once;
+use std::time::Duration;
 
 ::pgrx::pg_module_magic!();
-
-static BLACKLIST_INIT: Once = Once::new();
-// TODO: Consider using PostgreSQL's native shared memory instead of Rust Mutex for better integration
-static BLACKLIST_CACHE: Mutex<Option<HashSet<String>>> = Mutex::new(None);
-
-// Authentication event cache to prevent duplicate processing
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthEventKind {
-    Failed,
-    Success,
-}
-
-#[derive(Debug, Clone)]
-struct AuthEvent {
-    username: String,
-    kind: AuthEventKind,
-    timestamp: Instant,
-}
-
-static AUTH_EVENT_CACHE: Mutex<Vec<AuthEvent>> = Mutex::new(Vec::new());
 
 const LOCK_CACHE_SIZE: usize = 2048;
 const LOCK_USERNAME_BYTES: usize = 64;
 const MICROS_PER_SEC: i64 = 1_000_000;
+const BLACKLIST_HASH_SIZE: usize = 10000; // Match blacklist.txt size
+const AUTH_EVENT_RING_SIZE: usize = 1024;
 
 #[repr(C)]
 struct LockEntry {
@@ -44,6 +28,7 @@ struct LockEntry {
 }
 
 impl LockEntry {
+    #[allow(dead_code)]
     const fn new() -> Self {
         LockEntry {
             username: [0; LOCK_USERNAME_BYTES],
@@ -58,10 +43,64 @@ struct LockCache {
     entries: [LockEntry; LOCK_CACHE_SIZE],
 }
 
+/// Shared memory blacklist cache using sorted hash array for O(log n) lookup
+/// Memory: ~80KB shared vs ~80MB (1000 processes × 80KB each) with Mutex<HashSet>
+/// 
+/// CRITICAL: Uses fixed SipHash keys (k0, k1) stored in shared memory to ensure
+/// consistent hashing across all processes. Without fixed keys, each process
+/// would hash passwords differently, breaking lookups entirely.
+#[repr(C)]
+struct BlacklistCache {
+    lock: pg_sys::slock_t,
+    count: u32,                              // Number of hashes in array
+    sip_k0: u64,                             // SipHash key 0 (fixed per cluster)
+    sip_k1: u64,                             // SipHash key 1 (fixed per cluster)
+    hashes: [u64; BLACKLIST_HASH_SIZE],      // Sorted SipHash-13 values
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SharedAuthEvent {
+    username: [u8; LOCK_USERNAME_BYTES],
+    timestamp: pg_sys::TimestampTz,
+    is_failure: bool,
+}
+
+#[repr(C)]
+struct AuthEventRing {
+    lock: pg_sys::slock_t,
+    head: u32,
+    tail: u32,
+    dropped: u64,
+    events: [SharedAuthEvent; AUTH_EVENT_RING_SIZE],
+}
+
+/// RAII guard for PostgreSQL SpinLock - automatically releases lock on drop (panic-safe)
+struct SpinLockGuard {
+    lock_ptr: *mut pg_sys::slock_t,
+}
+
+impl SpinLockGuard {
+    /// Acquires SpinLock and returns RAII guard
+    /// SAFETY: Caller must ensure lock_ptr is valid for entire lifetime
+    unsafe fn new(lock_ptr: *mut pg_sys::slock_t) -> Self {
+        pg_sys::SpinLockAcquire(lock_ptr);
+        Self { lock_ptr }
+    }
+}
+
+impl Drop for SpinLockGuard {
+    fn drop(&mut self) {
+        // CRITICAL: Always release lock even if panic occurs
+        unsafe { pg_sys::SpinLockRelease(self.lock_ptr) }
+    }
+}
+
 static mut LOCK_CACHE: *mut LockCache = ptr::null_mut();
+static mut BLACKLIST_CACHE_SHM: *mut BlacklistCache = ptr::null_mut();
+static mut AUTH_EVENT_RING: *mut AuthEventRing = ptr::null_mut();
 
 // Hook registration - ensures hooks are registered exactly once
-static HOOK_INIT: Once = Once::new();
 static CLIENT_AUTH_HOOK_INIT: Once = Once::new();
 
 type ClientAuthHookRaw = unsafe extern "C" fn(port: *mut pg_sys::Port, status: c_int);
@@ -87,47 +126,13 @@ static PASSWORD_GRACE_LOGINS: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::n
 static FAILED_LOGIN_MAX: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(3);
 static LOCKOUT_MINUTES: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(2);
 
-// Log monitoring GUCs for background worker
-static LOG_DIRECTORY: pgrx::GucSetting<Option<CString>> =
-    pgrx::GucSetting::<Option<CString>>::new(None);
-static LOG_MONITOR_ENABLED: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
+// bcrypt hashing cost (4-31, default 10)
+// Higher = more secure but slower. Adjust based on hardware and security requirements.
+// Cost 10 = ~70ms, Cost 12 = ~300ms, Cost 8 = ~20ms
+static BCRYPT_COST: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(10);
 
-// ====================================================================================
-// Background Worker SPI Execution
-// ====================================================================================
-
-/// Execute SQL safely from background worker context using raw PostgreSQL SPI
-unsafe fn bg_execute_sql(sql: &str) {
-    let c_sql = match CString::new(sql) {
-        Ok(s) => s,
-        Err(_) => {
-            pgrx::warning!("Failed to create CString for SQL");
-            return;
-        }
-    };
-
-    // Begin transaction and connect to SPI
-    pg_sys::SetCurrentStatementStartTimestamp();
-    pg_sys::StartTransactionCommand();
-    pg_sys::SPI_connect();
-    pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
-
-    // Execute SQL statement
-    let result = pg_sys::SPI_execute(c_sql.as_ptr(), false, 0);
-
-    // Cleanup and commit/rollback
-    pg_sys::SPI_finish();
-    pg_sys::PopActiveSnapshot();
-
-    if result >= 0 {
-        pg_sys::CommitTransactionCommand();
-    } else {
-        pgrx::warning!("SPI_execute failed with code: {}", result);
-        pg_sys::AbortCurrentTransaction();
-    }
-
-    pg_sys::pgstat_report_stat(false);
-}
+// Bypass parameter for special users (superusers, service accounts)
+static BYPASS_PASSWORD_PROFILE: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(false);
 
 // ====================================================================================
 // PostgreSQL Hook Integration
@@ -177,7 +182,7 @@ unsafe fn register_password_check_hook() {
             // Call our validation function
             match check_password(username_str, password_str) {
                 Ok(_) => {
-                    pgrx::log!("Password validation passed for user: {}", username_str);
+                    // SECURITY: Do not log usernames
                 }
                 Err(e) => {
                     // Password validation failed - report error to PostgreSQL
@@ -214,6 +219,8 @@ extern "C" {
     fn password_profile_register_client_auth_hook(
         hook: Option<ClientAuthHookRaw>,
     ) -> Option<ClientAuthHookRaw>;
+    fn password_profile_raise_lockout_error(username: *const std::os::raw::c_char, remaining_seconds: c_int);
+    fn password_profile_user_exists(username: *const std::os::raw::c_char) -> c_int;
 }
 
 #[inline]
@@ -276,71 +283,77 @@ unsafe fn lock_cache_set(username: &str, expires_at: pg_sys::TimestampTz) {
     let cache = &mut *LOCK_CACHE;
     let now = pg_sys::GetCurrentTimestamp();
 
-    pg_sys::SpinLockAcquire(&mut cache.lock);
+    // Track operation result for logging AFTER lock release
+    enum CacheOp {
+        Updated,
+        Inserted,
+        Evicted(String),
+        OverwriteSlot0,
+    }
+    let operation: CacheOp;
 
-    if let Some(entry) = cache
-        .entries
-        .iter_mut()
-        .find(|e| e.username[0] != 0 && e.username == encoded)
+    // SAFETY: SpinLockGuard ensures lock release even if panic occurs
+    // CRITICAL: NO LOGGING INSIDE SPINLOCK! Log after guard drops.
     {
-        entry.expires_at = expires_at;
-        pgrx::log!(
+        let _guard = SpinLockGuard::new(&mut cache.lock);
+
+        if let Some(entry) = cache
+            .entries
+            .iter_mut()
+            .find(|e| e.username[0] != 0 && e.username == encoded)
+        {
+            entry.expires_at = expires_at;
+            operation = CacheOp::Updated;
+        } else if let Some(entry) = cache
+            .entries
+            .iter_mut()
+            .find(|e| e.username[0] == 0 || e.expires_at <= now)
+        {
+            entry.username = encoded;
+            entry.expires_at = expires_at;
+            operation = CacheOp::Inserted;
+        } else if let Some(oldest_entry) = cache.entries.iter_mut().min_by_key(|e| e.expires_at) {
+            // No free slots - evict oldest entry (LRU)
+            let old_username = std::str::from_utf8(&oldest_entry.username)
+                .unwrap_or("(invalid)")
+                .trim_end_matches('\0')
+                .to_string();
+            oldest_entry.username = encoded;
+            oldest_entry.expires_at = expires_at;
+            operation = CacheOp::Evicted(old_username);
+        } else {
+            // Fallback: overwrite slot 0 (should never happen)
+            cache.entries[0].username = encoded;
+            cache.entries[0].expires_at = expires_at;
+            operation = CacheOp::OverwriteSlot0;
+        }
+    } // Guard drops here, lock released
+
+    // Log AFTER releasing spinlock to avoid deadlock
+    match operation {
+        CacheOp::Updated => pgrx::log!(
             "password_profile: lock cache update existing user={} expires_at={}",
-            username,
-            expires_at
-        );
-        pg_sys::SpinLockRelease(&mut cache.lock);
-        return;
-    }
-
-    if let Some(entry) = cache
-        .entries
-        .iter_mut()
-        .find(|e| e.username[0] == 0 || e.expires_at <= now)
-    {
-        entry.username = encoded;
-        entry.expires_at = expires_at;
-        pgrx::log!(
+            username, expires_at
+        ),
+        CacheOp::Inserted => pgrx::log!(
             "password_profile: lock cache set user={} expires_at={}",
-            username,
-            expires_at
-        );
-        pg_sys::SpinLockRelease(&mut cache.lock);
-        return;
-    }
-
-    // No free slots - evict oldest entry (LRU)
-    if let Some(oldest_entry) = cache
-        .entries
-        .iter_mut()
-        .min_by_key(|e| e.expires_at)
-    {
-        let old_username = std::str::from_utf8(&oldest_entry.username)
-            .unwrap_or("(invalid)")
-            .trim_end_matches('\0');
-        pgrx::warning!(
-            "password_profile: LockCache full (2048 entries), evicting oldest entry: {}",
-            old_username
-        );
-        oldest_entry.username = encoded;
-        oldest_entry.expires_at = expires_at;
-        pgrx::log!(
-            "password_profile: lock cache evicted and set user={} expires_at={}",
-            username,
-            expires_at
-        );
-    } else {
-        // Fallback: overwrite slot 0 (should never happen)
-        cache.entries[0].username = encoded;
-        cache.entries[0].expires_at = expires_at;
-        pgrx::log!(
+            username, expires_at
+        ),
+        CacheOp::Evicted(old_user) => {
+            pgrx::warning!(
+                "password_profile: LockCache full (2048 entries), evicting oldest entry: {}",
+                old_user
+            );
+            pgrx::log!(
+                "password_profile: lock cache evicted and set user={} expires_at={}",
+                username, expires_at
+            );
+        }
+        CacheOp::OverwriteSlot0 => pgrx::log!(
             "password_profile: lock cache overwrite slot0 user={} expires_at={}",
-            username,
-            expires_at
-        );
+            username, expires_at
+        ),
     }
-
-    pg_sys::SpinLockRelease(&mut cache.lock);
 }
 
 unsafe fn lock_cache_clear(username: &str) {
@@ -350,16 +363,21 @@ unsafe fn lock_cache_clear(username: &str) {
     let encoded = encode_username(username);
     let cache = &mut *LOCK_CACHE;
 
-    pg_sys::SpinLockAcquire(&mut cache.lock);
-    for entry in cache.entries.iter_mut() {
-        if entry.username[0] != 0 && entry.username == encoded {
-            entry.username = [0; LOCK_USERNAME_BYTES];
-            entry.expires_at = 0;
-            pgrx::log!("password_profile: lock cache cleared user={}", username);
-            break;
+    // SAFETY: SpinLockGuard ensures lock release even if panic occurs
+    // CRITICAL: NO LOGGING INSIDE SPINLOCK!
+    {
+        let _guard = SpinLockGuard::new(&mut cache.lock);
+        
+        for entry in cache.entries.iter_mut() {
+            if entry.username[0] != 0 && entry.username == encoded {
+                entry.username = [0; LOCK_USERNAME_BYTES];
+                entry.expires_at = 0;
+                break;
+            }
         }
-    }
-    pg_sys::SpinLockRelease(&mut cache.lock);
+    } // Guard drops here, lock released
+
+    // SECURITY: Do not log usernames
 }
 
 unsafe fn lock_cache_remaining_seconds(username: &str) -> Option<i64> {
@@ -372,17 +390,21 @@ unsafe fn lock_cache_remaining_seconds(username: &str) -> Option<i64> {
     let now = pg_sys::GetCurrentTimestamp();
     let mut remaining = None;
 
-    pg_sys::SpinLockAcquire(&mut cache.lock);
-    for entry in cache.entries.iter() {
-        if entry.username[0] == 0 {
-            continue;
+    // SAFETY: SpinLockGuard ensures lock release even if panic occurs
+    {
+        let _guard = SpinLockGuard::new(&mut cache.lock);
+        
+        for entry in cache.entries.iter() {
+            if entry.username[0] == 0 {
+                continue;
+            }
+            if entry.username == encoded && entry.expires_at > now {
+                remaining = Some(((entry.expires_at - now) / MICROS_PER_SEC) as i64);
+                break;
+            }
         }
-        if entry.username == encoded && entry.expires_at > now {
-            remaining = Some(((entry.expires_at - now) / MICROS_PER_SEC) as i64);
-            break;
-        }
+        // Guard drops here, releases lock
     }
-    pg_sys::SpinLockRelease(&mut cache.lock);
 
     let filtered = remaining.filter(|secs| *secs > 0);
     if filtered.is_none() {
@@ -394,51 +416,154 @@ unsafe fn lock_cache_remaining_seconds(username: &str) -> Option<i64> {
     filtered
 }
 
+unsafe fn auth_event_ring_init() {
+    if !AUTH_EVENT_RING.is_null() {
+        return;
+    }
+
+    let size = std::mem::size_of::<AuthEventRing>();
+    let mut found = false;
+    let ring_ptr = pg_sys::ShmemInitStruct(
+        c"password_profile_auth_event_ring".as_ptr(),
+        size,
+        &mut found as *mut bool,
+    ) as *mut AuthEventRing;
+
+    if ring_ptr.is_null() {
+        pgrx::error!("password_profile: failed to initialize auth event ring");
+    }
+
+    if !found {
+        (*ring_ptr).lock = 0;
+        pg_sys::SpinLockInit(&mut (*ring_ptr).lock);
+        (*ring_ptr).head = 0;
+        (*ring_ptr).tail = 0;
+        (*ring_ptr).dropped = 0;
+        (*ring_ptr).events.iter_mut().for_each(|event| {
+            event.username = [0; LOCK_USERNAME_BYTES];
+            event.timestamp = 0;
+            event.is_failure = false;
+        });
+        pgrx::log!(
+            "password_profile: auth event ring allocated ({} bytes)",
+            size
+        );
+    } else {
+        pgrx::log!("password_profile: auth event ring attached to existing segment");
+    }
+
+    AUTH_EVENT_RING = ring_ptr;
+}
+
+fn enqueue_auth_event(username: &str, is_failure: bool) {
+    unsafe {
+        if AUTH_EVENT_RING.is_null() {
+            pgrx::warning!("password_profile: auth event ring not initialized");
+            return;
+        }
+
+        let encoded = encode_username(username);
+        let ring = &mut *AUTH_EVENT_RING;
+
+        let mut dropped_event = false;
+
+        {
+            let _guard = SpinLockGuard::new(&mut ring.lock);
+            let next_head = (ring.head + 1) % AUTH_EVENT_RING_SIZE as u32;
+            if next_head == ring.tail {
+                // Ring full - drop oldest
+                ring.tail = (ring.tail + 1) % AUTH_EVENT_RING_SIZE as u32;
+                ring.dropped = ring.dropped.saturating_add(1);
+                dropped_event = true;
+            }
+
+            ring.events[ring.head as usize] = SharedAuthEvent {
+                username: encoded,
+                timestamp: pg_sys::GetCurrentTimestamp(),
+                is_failure,
+            };
+            ring.head = next_head;
+        }
+
+        if dropped_event {
+            pgrx::warning!("password_profile: auth event ring full, dropping oldest event");
+        }
+    }
+}
+
+fn dequeue_auth_event() -> Option<SharedAuthEvent> {
+    unsafe {
+        if AUTH_EVENT_RING.is_null() {
+            return None;
+        }
+        let ring = &mut *AUTH_EVENT_RING;
+        let mut event = None;
+        {
+            let _guard = SpinLockGuard::new(&mut ring.lock);
+            if ring.tail != ring.head {
+                event = Some(ring.events[ring.tail as usize]);
+                ring.tail = (ring.tail + 1) % AUTH_EVENT_RING_SIZE as u32;
+            }
+        }
+        event
+    }
+}
+
+fn username_from_bytes(bytes: &[u8]) -> Option<String> {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    if end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&bytes[..end]).ok().map(|s| s.to_string())
+}
+
 unsafe extern "C" fn client_auth_hook(port: *mut pg_sys::Port, status: c_int) {
     let username_ptr = password_profile_port_username(port);
     if !username_ptr.is_null() {
         if let Ok(username_str) = CStr::from_ptr(username_ptr).to_str() {
-            // Check lockout BEFORE authentication - reject early
             if let Some(seconds) = lock_cache_remaining_seconds(username_str) {
                 if seconds > 0 {
-                    pgrx::log!(
-                        "password_profile: LOCKOUT ENFORCED for {} (remaining {}s) - CONNECTION REJECTED",
-                        username_str,
-                        seconds
-                    );
-
-                    let minutes = seconds / 60;
-                    let secs = seconds % 60;
-                    pgrx::log!(
-                        "password_profile: Account locked for user '{}'. Please wait {} minute(s) and {} second(s) before retrying.",
-                        username_str,
-                        minutes,
-                        secs
-                    );
-
+                    // SECURITY: Do not log usernames
                     add_timing_jitter();
 
-                    // Call previous hook with failed status to reject connection
-                    // Note: Cannot send custom error message to client from auth hook
-                    // Client will see generic "password authentication failed"
-                    // but lockout is ENFORCED and logged
-                    if let Some(prev_hook) = PREV_CLIENT_AUTH_HOOK {
-                        pg_guard_ffi_boundary(|| prev_hook(port, pg_sys::STATUS_EOF as c_int));
+                    static FALLBACK_USERNAME: &[u8] = b"locked_user\0";
+                    let c_username = CString::new(username_str)
+                        .unwrap_or_else(|_| unsafe {
+                            CStr::from_bytes_with_nul_unchecked(FALLBACK_USERNAME).to_owned()
+                        });
+                    unsafe {
+                        password_profile_raise_lockout_error(c_username.as_ptr(), seconds as c_int);
                     }
-                    return; // Early exit - connection rejected
                 }
             }
 
-            // Log auth result for non-locked users
-            if status == pg_sys::STATUS_OK as c_int {
-                pgrx::log!("password_profile: auth_success user={}", username_str);
+            let is_failure = status != pg_sys::STATUS_OK as c_int;
+            
+            if is_failure {
+                // Check if user exists in pg_authid before tracking
+                let user_exists = password_profile_user_exists(username_ptr);
+                
+                if user_exists == 1 {
+                    // User exists but password wrong - track it
+                    enqueue_auth_event(username_str, true);
+                    // SECURITY: Do not log usernames
+                } else if user_exists == 0 {
+                    // User does not exist - don't track
+                    // SECURITY: Do not log usernames
+                } else {
+                    // Error checking user existence - track to be safe
+                    enqueue_auth_event(username_str, true);
+                    // SECURITY: Do not log usernames
+                }
             } else {
-                pgrx::log!("password_profile: auth_failure user={}", username_str);
+                // Success - clear failure count
+                enqueue_auth_event(username_str, false);
+                // SECURITY: Do not log usernames
             }
         }
     }
 
-    // Preserve existing hook chain for normal auth flow
+    // Call previous hook
     if let Some(prev_hook) = PREV_CLIENT_AUTH_HOOK {
         pg_guard_ffi_boundary(|| prev_hook(port, status));
     }
@@ -455,111 +580,6 @@ fn register_client_auth_hook() {
     });
 }
 
-// ====================================================================================
-// Hook Initialization - Ensures hooks are registered exactly once
-// ====================================================================================
-
-/// Ensures all hooks are registered. Safe to call multiple times.
-/// This is called from SQL functions since _PG_init doesn't work with pgrx + CREATE EXTENSION
-pub fn ensure_hooks_registered() {
-    HOOK_INIT.call_once(|| {
-        unsafe {
-            register_log_hook();
-            pgrx::log!("Hooks registered via ensure_hooks_registered()");
-        }
-        register_client_auth_hook();
-    });
-}
-
-// ====================================================================================
-// Log Hook - Track Failed Logins via PostgreSQL Logs
-// ====================================================================================
-
-extern "C" {
-    #[link_name = "emit_log_hook"]
-    static mut emit_log_hook: Option<unsafe extern "C" fn(edata: *mut pg_sys::ErrorData)>;
-}
-
-/// Register emit_log_hook to intercept PostgreSQL logs and detect failed logins
-unsafe fn register_log_hook() {
-    pgrx::log!("Registering PostgreSQL log hook for authentication monitoring");
-
-    static mut PREV_LOG_HOOK: Option<unsafe extern "C" fn(edata: *mut pg_sys::ErrorData)> = None;
-
-    unsafe extern "C" fn log_hook_impl(edata: *mut pg_sys::ErrorData) {
-        // Call previous hook first (if exists)
-        if let Some(prev_hook) = PREV_LOG_HOOK {
-            prev_hook(edata);
-        }
-
-        if edata.is_null() {
-            return;
-        }
-
-        let error_data = &*edata;
-
-        // Check if this is an authentication error (elevel = ERROR or FATAL)
-        // FATAL = 22 in PostgreSQL, ERROR = 21
-        if error_data.elevel < 21 {
-            return; // Skip non-error logs
-        }
-
-        // Get the error message
-        let message = if error_data.message.is_null() {
-            return;
-        } else {
-            match std::ffi::CStr::from_ptr(error_data.message).to_str() {
-                Ok(s) => s,
-                Err(_) => return,
-            }
-        };
-
-        // Detect failed authentication from log message
-        if !message.contains("password authentication failed") {
-            return;
-        }
-
-        // Extract username from authentication error message
-        // Format: 'password authentication failed for user "username"'
-        let username = if let Some(start_idx) = message.find("user \"") {
-            let start = start_idx + 6;
-            if let Some(end_idx) = message[start..].find('"') {
-                &message[start..start + end_idx]
-            } else {
-                return;
-            }
-        } else {
-            return;
-        };
-
-        pgrx::log!("Failed login attempt detected for user: {}", username);
-
-        // Record the failed login attempt
-        // Use catch_unwind to prevent panics from crashing PostgreSQL
-        let result = std::panic::catch_unwind(|| {
-            // Try to record using SPI if available
-            // SPI might not be initialized in all contexts, so we gracefully handle errors
-            if let Ok(_) = pgrx::Spi::run(&format!(
-                "SELECT record_failed_login('{}')",
-                username.replace("'", "''") // SQL injection protection
-            )) {
-                pgrx::log!("Recorded failed login for user: {}", username);
-            }
-        });
-        
-        // Log panic if catch_unwind caught one
-        if let Err(e) = result {
-            pgrx::warning!("Log hook: Failed to record login attempt: {:?}", e);
-        }
-    }
-
-    // Save previous hook and install ours
-    PREV_LOG_HOOK = emit_log_hook;
-    emit_log_hook = Some(log_hook_impl);
-
-    pgrx::log!("Log hook registration complete");
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn _PG_init() {
     // CRITICAL: Verify that _PG_init is being called during library load
@@ -573,6 +593,8 @@ pub unsafe extern "C" fn _PG_init() {
             prev();
         }
         pg_sys::RequestAddinShmemSpace(std::mem::size_of::<LockCache>());
+        pg_sys::RequestAddinShmemSpace(std::mem::size_of::<BlacklistCache>());
+        pg_sys::RequestAddinShmemSpace(std::mem::size_of::<AuthEventRing>());
     }
 
     PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
@@ -586,6 +608,8 @@ pub unsafe extern "C" fn _PG_init() {
             prev();
         }
         lock_cache_init();
+        blacklist_cache_init(); // Initialize blacklist in shared memory
+        auth_event_ring_init(); // Initialize auth event queue
     }
 
     PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
@@ -717,35 +741,36 @@ pub unsafe extern "C" fn _PG_init() {
         pgrx::GucFlags::default(),
     );
 
-    // Log monitoring GUCs
-    pgrx::GucRegistry::define_string_guc(
-        c"password_profile.log_directory",
-        c"PostgreSQL log directory path",
-        c"If not set, uses PostgreSQL's log_directory setting",
-        &LOG_DIRECTORY,
+    pgrx::GucRegistry::define_int_guc(
+        c"password_profile.bcrypt_cost",
+        c"bcrypt hashing cost factor (4-31, default 10)",
+        c"Higher = more secure but slower. Cost 10 = ~70ms, Cost 12 = ~300ms, Cost 8 = ~20ms. Adjust based on hardware capabilities.",
+        &BCRYPT_COST,
+        4,
+        31,
         pgrx::GucContext::Suset,
         pgrx::GucFlags::default(),
     );
 
+    // Bypass parameter for exempting users from password profile checks
     pgrx::GucRegistry::define_bool_guc(
-        c"password_profile.log_monitor_enabled",
-        c"Enable automatic failed login tracking via log monitoring",
-        c"Requires shared_preload_libraries",
-        &LOG_MONITOR_ENABLED,
+        c"password_profile.bypass_password_profile",
+        c"Bypass all password profile checks for this user",
+        c"Set to true to exempt a user from password validation, history, expiry, and lockout checks. Use with ALTER USER username SET password_profile.bypass_password_profile = true;",
+        &BYPASS_PASSWORD_PROFILE,
         pgrx::GucContext::Suset,
         pgrx::GucFlags::default(),
     );
 
-    // Background worker for log monitoring
-    if LOG_MONITOR_ENABLED.get() {
-        BackgroundWorkerBuilder::new("password_profile_log_monitor")
-            .set_function("log_monitor_main")
-            .set_library("password_profile_pure") // MUST match Cargo.toml [package] name
-            .set_argument(None::<i32>.into_datum())
-            .enable_spi_access()
-            .load();
-        pgrx::info!("password_profile: log monitor background worker registered");
-    }
+    // Background worker: consume auth events from shared memory
+    BackgroundWorkerBuilder::new("password_profile_auth_event_consumer")
+        .set_function("auth_event_consumer_main")
+        .set_library("password_profile") // MUST match Cargo.toml [package] name AND .so filename
+        .set_argument(None::<i32>.into_datum())
+        .set_restart_time(Some(Duration::from_secs(1)))
+        .enable_spi_access()
+        .load();
+    pgrx::info!("password_profile: auth event consumer background worker registered");
 
     // Register check_password_hook
     pgrx::log!("password_profile: Registering hooks...");
@@ -754,18 +779,39 @@ pub unsafe extern "C" fn _PG_init() {
         pgrx::log!("password_profile: Password check hook registered");
     }
     register_client_auth_hook();
+    // Note: log_hook removed - using SQLSTATE check in client_auth_hook instead
+
+    // CRITICAL FIX: CANNOT call SPI functions (Spi::run) during _PG_init!
+    // _PG_init runs in the postmaster process during shared library load,
+    // and SPI is not available/initialized at this phase. Calling SPI here
+    // causes FATAL errors: "SPI_connect() can only be called from a normal backend"
+    // or crashes the entire PostgreSQL server.
+    //
+    // Table creation has been moved to sql/password_profile--0.0.0.sql
+    // which is automatically executed during CREATE EXTENSION.
+    // Removed init_login_attempts_table() call from here.
 
     pgrx::log!("password_profile initialized with all features");
 }
 
 // Safe SQL escaping helper - uses PostgreSQL's quote_literal for proper escaping
 fn quote_literal(s: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let query = format!(
-        "SELECT quote_literal({})",
-        // First escape for Rust string, then PostgreSQL will properly escape
-        format!("'{}'", s.replace("'", "''"))
-    );
-    Spi::get_one::<String>(&query)?.ok_or_else(|| "Failed to quote string".into())
+    // Use PostgreSQL's native quote_literal_cstr for proper SQL escaping
+    // This is faster and more reliable than manual string replacement
+    use std::ffi::CString;
+    
+    let c_str = CString::new(s)?;
+    unsafe {
+        let quoted = pg_sys::quote_literal_cstr(c_str.as_ptr());
+        if quoted.is_null() {
+            return Err("quote_literal_cstr returned NULL".into());
+        }
+        let result = std::ffi::CStr::from_ptr(quoted)
+            .to_str()?
+            .to_string();
+        pg_sys::pfree(quoted as *mut std::ffi::c_void);
+        Ok(result)
+    }
 }
 
 // Timing attack prevention: Add small random delay on auth failures
@@ -775,7 +821,7 @@ fn add_timing_jitter() {
     let mut rng = rand::thread_rng();
     // Random delay between 10-50ms to mask timing variations
     let delay_ms = rng.gen_range(10..50);
-    pgrx::log!("Adding {}ms timing jitter for security", delay_ms);
+    // SECURITY: Do NOT log timing delay - prevents information leakage
     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 }
 
@@ -889,43 +935,163 @@ fn is_hash_like(password: &str) -> bool {
     false
 }
 
-fn init_blacklist() {
-    BLACKLIST_INIT.call_once(|| {
+/// Initialize blacklist cache in shared memory (called once at extension load)
+unsafe fn blacklist_cache_init() {
+    if !BLACKLIST_CACHE_SHM.is_null() {
+        return; // Already initialized
+    }
+
+    let size = std::mem::size_of::<BlacklistCache>();
+    let mut found = false;
+    let cache_ptr = pg_sys::ShmemInitStruct(
+        c"password_profile_blacklist_cache".as_ptr(),
+        size,
+        &mut found as *mut bool,
+    ) as *mut BlacklistCache;
+
+    if cache_ptr.is_null() {
+        pgrx::error!("password_profile: failed to initialize blacklist cache");
+    }
+
+    if !found {
+        // First process to attach - initialize cache
+        (*cache_ptr).lock = 0;
+        pg_sys::SpinLockInit(&mut (*cache_ptr).lock);
+        (*cache_ptr).count = 0;
+        
+        // CRITICAL FIX: Use fixed SipHash keys so all processes hash consistently
+        // Without fixed keys, each process would use RandomState::new() which generates
+        // different keys per process, making lookups fail 100% of the time.
+        // These keys are arbitrary but must be consistent across the cluster.
+        (*cache_ptr).sip_k0 = 0x0706050403020100u64; // Fixed key 0
+        (*cache_ptr).sip_k1 = 0x0f0e0d0c0b0a0908u64; // Fixed key 1
+        
+        // Load blacklist.txt and hash all entries with FIXED keys
         let content = include_str!("../blacklist.txt");
-        let set: HashSet<String> = content
+        let mut hashes: Vec<u64> = content
             .lines()
             .map(|l| l.trim().to_lowercase())
             .filter(|l| !l.is_empty())
+            .map(|password| {
+                // Use SipHasher13 with FIXED keys from shared memory
+                let mut hasher = SipHasher13::new_with_keys(
+                    (*cache_ptr).sip_k0,
+                    (*cache_ptr).sip_k1
+                );
+                password.hash(&mut hasher);
+                hasher.finish()
+            })
             .collect();
-        pgrx::info!("Loaded {} passwords", set.len());
-        if let Ok(mut cache) = BLACKLIST_CACHE.lock() {
-            *cache = Some(set);
+
+        // Sort for binary search
+        hashes.sort_unstable();
+        
+        let count = hashes.len().min(BLACKLIST_HASH_SIZE);
+        (*cache_ptr).count = count as u32;
+        
+        // Copy to shared memory
+        for (i, hash) in hashes.iter().take(count).enumerate() {
+            (*cache_ptr).hashes[i] = *hash;
         }
-    });
+        
+        pgrx::log!(
+            "password_profile: blacklist cache initialized with {} passwords ({} bytes, keys: 0x{:x}, 0x{:x})",
+            count,
+            size,
+            (*cache_ptr).sip_k0,
+            (*cache_ptr).sip_k1
+        );
+    } else {
+        pgrx::log!("password_profile: blacklist cache attached to existing segment");
+    }
+
+    BLACKLIST_CACHE_SHM = cache_ptr;
 }
 
+/// Check if password is blacklisted using binary search on sorted hash array
+/// Time: O(log n) = O(log 10000) = ~13 comparisons max
+/// 
+/// CRITICAL: Must use the SAME fixed SipHash keys as blacklist_cache_init()
 fn is_blacklisted(password: &str) -> bool {
-    init_blacklist();
-    BLACKLIST_CACHE
-        .lock()
-        .ok()
-        .and_then(|c| c.as_ref().map(|s| s.contains(&password.to_lowercase())))
-        .unwrap_or(false)
+    // Check database blacklist table first (dynamic entries)
+    // Only if we're in a proper backend context (not during _PG_init or early auth)
+    if unsafe { pg_sys::IsUnderPostmaster } {
+        // Try database check, but silently fail if database context not ready
+        let pwd_escaped = password.replace("'", "''");
+        let db_check = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS(SELECT 1 FROM password_profile.blacklist WHERE password = '{}')",
+            pwd_escaped
+        ));
+        
+        // If query succeeds and found in DB, reject immediately
+        if let Ok(Some(true)) = db_check {
+            return true;
+        }
+        // If query fails (table doesn't exist, no DB selected, etc.), fall through to static cache
+    }
+    
+    // Check compile-time blacklist cache (static entries)
+    unsafe {
+        if BLACKLIST_CACHE_SHM.is_null() {
+            pgrx::warning!("Blacklist cache not initialized");
+            return false;
+        }
+
+        let cache = &*BLACKLIST_CACHE_SHM;
+        
+        // Hash the input password using THE SAME fixed keys from shared memory
+        // CRITICAL: Must use the exact same SipHasher13 keys as init, otherwise
+        // hashes won't match and blacklist lookups will always fail.
+        let mut hasher = SipHasher13::new_with_keys(cache.sip_k0, cache.sip_k1);
+        password.to_lowercase().hash(&mut hasher);
+        let password_hash = hasher.finish();
+
+        let found: bool;
+        let count: usize;
+
+        // Binary search in sorted hash array (SpinLock for read)
+        // CRITICAL: NO LOGGING INSIDE SPINLOCK!
+        {
+            let _guard = SpinLockGuard::new(&mut (*BLACKLIST_CACHE_SHM).lock);
+            
+            count = cache.count as usize;
+            let hashes = &cache.hashes[0..count];
+            
+            // Binary search
+            found = hashes.binary_search(&password_hash).is_ok();
+        } // Guard drops, lock released
+
+        // SECURITY: Do NOT log passwords or hashes in production
+        // Removed debug logging to prevent information leakage
+        found
+    }
 }
 
 #[pg_extern]
 fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // Check if user has bypass enabled (per-user setting)
+    let username_quoted = quote_literal(username)?;
+    let bypass_check = Spi::get_one::<bool>(&format!(
+        "SELECT COALESCE(
+            (SELECT (unnest(useconfig) LIKE 'password_profile.bypass_password_profile=true')
+             FROM pg_user WHERE usename = {}
+             LIMIT 1),
+            false
+        )",
+        username_quoted
+    ));
+    
+    if let Ok(Some(true)) = bypass_check {
+        // SECURITY: Do not log usernames
+        return Ok("Password accepted (bypassed)".to_string());
+    }
+
     // SECURITY LAYER 1: Defense-in-depth - reject hash-formatted input
     // This is a second layer of protection (first is in the hook)
     // Prevents attackers from bypassing validation by entering precomputed hashes
     if is_hash_like(password) {
         add_timing_jitter();
-        pgrx::log!(
-            "Security: Rejected hash-like password for user '{}' (length: {}, prefix: {})",
-            username,
-            password.len(),
-            if password.len() > 10 { &password[..10] } else { password }
-        );
+        // SECURITY: Do not log usernames or password details
         return Err(
             "Security violation: Password looks like a precomputed hash. \
              Plain text passwords cannot be in hash format (bcrypt, MD5, SCRAM, etc.)"
@@ -1137,85 +1303,114 @@ fn init_login_attempts_table() -> Result<String, Box<dyn std::error::Error>> {
 
 #[pg_extern]
 fn record_failed_login(username: &str) -> Result<String, Box<dyn std::error::Error>> {
-    // Ensure hooks are registered on first call
-    ensure_hooks_registered();
+    let my_db_id = unsafe { std::ptr::addr_of!(pg_sys::MyDatabaseId).read() };
+    if my_db_id == pg_sys::InvalidOid {
+        return Ok("Skipped - no database context".to_string());
+    }
 
+    // CRITICAL: Use single Spi::connect() to avoid nested SPI calls
+    // This prevents SIGSEGV when called from background worker transaction
     let username_quoted = quote_literal(username)?;
+    let (is_superuser, bypass_check, _lockout_min, max_fails) = Spi::connect(|_client| -> Result<(bool, bool, i32, i32), Box<dyn std::error::Error>> {
+        // Check if user is superuser (never lock superusers)
+        let is_super = Spi::get_one::<bool>(&format!(
+            "SELECT COALESCE((SELECT usesuper FROM pg_user WHERE usename = {}), false)",
+            username_quoted
+        ))?.unwrap_or(false);
+        
+        if is_super {
+            return Ok((true, false, 0, 0));
+        }
+
+        // Check bypass setting
+        let bypass = Spi::get_one::<bool>(&format!(
+            "SELECT COALESCE(
+                (SELECT (unnest(useconfig) LIKE 'password_profile.bypass_password_profile=true')
+                 FROM pg_user WHERE usename = {}
+                 LIMIT 1),
+                false
+            )",
+            username_quoted
+        ))?.unwrap_or(false);
+        
+        if bypass {
+            return Ok((false, true, 0, 0));
+        }
+
+        // Get user-specific settings
+        let lockout = Spi::get_one::<i32>(&format!(
+            "SELECT COALESCE(
+                (SELECT substring(cfg FROM 'password_profile\\.lockout_minutes=([0-9]+)')::int
+                 FROM unnest((SELECT useconfig FROM pg_user WHERE usename = {})) AS cfg
+                 WHERE cfg LIKE 'password_profile.lockout_minutes=%'),
+                {}
+            )",
+            username_quoted, LOCKOUT_MINUTES.get()
+        ))?.unwrap_or(LOCKOUT_MINUTES.get());
+        
+        let max_fails_val = Spi::get_one::<i32>(&format!(
+            "SELECT COALESCE(
+                (SELECT substring(cfg FROM 'password_profile\\.failed_login_max=([0-9]+)')::int
+                 FROM unnest((SELECT useconfig FROM pg_user WHERE usename = {})) AS cfg
+                 WHERE cfg LIKE 'password_profile.failed_login_max=%'),
+                {}
+            )",
+            username_quoted, FAILED_LOGIN_MAX.get()
+        ))?.unwrap_or(FAILED_LOGIN_MAX.get());
+
+        // Cleanup expired lockouts
+        Spi::run(&format!(
+            "UPDATE password_profile.login_attempts 
+             SET fail_count = 0, lockout_until = NULL
+             WHERE username = {} AND lockout_until IS NOT NULL AND lockout_until <= now()",
+            username_quoted
+        ))?;
+
+        // Insert or update failed attempt
+        Spi::run(&format!(
+            "INSERT INTO password_profile.login_attempts (username, fail_count, last_fail, lockout_until)
+             VALUES ({}, 1, now(), NULL)
+             ON CONFLICT (username) DO UPDATE SET
+                 fail_count = password_profile.login_attempts.fail_count + 1,
+                 last_fail = now(),
+                 lockout_until = CASE
+                     WHEN password_profile.login_attempts.fail_count + 1 >= {}
+                     THEN now() + make_interval(mins => {})
+                     ELSE NULL
+                 END",
+            username_quoted, max_fails_val, lockout
+        ))?;
+
+        Ok((false, false, lockout, max_fails_val))
+    })?;
     
-    // Get user-specific lockout_minutes from pg_user.useconfig or use global default
-    let lockout_min = Spi::get_one::<i32>(&format!(
-        "SELECT COALESCE(
-            (SELECT substring(cfg FROM 'password_profile\\.lockout_minutes=([0-9]+)')::int
-             FROM unnest((SELECT useconfig FROM pg_user WHERE usename = {})) AS cfg
-             WHERE cfg LIKE 'password_profile.lockout_minutes=%'),
-            {}
-        )",
-        username_quoted, LOCKOUT_MINUTES.get()
-    ))?.unwrap_or(LOCKOUT_MINUTES.get());
+    if is_superuser {
+        return Ok("Superuser bypassed".to_string());
+    }
     
-    // Get user-specific failed_login_max from pg_user.useconfig or use global default
-    let max_fails = Spi::get_one::<i32>(&format!(
-        "SELECT COALESCE(
-            (SELECT substring(cfg FROM 'password_profile\\.failed_login_max=([0-9]+)')::int
-             FROM unnest((SELECT useconfig FROM pg_user WHERE usename = {})) AS cfg
-             WHERE cfg LIKE 'password_profile.failed_login_max=%'),
-            {}
-        )",
-        username_quoted, FAILED_LOGIN_MAX.get()
-    ))?.unwrap_or(FAILED_LOGIN_MAX.get());
+    if bypass_check {
+        return Ok("Bypassed failed login tracking".to_string());
+    }
 
-    pgrx::log!(
-        "password_profile: User {} - lockout_minutes={}, max_fails={}",
-        username, lockout_min, max_fails
-    );
-
-    // First, clean up ONLY truly expired lockouts (not NULL, and past expiration)
-    let cleanup_query = format!(
-        "UPDATE password_profile.login_attempts 
-         SET fail_count = 0, lockout_until = NULL
-         WHERE username = {} AND lockout_until IS NOT NULL AND lockout_until <= now()",
-        username_quoted
-    );
-    pgrx::log!("password_profile: Running cleanup query: {}", cleanup_query);
-    Spi::run(&cleanup_query)?;
-
-    let query = format!(
-        "INSERT INTO password_profile.login_attempts (username, fail_count, last_fail, lockout_until)
-         VALUES ({}, 1, now(), NULL)
-         ON CONFLICT (username) DO UPDATE SET
-             fail_count = password_profile.login_attempts.fail_count + 1,
-             last_fail = now(),
-             lockout_until = CASE
-                 WHEN password_profile.login_attempts.fail_count + 1 >= {}
-                 THEN now() + interval '{} minutes'
-                 ELSE NULL
-             END",
-        username_quoted, max_fails, lockout_min
-    );
-
-    pgrx::log!("password_profile: Running insert/update query: {}", query);
-    Spi::run(&query)?;
-    pgrx::log!("password_profile: Query completed successfully");
-    pgrx::log!(
-        "password_profile: record_failed_login calling sync_lock_cache for {}",
-        username
-    );
     sync_lock_cache(username, max_fails)?;
     Ok("Failed login recorded".to_string())
 }
-
 #[pg_extern]
 fn clear_login_attempts(username: &str) -> Result<String, Box<dyn std::error::Error>> {
     // Security check: Only superuser or the same user can clear attempts
-    let current_user = Spi::get_one::<String>("SELECT current_user::text")?
-        .ok_or("Failed to get current user")?;
-    
-    let current_user_quoted = quote_literal(&current_user)?;
-    let is_superuser = Spi::get_one::<bool>(&format!(
-        "SELECT usesuper FROM pg_user WHERE usename = {}",
-        current_user_quoted
-    ))?
-    .unwrap_or(false);
+    // Use single Spi::connect() to avoid nested SPI
+    let (current_user, is_superuser) = Spi::connect(|_client| {
+        let user = Spi::get_one::<String>("SELECT current_user::text")?
+            .ok_or("Failed to get current user")?;
+        
+        let user_quoted = quote_literal(&user)?;
+        let is_super = Spi::get_one::<bool>(&format!(
+            "SELECT usesuper FROM pg_user WHERE usename = {}", 
+            user_quoted
+        ))?.unwrap_or(false);
+        
+        Ok::<(String, bool), Box<dyn std::error::Error>>((user, is_super))
+    })?;
     
     if !is_superuser && current_user != username {
         return Err(format!(
@@ -1224,16 +1419,25 @@ fn clear_login_attempts(username: &str) -> Result<String, Box<dyn std::error::Er
         ).into());
     }
     
-    let username_quoted = quote_literal(username)?;
-    let query = format!(
-        "DELETE FROM password_profile.login_attempts WHERE username = {}",
-        username_quoted
-    );
-    Spi::run(&query)?;
+    clear_login_attempts_internal(username)?;
+    Ok("Login attempts cleared".to_string())
+}
+
+fn clear_login_attempts_internal(username: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Use single Spi::connect() to avoid nested SPI
+    Spi::connect(|_client| {
+        let username_quoted = quote_literal(username)?;
+        Spi::run(&format!(
+            "DELETE FROM password_profile.login_attempts WHERE username = {}", 
+            username_quoted
+        ))?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    
     unsafe {
         lock_cache_clear(username);
     }
-    Ok("Login attempts cleared".to_string())
+    Ok(())
 }
 
 #[pg_extern]
@@ -1254,6 +1458,16 @@ fn is_user_locked(username: &str) -> Result<bool, Box<dyn std::error::Error>> {
 
 #[pg_extern]
 fn check_user_access(username: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // CRITICAL: Check database context before SPI operations
+    let my_db_id = unsafe { std::ptr::addr_of!(pg_sys::MyDatabaseId).read() };
+    if my_db_id == pg_sys::InvalidOid {
+        pgrx::log!(
+            "password_profile: check_user_access skipped - no database context"
+        );
+        return Ok("Access check skipped - no database context".to_string());
+    }
+
+    // First check lock cache (fast, no DB access needed)
     if let Some(seconds) = unsafe { lock_cache_remaining_seconds(username) } {
         if seconds > 0 {
             let minutes = seconds / 60;
@@ -1297,9 +1511,10 @@ fn record_password_change(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let username_quoted = quote_literal(username)?;
 
-    // Hash password with bcrypt (secure) - returns a string like "$2b$12$..."
+    // Hash password with bcrypt (cost from GUC parameter)
+    let cost = BCRYPT_COST.get().clamp(4, 31) as u32; // Ensure valid range
     let pwd_hash =
-        hash(new_password, DEFAULT_COST).map_err(|e| format!("Failed to hash password: {}", e))?;
+        hash(new_password, cost).map_err(|e| format!("Failed to hash password: {}", e))?;
     let hash_quoted = quote_literal(&pwd_hash)?;
 
     // Insert into history
@@ -1422,110 +1637,58 @@ fn get_password_stats(username: &str) -> Result<String, Box<dyn std::error::Erro
     Ok(stats)
 }
 
-/// Check if an authentication event should be processed or skipped (duplicate)
-/// Returns true if the event should be processed, false if it's a recent duplicate
-fn should_process_auth_event(username: &str, kind: AuthEventKind) -> bool {
-    let mut cache = match AUTH_EVENT_CACHE.lock() {
-        Ok(c) => c,
-        Err(poisoned) => {
-            pgrx::warning!("AUTH_EVENT_CACHE mutex poisoned, recovering");
-            poisoned.into_inner()
-        }
-    };
-    let now = Instant::now();
-
-    // Clean up old events (older than 2 seconds)
-    cache.retain(|event| now.duration_since(event.timestamp) < Duration::from_millis(2000));
-
-    // Check if we've seen this event recently (within 1.5 seconds)
-    let is_duplicate = cache.iter().any(|event| {
-        event.username == username
-            && event.kind == kind
-            && now.duration_since(event.timestamp) < Duration::from_millis(1500)
-    });
-
-    if is_duplicate {
-        return false; // Skip duplicate
+fn sync_lock_cache(username: &str, max_fails: i32) -> Result<(), Box<dyn std::error::Error>> {
+    // CRITICAL: Check if we're in a backend process with database connection
+    let my_db_id = unsafe { std::ptr::addr_of!(pg_sys::MyDatabaseId).read() };
+    if my_db_id == pg_sys::InvalidOid {
+        return Ok(());
     }
 
-    // Add to cache
-    cache.push(AuthEvent {
-        username: username.to_string(),
-        kind,
-        timestamp: now,
-    });
-
-    true // Process this event
-}
-
-fn sync_lock_cache(username: &str, max_fails: i32) -> Result<(), Box<dyn std::error::Error>> {
-    pgrx::log!(
-        "password_profile: sync_lock_cache called for username={}, max_fails={}",
-        username,
-        max_fails
-    );
-
+    // Use single Spi::connect() to avoid nested SPI calls from worker
     let username_quoted = quote_literal(username)?;
-    let status_query = format!(
-        "SELECT fail_count::bigint,
-                GREATEST(
-                    COALESCE(ROUND(EXTRACT(EPOCH FROM (lockout_until - now())))::bigint, 0),
-                    0
-                )
-         FROM password_profile.login_attempts
-         WHERE username = {}",
-        username_quoted
-    );
+    let result: Option<(i64, i64)> = Spi::connect(|_client| {
+        let status_query = format!(
+            "SELECT fail_count::bigint,
+                    GREATEST(
+                        COALESCE(ROUND(EXTRACT(EPOCH FROM (lockout_until - now())))::bigint, 0),
+                        0
+                    )
+             FROM password_profile.login_attempts
+             WHERE username = {}",
+            username_quoted
+        );
 
-    match Spi::get_two::<i64, i64>(&status_query) {
-        Ok((Some(fails), Some(remaining_secs))) => {
-            pgrx::log!(
-                "password_profile: sync_lock_cache query result: fails={}, remaining_secs={}, max_fails={}",
-                fails, remaining_secs, max_fails
-            );
-            unsafe {
+        let row_result = Spi::get_two::<i64, i64>(&status_query)?;
+            
+        if let (Some(fails), Some(remaining_secs)) = row_result {
+            if fails >= max_fails as i64 && remaining_secs <= 0 {
+                // Lockout expired - delete DB record
+                Spi::run(&format!(
+                    "DELETE FROM password_profile.login_attempts WHERE username = {}",
+                    username_quoted
+                ))?;
+            }
+            Ok::<Option<(i64, i64)>, Box<dyn std::error::Error>>(Some((fails, remaining_secs)))
+        } else {
+            Ok(None)
+        }
+    })?;
+
+    unsafe {
+        match result {
+            Some((fails, remaining_secs)) => {
                 if fails >= max_fails as i64 && remaining_secs > 0 {
                     // Active lockout - add to cache
                     let now = pg_sys::GetCurrentTimestamp();
                     let delta = remaining_secs.saturating_mul(MICROS_PER_SEC);
                     let expires_at = now.saturating_add(delta);
-                    pgrx::log!(
-                        "password_profile: Calling lock_cache_set with expires_at={}",
-                        expires_at
-                    );
                     lock_cache_set(username, expires_at);
-                } else if fails >= max_fails as i64 && remaining_secs <= 0 {
-                    // Lockout expired - clear cache and delete DB record
-                    pgrx::log!("password_profile: Lockout EXPIRED (fails={} >= max={} BUT remaining={} <= 0), clearing cache and DB", fails, max_fails, remaining_secs);
-                    lock_cache_clear(username);
-                    let clear_query = format!(
-                        "DELETE FROM password_profile.login_attempts WHERE username = {}",
-                        username_quoted
-                    );
-                    let _ = Spi::run(&clear_query);
-                    pgrx::log!(
-                        "password_profile: Cleared expired lockout record for {}",
-                        username
-                    );
                 } else {
-                    // Not locked yet (fails < max) - just clear cache
-                    pgrx::log!("password_profile: Not locked yet (fails={} < max={}), clearing cache only", fails, max_fails);
+                    // Not locked or expired - clear cache
                     lock_cache_clear(username);
                 }
             }
-        }
-        Ok(_) => {
-            pgrx::log!("password_profile: sync_lock_cache query returned None, clearing cache");
-            unsafe {
-                lock_cache_clear(username);
-            }
-        }
-        Err(e) => {
-            pgrx::log!(
-                "password_profile: sync_lock_cache query error: {}, clearing cache",
-                e
-            );
-            unsafe {
+            None => {
                 lock_cache_clear(username);
             }
         }
@@ -1534,262 +1697,323 @@ fn sync_lock_cache(username: &str, max_fails: i32) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// Background worker main function for log monitoring
-/// Monitors PostgreSQL log files for failed/successful authentication events
 #[no_mangle]
-#[inline(never)]
-pub unsafe extern "C" fn log_monitor_main(_arg: pg_sys::Datum) {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader, Seek, SeekFrom};
-    use std::path::{Path, PathBuf};
+pub unsafe extern "C" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
     use std::thread;
     use std::time::Duration;
 
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-
-    // Connect to database (required for SPI operations)
     BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
 
-    pgrx::log!("password_profile: Log monitor background worker started");
+    pgrx::log!("password_profile: auth event consumer worker started");
 
-    // Helper: resolve log directory considering extension GUC + PostgreSQL config
-    fn resolve_log_directory() -> PathBuf {
-        if let Some(dir) = LOG_DIRECTORY.get().as_ref().and_then(|c| c.to_str().ok()) {
-            return PathBuf::from(dir);
-        }
-
-        // Fallback to PostgreSQL's own log_directory setting
-        let fallback = Spi::get_one::<String>("SHOW log_directory")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "log".to_string());
-
-        let mut path = PathBuf::from(fallback);
-
-        // When relative, it's relative to data_directory
-        if path.is_relative() {
-            if let Ok(Some(data_dir)) = Spi::get_one::<String>("SHOW data_directory") {
-                path = Path::new(&data_dir).join(path);
-            }
-        }
-
-        path
-    }
-
-    let mut log_dir = resolve_log_directory();
-    pgrx::log!(
-        "password_profile: Using log directory: {}",
-        log_dir.display()
-    );
-
-    let mut last_position: u64 = 0;
-    let mut current_log_file: Option<String> = None;
-
-    // Main monitoring loop
     loop {
-        if BackgroundWorker::sighup_received() {
-            pgrx::log!("password_profile: Log monitor received SIGHUP, reloading config");
-            log_dir = resolve_log_directory();
-            pgrx::log!(
-                "password_profile: Using log directory: {}",
-                log_dir.display()
-            );
-        }
-
         if BackgroundWorker::sigterm_received() {
-            pgrx::log!("password_profile: Log monitor shutting down");
+            pgrx::log!("password_profile: auth event consumer shutting down");
             break;
         }
 
-        // Ensure log directory exists before scanning
-        if !log_dir.exists() {
-            pgrx::warning!(
-                "password_profile: Log directory '{}' not found; sleeping",
-                log_dir.display()
-            );
-            thread::sleep(Duration::from_secs(5));
-            continue;
-        }
+        let mut processed = false;
+        while let Some(event) = dequeue_auth_event() {
+            processed = true;
+            if let Some(username) = username_from_bytes(&event.username) {
+                // SECURITY: Do not log usernames
 
-        // Find the latest log file
-        if let Ok(entries) = std::fs::read_dir(&log_dir) {
-            let mut latest_file: Option<(String, std::time::SystemTime)> = None;
-
-            for entry in entries.flatten() {
-                if let Ok(metadata) = entry.metadata() {
-                    if let Some(path_str) = entry.path().to_str().map(String::from) {
-                        if path_str.ends_with(".log") || path_str.contains("postgresql-") {
-                            if let Ok(modified) = metadata.modified() {
-                                if latest_file.is_none()
-                                    || Some(modified) > latest_file.as_ref().map(|(_, t)| *t)
-                                {
-                                    latest_file = Some((path_str, modified));
-                                }
+                // CRITICAL: Each SPI operation must be in its own transaction block
+                let result = BackgroundWorker::transaction(|| {
+                    if event.is_failure {
+                        match record_failed_login(&username) {
+                            Ok(_) => {
+                                // SECURITY: Do not log usernames
+                                Ok(())
+                            }
+                            Err(e) => {
+                                pgrx::warning!(
+                                    "password_profile: worker failed to record login: {}",
+                                    e
+                                );
+                                Err(e)
+                            }
+                        }
+                    } else {
+                        match clear_login_attempts_internal(&username) {
+                            Ok(_) => {
+                                // SECURITY: Do not log usernames
+                                Ok(())
+                            }
+                            Err(e) => {
+                                pgrx::warning!(
+                                    "password_profile: worker failed to clear login attempts: {}",
+                                    e
+                                );
+                                Err(e)
                             }
                         }
                     }
+                });
+
+                if let Err(e) = result {
+                    pgrx::warning!("password_profile: worker transaction failed: {:?}", e);
                 }
             }
-
-            if let Some((log_file_path, _)) = latest_file {
-                // Check if we switched to a new log file
-                if current_log_file.as_ref() != Some(&log_file_path) {
-                    pgrx::log!(
-                        "password_profile: Monitoring new log file: {}",
-                        log_file_path
-                    );
-                    current_log_file = Some(log_file_path.clone());
-                    last_position = 0;
-                }
-
-                // Read new lines from the log file
-                if let Ok(mut file) = File::open(&log_file_path) {
-                    if file.seek(SeekFrom::Start(last_position)).is_ok() {
-                        let reader = BufReader::new(file);
-
-                        for line in reader.lines().flatten() {
-                            last_position += line.len() as u64 + 1; // +1 for newline
-
-                            // Parse authentication events from log line
-                            // Prefer hook-based logs (explicit), fallback to FATAL messages
-                            let hook_failed = line.contains("password_profile: auth_failure");
-                            let hook_success = line.contains("password_profile: auth_success");
-
-                            // Legacy fallback: FATAL authentication errors
-                            let legacy_failed = !hook_failed
-                                && line.contains("FATAL")
-                                && line.contains("password authentication failed");
-                            let legacy_success =
-                                !hook_success && line.contains("connection authorized");
-
-                            if hook_failed || legacy_failed {
-                                if let Some(username) = extract_username_from_log(&line) {
-                                    // Prevent duplicate processing of same event
-                                    if !should_process_auth_event(&username, AuthEventKind::Failed)
-                                    {
-                                        continue;
-                                    }
-
-                                    pgrx::log!("Failed login detected for user: {}", username);
-
-                                    unsafe {
-                                        bg_execute_sql(&format!(
-                                            "SELECT password_profile.record_failed_login('{}')",
-                                            username.replace("'", "''")
-                                        ));
-                                    }
-                                    pgrx::log!("Recorded failed login for: {}", username);
-                                }
-                            } else if hook_success || legacy_success {
-                                if let Some(username) = extract_username_from_log(&line) {
-                                    if !should_process_auth_event(&username, AuthEventKind::Success)
-                                    {
-                                        continue;
-                                    }
-
-                                    pgrx::log!(
-                                        "Successful login detected for user: {}",
-                                        username
-                                    );
-
-                                    unsafe {
-                                        bg_execute_sql(&format!(
-                                            "SELECT password_profile.clear_login_attempts('{}')",
-                                            username.replace("'", "''")
-                                        ));
-                                    }
-                                    pgrx::log!("Cleared login attempts for: {}", username);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Log file disappeared (rotation/deletion)
-                    pgrx::warning!(
-                        "password_profile: Log file disappeared: {}, re-detecting...",
-                        log_file_path
-                    );
-                    current_log_file = None; // Force re-detection
-                    last_position = 0;
-                }
-            } else {
-                // No log file found in directory
-                pgrx::warning!(
-                    "password_profile: No log files found in directory: {}",
-                    log_dir.display()
-                );
-            }
-        } else {
-            // Cannot read log directory
-            pgrx::warning!(
-                "password_profile: Cannot read log directory: {}",
-                log_dir.display()
-            );
         }
 
-        // Sleep for a short interval before checking again
-        thread::sleep(Duration::from_secs(1));
+        if !processed {
+            thread::sleep(Duration::from_millis(25));
+        }
     }
 
-    pgrx::log!("password_profile: Log monitor background worker stopped");
+    pgrx::log!("password_profile: auth event consumer worker stopped");
 }
 
-/// Extract username from PostgreSQL log line
-/// Supports multiple log formats and locales
-fn extract_username_from_log(line: &str) -> Option<String> {
-    // Pattern 1: Hook-generated logs (preferred)
-    // Format: "password_profile: auth_failure user=username"
-    if let Some(pos) = line.find("password_profile: auth_") {
-        if let Some(user_pos) = line[pos..].find("user=") {
-            let after_user = &line[pos + user_pos + 5..];
-            let username: String = after_user
-                .chars()
-                .take_while(|c| !c.is_whitespace() && *c != ',' && *c != ';')
-                .collect();
-            if !username.is_empty() {
-                return Some(username);
-            }
-        }
-    }
+// ====================================================================================
+// Instrumentation & Monitoring Functions
+// ====================================================================================
 
-    // Pattern 2: Quoted username (user="username")
-    if let Some(pos) = line.find("user=\"") {
-        let after_user = &line[pos + 6..];
-        if let Some(end_pos) = after_user.find('"') {
-            return Some(after_user[..end_pos].to_string());
-        }
-    }
+/// Returns runtime statistics about lock cache and authentication failures
+/// Useful for ops monitoring and capacity planning
+#[pg_extern]
+fn get_lock_cache_stats() -> Result<
+    TableIterator<
+        'static,
+        (
+            name!(metric, String),
+            name!(value, i64),
+            name!(description, String),
+        ),
+    >,
+    Box<dyn std::error::Error>,
+> {
+    let mut stats = Vec::new();
 
-    // Pattern 3: Unquoted username (user=username)
-    if let Some(pos) = line.find("user=") {
-        let after_user = &line[pos + 5..];
-        let username: String = after_user
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-            .collect();
-        if !username.is_empty() {
-            return Some(username);
-        }
-    }
+    unsafe {
+        if !LOCK_CACHE.is_null() {
+            let cache = &*LOCK_CACHE;
+            let now = pg_sys::GetCurrentTimestamp();
+            
+            // SAFETY: Read-only access to cache for statistics
+            let _guard = SpinLockGuard::new(&mut (*LOCK_CACHE).lock);
+            
+            // Count active (non-expired) entries
+            let active_count = cache
+                .entries
+                .iter()
+                .filter(|e| e.username[0] != 0 && e.expires_at > now)
+                .count() as i64;
 
-    // Pattern 4: English format (for user "username")
-    if let Some(pos) = line.find("for user ") {
-        let after_user = &line[pos + 9..];
-        if after_user.starts_with('"') {
-            let username: String = after_user[1..].chars().take_while(|c| *c != '"').collect();
-            if !username.is_empty() {
-                return Some(username);
-            }
+            // Count total used slots (including expired)
+            let used_count = cache
+                .entries
+                .iter()
+                .filter(|e| e.username[0] != 0)
+                .count() as i64;
+
+            stats.push((
+                "lock_cache_total_size".to_string(),
+                LOCK_CACHE_SIZE as i64,
+                "Maximum number of lockout entries".to_string(),
+            ));
+
+            stats.push((
+                "lock_cache_active_lockouts".to_string(),
+                active_count,
+                "Currently locked accounts (non-expired)".to_string(),
+            ));
+
+            stats.push((
+                "lock_cache_used_slots".to_string(),
+                used_count,
+                "Total used cache slots (including expired)".to_string(),
+            ));
+
+            stats.push((
+                "lock_cache_free_slots".to_string(),
+                (LOCK_CACHE_SIZE as i64) - used_count,
+                "Available cache slots for new lockouts".to_string(),
+            ));
+
+            stats.push((
+                "lock_cache_utilization_pct".to_string(),
+                (used_count * 100) / (LOCK_CACHE_SIZE as i64),
+                "Cache utilization percentage".to_string(),
+            ));
         } else {
-            let username: String = after_user
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                .collect();
-            if !username.is_empty() {
-                return Some(username);
-            }
+            stats.push((
+                "lock_cache_status".to_string(),
+                0,
+                "Lock cache not initialized".to_string(),
+            ));
         }
     }
 
-    None
+    // Add database-based stats (failed login attempts count)
+    if let Ok(Some(total_attempts)) = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM password_profile.login_attempts WHERE fail_count > 0",
+    ) {
+        stats.push((
+            "db_users_with_failures".to_string(),
+            total_attempts,
+            "Users with recorded failed attempts".to_string(),
+        ));
+    }
+
+    if let Ok(Some(active_lockouts)) = Spi::get_one::<i64>(
+        "SELECT COUNT(*) FROM password_profile.login_attempts WHERE lockout_until > NOW()",
+    ) {
+        stats.push((
+            "db_active_lockouts".to_string(),
+            active_lockouts,
+            "Users currently locked in database".to_string(),
+        ));
+    }
+
+    Ok(TableIterator::new(stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use pgrx::prelude::*;
+
+    #[test]
+    fn test_quote_literal_basic() {
+        let result = crate::quote_literal("test").unwrap();
+        assert_eq!(result, "'test'");
+    }
+
+    #[test]
+    fn test_quote_literal_with_quotes() {
+        let result = crate::quote_literal("test'with'quotes").unwrap();
+        // PostgreSQL quote_literal_cstr doubles single quotes
+        assert!(result.contains("''"));
+    }
+
+    #[test]
+    fn test_quote_literal_sql_injection() {
+        let malicious = "'; DROP TABLE users; --";
+        let result = crate::quote_literal(malicious).unwrap();
+        // Should be safely quoted
+        assert!(result.starts_with("'"));
+        assert!(result.ends_with("'"));
+    }
+
+    #[test]
+    fn test_user_exists_real_user() {
+        // Create a test user
+        Spi::run("CREATE USER test_exists_user WITH PASSWORD 'test123'").ok();
+        
+        let username = std::ffi::CString::new("test_exists_user").unwrap();
+        let result = unsafe { crate::password_profile_user_exists(username.as_ptr()) };
+        
+        assert_eq!(result, 1, "Real user should return 1");
+        
+        // Cleanup
+        Spi::run("DROP USER test_exists_user").ok();
+    }
+
+    #[test]
+    fn test_user_exists_fake_user() {
+        let username = std::ffi::CString::new("definitely_not_exists_99999").unwrap();
+        let result = unsafe { crate::password_profile_user_exists(username.as_ptr()) };
+        
+        assert_eq!(result, 0, "Fake user should return 0");
+    }
+
+    #[test]
+    fn test_user_exists_null() {
+        let result = unsafe { crate::password_profile_user_exists(std::ptr::null()) };
+        assert_eq!(result, -1, "NULL username should return -1");
+    }
+
+    #[test]
+    fn test_record_failed_login_basic() {
+        // Ensure schema and table exist
+        Spi::run("CREATE SCHEMA IF NOT EXISTS password_profile").ok();
+        Spi::run("CREATE TABLE IF NOT EXISTS password_profile.login_attempts (
+            username TEXT PRIMARY KEY,
+            fail_count INT DEFAULT 0,
+            last_fail TIMESTAMPTZ,
+            lockout_until TIMESTAMPTZ
+        )").ok();
+
+        // Create a test user
+        Spi::run("CREATE USER test_fail_user WITH PASSWORD 'test123'").ok();
+        
+        // Record a failed login
+        let result = crate::record_failed_login("test_fail_user");
+        assert!(result.is_ok(), "record_failed_login should succeed");
+
+        // Check that fail_count was incremented
+        let count: Option<i32> = Spi::get_one(
+            "SELECT fail_count FROM password_profile.login_attempts WHERE username = 'test_fail_user'"
+        ).unwrap();
+        
+        assert!(count.is_some(), "Should have a record");
+        assert!(count.unwrap() > 0, "Fail count should be greater than 0");
+
+        // Cleanup
+        Spi::run("DELETE FROM password_profile.login_attempts WHERE username = 'test_fail_user'").ok();
+        Spi::run("DROP USER test_fail_user").ok();
+    }
+
+    #[test]
+    fn test_clear_login_attempts() {
+        // Setup
+        Spi::run("CREATE SCHEMA IF NOT EXISTS password_profile").ok();
+        Spi::run("CREATE TABLE IF NOT EXISTS password_profile.login_attempts (
+            username TEXT PRIMARY KEY,
+            fail_count INT DEFAULT 0,
+            last_fail TIMESTAMPTZ,
+            lockout_until TIMESTAMPTZ
+        )").ok();
+
+        Spi::run("CREATE USER test_clear_user WITH PASSWORD 'test123'").ok();
+        
+        // Insert a failed attempt
+        Spi::run("INSERT INTO password_profile.login_attempts (username, fail_count, last_fail) 
+                  VALUES ('test_clear_user', 5, NOW())").ok();
+
+        // Clear as superuser (current user in tests)
+        let result = crate::clear_login_attempts("test_clear_user");
+        assert!(result.is_ok(), "clear_login_attempts should succeed");
+
+        // Verify cleared
+        let count: Option<i32> = Spi::get_one(
+            "SELECT COUNT(*) FROM password_profile.login_attempts WHERE username = 'test_clear_user'"
+        ).unwrap();
+        
+        assert_eq!(count.unwrap(), 0, "Record should be deleted");
+
+        // Cleanup
+        Spi::run("DROP USER test_clear_user").ok();
+    }
+
+    #[test]
+    fn test_password_validation_weak() {
+        // Test weak password rejection
+        let result = Spi::run("SET password_profile.password_min_length = 8");
+        assert!(result.is_ok());
+
+        // This should fail validation (too short)
+        let result = Spi::run("CREATE USER test_weak WITH PASSWORD 'weak'");
+        assert!(result.is_err(), "Weak password should be rejected");
+    }
+
+    #[test]
+    fn test_detect_hash_password() {
+        // Test hash detection to prevent bypass
+        let hash_attempts = vec![
+            "md5c4ca4238a0b923820dcc509a6f75849b",  // MD5 hash
+            "SCRAM-SHA-256$",                        // SCRAM prefix
+            "$2a$10$abcdefghijklmnopqrstuv",          // Bcrypt
+        ];
+        
+        for attempt in hash_attempts {
+            let is_hash = crate::is_hash_like(attempt);
+            assert!(is_hash, "Should detect '{}' as hash", attempt);
+        }
+        
+        // Normal passwords should not be detected as hashes
+        assert!(!crate::is_hash_like("MyPassword123!"));
+        assert!(!crate::is_hash_like("valid_pass_2024"));
+    }
 }

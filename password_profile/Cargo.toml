@@ -1,5 +1,5 @@
 [package]
-name = "password_profile_pure"
+name = "password_profile"
 version = "0.0.0"
 edition = "2021"
 
@@ -7,11 +7,11 @@ edition = "2021"
 crate-type = ["cdylib", "lib"]
 
 [[bin]]
-name = "pgrx_embed_password_profile_pure"
+name = "pgrx_embed_password_profile"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]
-default = ["pg13"]
+default = ["pg16"]
 pg13 = ["pgrx/pg13", "pgrx-tests/pg13" ]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14" ]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15" ]
@@ -25,6 +25,7 @@ pgrx = "=0.16.1"
 bcrypt = "0.15"
 md5 = "0.7"  # Legacy support for backward compatibility
 rand = "0.8"  # For timing attack prevention
+siphasher = "1.0"  # For consistent blacklist hashing with fixed keys
 
 [dev-dependencies]
 pgrx-tests = "=0.16.1"
