@@ -34,4 +34,18 @@ fn main() {
 
     build.flag_if_supported("-Wno-unused-parameter");
     build.compile("password_profile_client_auth_shim");
+
+    // Link PostgreSQL library when building tests
+    if let Ok(output) = std::process::Command::new("pg_config")
+        .arg("--libdir")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                println!("cargo:rustc-link-search=native={}", path);
+                println!("cargo:rustc-link-lib=dylib=pq");
+            }
+        }
+    }
 }

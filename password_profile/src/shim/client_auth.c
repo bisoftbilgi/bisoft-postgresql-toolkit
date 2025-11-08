@@ -1,5 +1,6 @@
 #include "postgres.h"
 #include "libpq/auth.h"
+#include "libpq/hba.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
 #include "miscadmin.h"
@@ -37,6 +38,46 @@ int password_profile_user_exists(const char *username) {
     }
     
     return 0; /* User does not exist */
+}
+
+/*
+ * Predict the SQLSTATE that auth_failed() would emit for the given
+ * authentication status. This mirrors auth_failed()'s errcode logic so
+ * extensions can distinguish password errors (28P01) from other failures.
+ */
+int password_profile_get_last_sqlstate(Port *port, int status) {
+    if (port == NULL || port->hba == NULL) {
+        return ERRCODE_INTERNAL_ERROR;
+    }
+
+    if (status == STATUS_OK) {
+        return ERRCODE_SUCCESSFUL_COMPLETION;
+    }
+
+    if (status == STATUS_EOF) {
+        return ERRCODE_CONNECTION_FAILURE;
+    }
+
+    switch (port->hba->auth_method) {
+        case uaPassword:
+        case uaMD5:
+        case uaSCRAM:
+            return ERRCODE_INVALID_PASSWORD;
+        case uaCert:
+        case uaReject:
+        case uaImplicitReject:
+        case uaTrust:
+        case uaIdent:
+        case uaPeer:
+        case uaGSS:
+        case uaSSPI:
+        case uaPAM:
+        case uaBSD:
+        case uaLDAP:
+        case uaRADIUS:
+        default:
+            return ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION;
+    }
 }
 
 ClientAuthentication_hook_type password_profile_register_client_auth_hook(
