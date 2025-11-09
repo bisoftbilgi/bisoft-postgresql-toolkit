@@ -1,6 +1,6 @@
-# SQL Firewall RS (PostgreSQL 16)
+# SQL Firewall (PostgreSQL 16)
 
-`sql_firewall_rs` is a PostgreSQL 16 extension written entirely in Rust (pgrx) that evaluates every SQL command before the backend executes it. The extension enforces least-privilege policies via multi-mode approvals, keyword and regex bans, quiet hours, shared-memory rate limiting, adaptive fingerprint learning, activity logging, and optional alerting—without any external service.
+`sql_firewall` is a PostgreSQL 16 extension written entirely in Rust (pgrx) that evaluates every SQL command before the backend executes it. The extension enforces least-privilege policies via multi-mode approvals, keyword and regex bans, quiet hours, shared-memory rate limiting, adaptive fingerprint learning, activity logging, and optional alerting—without any external service.
 
 ---
 ## 1. Architecture
@@ -62,9 +62,9 @@ sudo cp sql_firewall_rs.control /usr/pgsql-16/share/extension/
 sudo cp sql/sql_firewall_rs--*.sql /usr/pgsql-16/share/extension/
 
 # 4) Enable and create
-sudo sed -i "s/^shared_preload_libraries.*/shared_preload_libraries = 'sql_firewall_rs'/" /var/lib/pgsql/16/data/postgresql.conf
+sudo sed -i "s/^shared_preload_libraries.*/shared_preload_libraries = 'sql_firewall'/" /var/lib/pgsql/16/data/postgresql.conf
 sudo systemctl restart postgresql-16
-psql -d mydb -c 'CREATE EXTENSION sql_firewall_rs;'
+psql -d mydb -c 'CREATE EXTENSION sql_firewall;'
 ```
 
 For upgrades, rebuild, copy the `.so`, and run `ALTER EXTENSION sql_firewall_rs UPDATE;` in each database.
@@ -134,8 +134,7 @@ Activity logging itself is always enabled outside quiet hours; quiet-hour suppre
 Run the bundled suite before every release:
 
 ```bash
-cd sql_firewall_rs
-export PGPASSWORD='caghan'
+cd sql_firewall
 bash run_tests.sh
 ```
 
@@ -156,7 +155,7 @@ Coverage today (12/12):
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| `FATAL: could not access file "sql_firewall_rs"` | `.so` missing from PostgreSQL lib dir or typo in `shared_preload_libraries`. | Copy `libsql_firewall_rs.so` into the server lib path and double-check the conf entry, then restart PostgreSQL. |
+| `FATAL: could not access file "sql_firewall"` | `.so` missing from PostgreSQL lib dir or typo in `shared_preload_libraries`. | Copy `libsql_firewall_rs.so` into the server lib path and double-check the conf entry, then restart PostgreSQL. |
 | Quiet hours logging causes recursion | Using SPI logging inside quiet hours. | Keep `sql_firewall.quiet_hours_log = on`; it uses elog-only logging and avoids SPI entirely. |
 | Approval rows never appear | SPI insert failing or wrong column names. | Confirm `sql_firewall_command_approvals` schema is installed and that inserts use `(role_name, command_type, is_approved)`. |
 | `approval lookup failed: SpiTupleTable positioned before the start` | SPI used outside a transaction. | Use the provided `Spi::connect` helper or wrap manual SPI in `StartTransactionCommand()` / `CommitTransactionCommand()`. |
@@ -165,7 +164,3 @@ Coverage today (12/12):
 
 If problems persist, capture PostgreSQL logs plus `run_tests.sh` output when filing an issue.
 
----
-## License & Contributions
-
-`sql_firewall_rs` inherits the license of the parent repository. Contributions and bug reports are welcome—please include reproduction steps and the latest `run_tests.sh` summary to speed up triage.
