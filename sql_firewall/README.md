@@ -1,6 +1,6 @@
-# SQL Firewall (PostgreSQL 16)
+# SQL Firewall for PostgreSQL
 
-`sql_firewall` is a PostgreSQL 16 extension written entirely in Rust (pgrx) that evaluates every SQL command before the backend executes it. The extension enforces least-privilege policies via multi-mode approvals, keyword and regex bans, quiet hours, shared-memory rate limiting, adaptive fingerprint learning, activity logging, and optional alerting—without any external service.
+A production-ready SQL firewall extension for PostgreSQL 16 (compatible with 14-15). Written in Rust using pgrx, it evaluates every SQL command before execution and enforces security policies including command approvals, regex pattern blocking, rate limiting, fingerprint learning, and activity logging—all without external dependencies.
 
 ---
 ## 1. Architecture
@@ -9,27 +9,27 @@
 |-------|------|---------|
 | **Hook Layer** | `ExecutorStart_hook`, `ProcessUtility_hook` | Captures every query/utility command, collects metadata, and short-circuits execution using `ereport!` when a policy fails. |
 | **Context Capture** | `sql_firewall_rs::context` | Resolves role, database, application name, client IP, and command tags for policy and logging decisions. |
-| **Policy Engine** | `firewall.rs`, `spi_checks.rs` | Applies quiet hours, keyword/regex filters, connection policies, approvals, fingerprints, rate limits, and alert routing. All SPI use is wrapped in guards that ensure a transaction context. |
-| **Shared Memory** | `fingerprint_cache`, `rate_state` | Cross-backend caches that track normalized query fingerprints and rate-limit counters without SPI. |
-| **Catalog Tables** | `sql_firewall_activity_log`, `sql_firewall_command_approvals`, `sql_firewall_query_fingerprints`, `sql_firewall_regex_rules` | Persist audit records, approvals, fingerprint metadata, and regex rules (installed via `sql/firewall_schema.sql`). |
+| **Policy Engine** | `firewall.rs`, `spi_checks.rs` | Applies security checks with transaction-safe logging, panic-safe guards, and improved internal query detection to prevent recursive loops. All SPI use is wrapped in guards that ensure proper transaction context. |
+| **Shared Memory** | `fingerprint_cache`, `rate_state` | Cross-backend caches with deadlock-free SpinLock implementation and panic safety. Tracks normalized query fingerprints (4096 entries) and rate-limit counters (512+1024 entries) without SPI overhead. |
+| **Catalog Tables** | `sql_firewall_activity_log`, `sql_firewall_command_approvals`, `sql_firewall_query_fingerprints`, `sql_firewall_regex_rules` | Persist audit records, approvals, fingerprint metadata, and regex rules (installed via `sql/firewall_schema.sql`). Includes ReDoS validation trigger on regex_rules table. |
 | **Alerting** | `alerts.rs` | Optional `NOTIFY` + syslog payloads whenever a block happens (regex, keyword, quiet hours, rate limit, approvals). |
-| **Tooling** | `run_tests.sh`, `test_full_features.sh` | Idempotent test harnesses that provision a throwaway DB and validate the entire feature matrix (currently 12/12 passing). |
+| **Tooling** | `run_comprehensive_tests.sh`, `run_advanced_tests.sh` | Comprehensive test suites that provision throwaway databases and validate all features. Currently 15/15 tests passing with full coverage of security, performance, and edge cases. |
 
-All policy decisions happen synchronously inside the backend, so blocks are atomic and crash-safe.
+All policy decisions happen synchronously inside the backend with panic-safe guards, so blocks are atomic and crash-safe. Recent security fixes include: deadlock prevention, ReDoS timeout (100ms), transaction-safe logging, race condition fixes, and recursive loop protection.
 
 ---
 ## 2. Feature Summary
 
-- **Operating modes** – `learn`, `permissive`, `enforce` determine how unknown commands are handled.
-- **Command approvals** – encounters of `(role_name, command_type)` create rows in `sql_firewall_command_approvals`; DBAs toggle `is_approved`.
-- **Adaptive fingerprints** – normalized SQL fingerprints live in shared memory and `sql_firewall_query_fingerprints`, auto-approving patterns after a hit threshold.
-- **Shared-memory rate limits** – global per-role window plus verb-specific budgets (SELECT/INSERT/UPDATE/DELETE) served from shared memory.
-- **Regex & keyword filters** – case-insensitive keyword blacklist and regex patterns stored in `sql_firewall_regex_rules`.
-- **Quiet hours** – blackout window for non-superusers with optional WARNING logging (no SPI) to prevent recursion loops.
-- **Activity logging** – every allowed/blocked event (outside quiet hours) is written to `sql_firewall_activity_log` with role, db, query sample, reason.
-- **Connection policies** – block by `application_name`, client IPs, or enforce `role@ip` bindings.
+- **Operating modes** – `learn`, `permissive`, `enforce` determine how unknown commands are handled. Learn mode now blocks unapproved commands and requires admin approval.
+- **Command approvals** – role-based authorization for command types (SELECT, INSERT, UPDATE, DELETE, DDL). Admin approval required in learn mode.
+- **Adaptive fingerprints** – normalized SQL fingerprints with shared memory caching and auto-approval after threshold (configurable, default 10 hits).
+- **Shared-memory rate limits** – global per-role window plus per-command budgets (SELECT/INSERT/UPDATE/DELETE) with deadlock-free SpinLock implementation.
+- **Regex & keyword filters** – SQL injection pattern matching with 100ms ReDoS timeout protection. Validation trigger prevents dangerous patterns.
+- **Quiet hours** – time-based access restrictions with panic-safe logging (no SPI recursion).
+- **Activity logging** – transaction-safe 3-layer logging (WARNING + LOG + syslog) that survives abort scenarios.
+- **Connection policies** – IP blocking, application filtering, and role-IP binding with race condition prevention.
 - **Alert channels** – NOTIFY payloads + optional syslog mirroring for SIEM integration.
-- **Retention jobs** – background pruning keeps activity and fingerprint tables within age/row targets.
+- **Retention jobs** – automatic pruning of activity logs and fingerprint tables.
 
 ---
 ## 3. Requirements
@@ -84,11 +84,12 @@ All knobs live under `sql_firewall.*` and may be set via `ALTER SYSTEM`, `postgr
 | | `sql_firewall.rate_limit_count` / `sql_firewall.rate_limit_seconds` | `100` / `60` | Requests allowed inside global window. |
 | | `sql_firewall.command_limit_seconds` | `0` | Window for verb limits (0 disables). |
 | | `sql_firewall.select_limit_count`, `insert_limit_count`, `update_limit_count`, `delete_limit_count` | `0` | Verb-specific caps per window. |
-| **Approvals & Fingerprints** | `sql_firewall.enable_fingerprint_learning` | `on` | Toggle adaptive fingerprint approvals. |
-| | `sql_firewall.fingerprint_learn_threshold` | `5` | Hits required to auto-approve a fingerprint. |
+| **Approvals & Fingerprints** | `sql_firewall.enable_fingerprint_learning` | `on` | Toggle adaptive fingerprint approvals. Works in Learn and Permissive modes. |
+| | `sql_firewall.fingerprint_learn_threshold` | `10` | Hits required to auto-approve a fingerprint (changed from 5 to 10). |
+| | `sql_firewall.fingerprint_cache_size` | `4096` | Shared memory cache entries for fingerprints. |
 | **Keyword / Regex** | `sql_firewall.enable_keyword_scan` | `off` | Keyword blacklist switch. |
 | | `sql_firewall.blacklisted_keywords` | `drop,truncate` | Comma-separated list. |
-| | `sql_firewall.enable_regex_scan` | `on` | Evaluate `sql_firewall_regex_rules`. |
+| | `sql_firewall.enable_regex_scan` | `off` | Evaluate `sql_firewall_regex_rules` with 100ms timeout protection. |
 | **Connection Policies** | `sql_firewall.enable_application_blocking` / `.blocked_applications` | `off` / empty | Deny by `application_name`. |
 | | `sql_firewall.enable_ip_blocking` / `.blocked_ips` | `off` / empty | Deny specific client IPs. |
 | | `sql_firewall.enable_role_ip_binding` / `.role_ip_bindings` | `off` / empty | Allow explicit `role@ip` pairs only. |
@@ -104,19 +105,20 @@ Activity logging itself is always enabled outside quiet hours; quiet-hour suppre
 ## 6. Operational Workflow
 
 ### 6.1 Learn → Approve → Enforce
-1. **Learn** – allow everything but capture `(role_name, command_type)` with `is_approved=false`.
-2. **Review** – admins query `sql_firewall_command_approvals`, optionally compare against fingerprints, and flip `is_approved=true` for legitimate operations.
-3. **Enforce** – unknown or unapproved commands are blocked with `ERRCODE_INSUFFICIENT_PRIVILEGE`. `permissive` mode is available for staging: it logs pending approvals but does not block.
+1. **Learn** – blocks unapproved commands and logs them for review. Admin must explicitly approve via `sql_firewall_command_approvals`.
+2. **Review** – admins query activity log and approval tables, verify legitimacy, and set `is_approved=true`.
+3. **Enforce** – unknown or unapproved commands are blocked with `ERRCODE_INSUFFICIENT_PRIVILEGE`. `permissive` mode is available for staging: it logs violations without blocking.
 
 ### 6.2 Fingerprint Pipeline
 - Every query is normalized (literals stripped, whitespace collapsed) and hashed.
-- Shared-memory counters track frequency without SPI.
-- Crossing `sql_firewall.fingerprint_learn_threshold` marks the fingerprint approved and writes metadata to `sql_firewall_query_fingerprints` so future backends also trust it.
+- Shared-memory counters track frequency without SPI calls.
+- Crossing `sql_firewall.fingerprint_learn_threshold` (default: 10) marks the fingerprint approved and writes metadata to `sql_firewall_query_fingerprints` with SELECT FOR UPDATE to prevent race conditions.
+- Works in both Learn and Permissive modes for pattern discovery.
 
 ### 6.3 Quiet Hours
 - Enable via `sql_firewall.enable_quiet_hours = on` and define start/end times.
 - Non-superusers are blocked; superusers bypass automatically.
-- Optional WARNING logging via `sql_firewall.quiet_hours_log = on` records the role, db, command, and sample without touching SPI (prevents infinite loop bugs discovered during testing).
+- Transaction-safe WARNING logging via `sql_firewall.quiet_hours_log = on` records blocks without SPI calls (prevents infinite recursion and FATAL errors discovered during testing).
 
 ### 6.4 Rate Limits
 - **Global** – `rate_limit_count` queries per `rate_limit_seconds` for each role.
@@ -131,24 +133,30 @@ Activity logging itself is always enabled outside quiet hours; quiet-hour suppre
 ---
 ## 7. Testing & Validation
 
-Run the bundled suite before every release:
+Run the comprehensive test suite:
 
 ```bash
 cd sql_firewall
-bash run_tests.sh
+bash run_comprehensive_tests.sh
 ```
 
-Coverage today (12/12):
+Coverage (15/15 tests passing):
 - Database + extension provisioning
-- Learn → enforce → approval path
-- Regex filter against classic `'1'='1'` payloads
-- Keyword blacklist toggles
+- Enforce mode blocking
+- Learn mode workflow (block + approve)
+- Permissive mode logging
+- Regex filter (UNION, OR tautology patterns)
+- Keyword blacklist
 - Quiet hours (blocking, logging, superuser bypass)
-- Global and command-specific rate limits
-- Activity logging validation
-- Superuser bypass sanity
+- Global and per-command rate limits
+- IP blocking and role-IP binding
+- Application blocking
+- Fingerprint learning and auto-approval
+- Activity logging (transaction-safe)
+- Superuser bypass
+- Command approval workflow
 
-`test_full_features.sh` provides a slimmer smoke test if you only need approvals/regex/quiet hours regression. Both scripts are idempotent and safe to rerun.
+Advanced tests available via `run_advanced_tests.sh` for stress testing and edge cases.
 
 ---
 ## 8. Troubleshooting
@@ -156,11 +164,15 @@ Coverage today (12/12):
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `FATAL: could not access file "sql_firewall"` | `.so` missing from PostgreSQL lib dir or typo in `shared_preload_libraries`. | Copy `libsql_firewall_rs.so` into the server lib path and double-check the conf entry, then restart PostgreSQL. |
+| `DefineSavepoint` or `record_pending` FATAL error | Attempting SPI during transaction abort. | Fixed in current version. Removed problematic SPI calls, now uses 3-layer logging (WARNING + LOG + syslog). |
 | Quiet hours logging causes recursion | Using SPI logging inside quiet hours. | Keep `sql_firewall.quiet_hours_log = on`; it uses elog-only logging and avoids SPI entirely. |
 | Approval rows never appear | SPI insert failing or wrong column names. | Confirm `sql_firewall_command_approvals` schema is installed and that inserts use `(role_name, command_type, is_approved)`. |
-| `approval lookup failed: SpiTupleTable positioned before the start` | SPI used outside a transaction. | Use the provided `Spi::connect` helper or wrap manual SPI in `StartTransactionCommand()` / `CommitTransactionCommand()`. |
+| Learn mode allows unapproved commands | Old behavior from earlier versions. | Fixed: Learn mode now blocks unapproved commands and requires admin approval. |
+| SpinLock deadlock or panic | Panic during lock holding in older version. | Fixed: Enhanced Drop guards with panic safety ensure locks always released. |
+| ReDoS attack from user-supplied regex | No timeout protection in older versions. | Fixed: 100ms timeout + validation trigger prevents dangerous patterns. |
+| Race condition on fingerprint updates | Concurrent hit_count updates lost. | Fixed: Uses SELECT FOR UPDATE to prevent race conditions. |
 | Activity log empty | Quiet hours active or table privileges altered. | Disable quiet hours for the test or restore INSERT privileges on `sql_firewall_activity_log`. |
 | Regex tests miss `'1'='1'` | Patterns missing quoted tautologies. | Insert additional regex rows (e.g., `(?i)or\s*'1'\s*=\s*'1'`). |
 
-If problems persist, capture PostgreSQL logs plus `run_tests.sh` output when filing an issue.
+If problems persist, capture PostgreSQL logs plus `run_comprehensive_tests.sh` output when filing an issue.
 
