@@ -56,6 +56,13 @@ fn guc_option(name: &str) -> Option<String> {
     let cname = CString::new(name).ok()?;
     unsafe {
         let ptr = pg_sys::GetConfigOptionByName(cname.as_ptr(), std::ptr::null_mut(), false);
-        cstr_to_string(ptr)
+        if ptr.is_null() {
+            return None;
+        }
+        // CRITICAL: Clone the string before freeing PostgreSQL's palloc'd memory
+        let result = CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_owned());
+        // Free the palloc'd buffer to prevent memory leak
+        pg_sys::pfree(ptr as *mut std::ffi::c_void);
+        result
     }
 }

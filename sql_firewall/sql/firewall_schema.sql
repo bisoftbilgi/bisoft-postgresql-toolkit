@@ -27,7 +27,8 @@ CREATE INDEX IF NOT EXISTS idx_sqlfw_activity_role_cmd_time
 CREATE INDEX IF NOT EXISTS idx_sqlfw_activity_action
     ON public.sql_firewall_activity_log(action);
 
-GRANT SELECT, INSERT, UPDATE ON public.sql_firewall_activity_log TO PUBLIC;
+-- SECURITY: Only allow SELECT for regular users, INSERT/UPDATE reserved for firewall extension
+GRANT SELECT ON public.sql_firewall_activity_log TO PUBLIC;
 GRANT USAGE, SELECT ON SEQUENCE public.sql_firewall_activity_log_log_id_seq TO PUBLIC;
 
 CREATE TABLE IF NOT EXISTS public.sql_firewall_command_approvals (
@@ -42,7 +43,8 @@ CREATE TABLE IF NOT EXISTS public.sql_firewall_command_approvals (
 COMMENT ON TABLE  public.sql_firewall_command_approvals IS 'Approval status of command types per role.';
 COMMENT ON COLUMN public.sql_firewall_command_approvals.is_approved IS 'If true, this role is allowed to execute the command type.';
 
-GRANT SELECT, INSERT, UPDATE ON public.sql_firewall_command_approvals TO PUBLIC;
+-- SECURITY: Only allow SELECT for regular users, INSERT/UPDATE must go through admin functions
+GRANT SELECT ON public.sql_firewall_command_approvals TO PUBLIC;
 GRANT USAGE, SELECT ON SEQUENCE public.sql_firewall_command_approvals_id_seq TO PUBLIC;
 
 CREATE TABLE IF NOT EXISTS public.sql_firewall_regex_rules (
@@ -86,7 +88,8 @@ CREATE TRIGGER validate_regex_trigger
 BEFORE INSERT OR UPDATE ON public.sql_firewall_regex_rules
 FOR EACH ROW EXECUTE FUNCTION validate_firewall_regex_pattern();
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.sql_firewall_regex_rules TO PUBLIC;
+-- SECURITY: Only allow SELECT for regular users, INSERT/UPDATE/DELETE must go through admin functions
+GRANT SELECT ON public.sql_firewall_regex_rules TO PUBLIC;
 GRANT USAGE, SELECT ON SEQUENCE public.sql_firewall_regex_rules_id_seq TO PUBLIC;
 
 INSERT INTO public.sql_firewall_regex_rules (pattern, description)
@@ -117,5 +120,151 @@ CREATE INDEX IF NOT EXISTS idx_sqlfw_fingerprint_role
 CREATE INDEX IF NOT EXISTS idx_sqlfw_fingerprint_last_seen
     ON public.sql_firewall_query_fingerprints(last_seen);
 
-GRANT SELECT, INSERT, UPDATE ON public.sql_firewall_query_fingerprints TO PUBLIC;
+-- SECURITY: Only allow SELECT for regular users, INSERT/UPDATE reserved for firewall extension
+GRANT SELECT ON public.sql_firewall_query_fingerprints TO PUBLIC;
 GRANT USAGE, SELECT ON SEQUENCE public.sql_firewall_query_fingerprints_id_seq TO PUBLIC;
+
+-- ============================================================================
+-- SECURITY DEFINER Functions for Controlled Admin Access
+-- ============================================================================
+
+-- Function to approve a command for a role (only superusers can call this)
+CREATE OR REPLACE FUNCTION public.sql_firewall_approve_command(
+    p_role_name NAME,
+    p_command_type TEXT
+) RETURNS VOID AS $$
+BEGIN
+    -- Only superusers can approve commands
+    IF NOT (SELECT usesuper FROM pg_user WHERE usename = current_user) THEN
+        RAISE EXCEPTION 'Only superusers can approve commands';
+    END IF;
+    
+    INSERT INTO public.sql_firewall_command_approvals (role_name, command_type, is_approved)
+    VALUES (p_role_name, p_command_type, true)
+    ON CONFLICT (role_name, command_type) 
+    DO UPDATE SET is_approved = true;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+COMMENT ON FUNCTION public.sql_firewall_approve_command IS 
+'Approve a command type for a specific role. Only callable by superusers.';
+
+-- Function to revoke command approval (only superusers can call this)
+CREATE OR REPLACE FUNCTION public.sql_firewall_revoke_command(
+    p_role_name NAME,
+    p_command_type TEXT
+) RETURNS VOID AS $$
+BEGIN
+    -- Only superusers can revoke commands
+    IF NOT (SELECT usesuper FROM pg_user WHERE usename = current_user) THEN
+        RAISE EXCEPTION 'Only superusers can revoke commands';
+    END IF;
+    
+    UPDATE public.sql_firewall_command_approvals
+    SET is_approved = false
+    WHERE role_name = p_role_name AND command_type = p_command_type;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Function to approve a fingerprint (only superusers can call this)
+CREATE OR REPLACE FUNCTION public.sql_firewall_approve_fingerprint(
+    p_fingerprint TEXT,
+    p_role_name NAME,
+    p_command_type TEXT
+) RETURNS VOID AS $$
+BEGIN
+    -- Only superusers can approve fingerprints
+    IF NOT (SELECT usesuper FROM pg_user WHERE usename = current_user) THEN
+        RAISE EXCEPTION 'Only superusers can approve fingerprints';
+    END IF;
+    
+    UPDATE public.sql_firewall_query_fingerprints
+    SET is_approved = true
+    WHERE fingerprint = p_fingerprint 
+      AND role_name = p_role_name 
+      AND command_type = p_command_type;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Function to block a fingerprint (only superusers can call this)
+CREATE OR REPLACE FUNCTION public.sql_firewall_block_fingerprint(
+    p_fingerprint TEXT,
+    p_role_name NAME,
+    p_command_type TEXT
+) RETURNS VOID AS $$
+BEGIN
+    -- Only superusers can block fingerprints
+    IF NOT (SELECT usesuper FROM pg_user WHERE usename = current_user) THEN
+        RAISE EXCEPTION 'Only superusers can block fingerprints';
+    END IF;
+    
+    UPDATE public.sql_firewall_query_fingerprints
+    SET is_approved = false
+    WHERE fingerprint = p_fingerprint 
+      AND role_name = p_role_name 
+      AND command_type = p_command_type;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Function to add a regex rule (only superusers can call this)
+CREATE OR REPLACE FUNCTION public.sql_firewall_add_regex_rule(
+    p_pattern TEXT,
+    p_description TEXT DEFAULT NULL
+) RETURNS INTEGER AS $$
+DECLARE
+    v_rule_id INTEGER;
+BEGIN
+    -- Only superusers can add regex rules
+    IF NOT (SELECT usesuper FROM pg_user WHERE usename = current_user) THEN
+        RAISE EXCEPTION 'Only superusers can add regex rules';
+    END IF;
+    
+    INSERT INTO public.sql_firewall_regex_rules (pattern, description)
+    VALUES (p_pattern, p_description)
+    RETURNING id INTO v_rule_id;
+    
+    RETURN v_rule_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Function to delete a regex rule (only superusers can call this)
+CREATE OR REPLACE FUNCTION public.sql_firewall_delete_regex_rule(
+    p_rule_id INTEGER
+) RETURNS VOID AS $$
+BEGIN
+    -- Only superusers can delete regex rules
+    IF NOT (SELECT usesuper FROM pg_user WHERE usename = current_user) THEN
+        RAISE EXCEPTION 'Only superusers can delete regex rules';
+    END IF;
+    
+    DELETE FROM public.sql_firewall_regex_rules
+    WHERE id = p_rule_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Function to toggle regex rule active status (only superusers can call this)
+CREATE OR REPLACE FUNCTION public.sql_firewall_toggle_regex_rule(
+    p_rule_id INTEGER,
+    p_is_active BOOLEAN
+) RETURNS VOID AS $$
+BEGIN
+    -- Only superusers can toggle regex rules
+    IF NOT (SELECT usesuper FROM pg_user WHERE usename = current_user) THEN
+        RAISE EXCEPTION 'Only superusers can modify regex rules';
+    END IF;
+    
+    UPDATE public.sql_firewall_regex_rules
+    SET is_active = p_is_active
+    WHERE id = p_rule_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Grant EXECUTE on admin functions to PUBLIC (functions enforce superuser check internally)
+GRANT EXECUTE ON FUNCTION public.sql_firewall_approve_command(NAME, TEXT) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.sql_firewall_revoke_command(NAME, TEXT) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.sql_firewall_approve_fingerprint(TEXT, NAME, TEXT) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.sql_firewall_block_fingerprint(TEXT, NAME, TEXT) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.sql_firewall_add_regex_rule(TEXT, TEXT) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.sql_firewall_delete_regex_rule(INTEGER) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.sql_firewall_toggle_regex_rule(INTEGER, BOOLEAN) TO PUBLIC;
+

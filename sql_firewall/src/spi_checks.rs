@@ -30,8 +30,18 @@ pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) ->
     }
 
     let matched = Spi::connect_mut(|client| {
-        // CRITICAL: Set statement timeout to prevent ReDoS attacks
-        // Set 100ms timeout for regex check
+        // CRITICAL: Save original statement_timeout and restore after regex check
+        // to prevent user's transaction from inheriting the 100ms limit
+        let saved_timeout = match spi_select_one::<String>(
+            client,
+            "SELECT current_setting('statement_timeout')",
+            &[],
+        ) {
+            Ok(Some(val)) => val,
+            _ => "0".to_string(),
+        };
+        
+        // Set temporary 100ms timeout to prevent ReDoS attacks
         let _ = spi_update(client, "SET LOCAL statement_timeout = 100", &[]);
         
         let result = match spi_select_one::<bool>(
@@ -46,16 +56,20 @@ pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) ->
                 // Check for timeout
                 if err_str.contains("timeout") || err_str.contains("canceling statement") {
                     pgrx::warning!("sql_firewall: regex check timeout - possible ReDoS attack pattern");
-                    return false;
+                    false
+                } else if err_str.contains("does not exist") || err_str.contains("mevcut değil") {
+                    // Tablo yoksa sessizce geç (bootstrap sırasında)
+                    false
+                } else {
+                    pgrx::warning!("sql_firewall: regex check failed: {err}");
+                    false
                 }
-                // Tablo yoksa sessizce geç (bootstrap sırasında)
-                if err_str.contains("does not exist") || err_str.contains("mevcut değil") {
-                    return false;
-                }
-                pgrx::warning!("sql_firewall: regex check failed: {err}");
-                false
             }
         };
+        
+        // CRITICAL: Restore original statement_timeout before returning
+        let restore_query = format!("SET LOCAL statement_timeout = '{}'", saved_timeout);
+        let _ = spi_update(client, &restore_query, &[]);
         
         result
     });
