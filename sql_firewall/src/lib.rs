@@ -1,17 +1,24 @@
+use pgrx::bgworkers::BackgroundWorkerBuilder;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
+use std::time::Duration;
 
 mod alerts;
+mod approval_worker;
 mod context;
 mod fingerprint_cache;
 mod fingerprints;
 mod firewall;
 mod guc;
 mod hooks;
+mod pending_approvals;
 mod port;
 mod rate_state;
 mod spi_checks;
 mod sql;
+mod structured_log;
+
+pub use approval_worker::approval_worker_main;
 
 pgrx::pg_module_magic!();
 pgrx::extension_sql_file!("../sql/firewall_schema.sql", name = "firewall_schema");
@@ -28,6 +35,16 @@ pub extern "C-unwind" fn _PG_init() {
         PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
         pg_sys::shmem_startup_hook = Some(shmem_startup_hook);
     }
+
+    // Register background worker for processing pending approvals
+    BackgroundWorkerBuilder::new("sql_firewall_approval_worker")
+        .set_function("approval_worker_main")
+        .set_library("sql_firewall_rs") // MUST match Cargo.toml [package] name
+        .set_argument(None::<i32>.into_datum())
+        .set_restart_time(Some(Duration::from_secs(1)))
+        .enable_spi_access()
+        .load();
+    pgrx::info!("sql_firewall: approval worker background worker registered");
 
     guc::register();
     hooks::install();
@@ -53,6 +70,7 @@ unsafe extern "C-unwind" fn shmem_request_hook() {
     }
     pg_sys::RequestAddinShmemSpace(fingerprint_cache::shared_memory_bytes());
     pg_sys::RequestAddinShmemSpace(rate_state::shared_memory_bytes());
+    pg_sys::RequestAddinShmemSpace(pending_approvals::shared_memory_bytes());
 }
 
 #[pgrx::pg_guard]
@@ -62,6 +80,7 @@ unsafe extern "C-unwind" fn shmem_startup_hook() {
     }
     fingerprint_cache::init();
     rate_state::init();
+    pending_approvals::init();
 }
 
 #[pg_extern]

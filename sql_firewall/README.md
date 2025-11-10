@@ -10,17 +10,19 @@ A production-ready SQL firewall extension for PostgreSQL 16 (compatible with 14-
 | **Hook Layer** | `ExecutorStart_hook`, `ProcessUtility_hook` | Captures every query/utility command, collects metadata, and short-circuits execution using `ereport!` when a policy fails. |
 | **Context Capture** | `sql_firewall_rs::context` | Resolves role, database, application name, client IP, and command tags for policy and logging decisions. |
 | **Policy Engine** | `firewall.rs`, `spi_checks.rs` | Applies security checks with transaction-safe logging, panic-safe guards, and improved internal query detection to prevent recursive loops. All SPI use is wrapped in guards that ensure proper transaction context. |
-| **Shared Memory** | `fingerprint_cache`, `rate_state` | Cross-backend caches with deadlock-free SpinLock implementation and panic safety. Tracks normalized query fingerprints (4096 entries) and rate-limit counters (512+1024 entries) without SPI overhead. |
+| **Shared Memory** | `fingerprint_cache`, `rate_state`, `pending_approvals` | Cross-backend caches with deadlock-free SpinLock implementation and panic safety. Tracks normalized query fingerprints (4096 entries), rate-limit counters (512+1024 entries), and pending approvals (1024-entry ring buffer) without SPI overhead. |
+| **Background Worker** | `approval_worker` | Asynchronous worker that processes pending approvals from shared memory queue and persists them to database. Survives transaction rollbacks, enabling Learn mode to block commands while still recording approval requests. |
 | **Catalog Tables** | `sql_firewall_activity_log`, `sql_firewall_command_approvals`, `sql_firewall_query_fingerprints`, `sql_firewall_regex_rules` | Persist audit records, approvals, fingerprint metadata, and regex rules (installed via `sql/firewall_schema.sql`). Includes ReDoS validation trigger on regex_rules table. |
 | **Alerting** | `alerts.rs` | Optional `NOTIFY` + syslog payloads whenever a block happens (regex, keyword, quiet hours, rate limit, approvals). |
 | **Tooling** | `run_comprehensive_tests.sh`, `run_advanced_tests.sh` | Comprehensive test suites that provision throwaway databases and validate all features. Currently 15/15 tests passing with full coverage of security, performance, and edge cases. |
 
-All policy decisions happen synchronously inside the backend with panic-safe guards, so blocks are atomic and crash-safe. Recent security fixes include: deadlock prevention, ReDoS timeout (100ms), transaction-safe logging, race condition fixes, and recursive loop protection.
+All policy decisions happen synchronously inside the backend with panic-safe guards, so blocks are atomic and crash-safe. Recent security fixes include: deadlock prevention, ReDoS timeout (100ms), transaction-safe logging, race condition fixes, and recursive loop protection. **New:** Background worker architecture enables Learn mode to block commands while reliably recording approval requests, solving the transaction rollback challenge.
 
 ---
 ## 2. Feature Summary
 
-- **Operating modes** – `learn`, `permissive`, `enforce` determine how unknown commands are handled. Learn mode now blocks unapproved commands and requires admin approval.
+- **Operating modes** – `learn`, `permissive`, `enforce` determine how unknown commands are handled. **Learn mode blocks unapproved commands and queues them for admin approval via background worker**.
+- **Background approval worker** – Asynchronous processing of pending approvals ensures reliable recording even when main transaction rolls back due to blocked commands.
 - **Command approvals** – role-based authorization for command types (SELECT, INSERT, UPDATE, DELETE, DDL). Admin approval required in learn mode.
 - **Adaptive fingerprints** – normalized SQL fingerprints with shared memory caching and auto-approval after threshold (configurable, default 10 hits).
 - **Shared-memory rate limits** – global per-role window plus per-command budgets (SELECT/INSERT/UPDATE/DELETE) with deadlock-free SpinLock implementation.
@@ -96,16 +98,19 @@ All knobs live under `sql_firewall.*` and may be set via `ALTER SYSTEM`, `postgr
 | **Alerts** | `sql_firewall.enable_alert_notifications` | `off` | Emit NOTIFY events for blocks. |
 | | `sql_firewall.alert_channel` | `sql_firewall_alerts` | Channel name for LISTEN/NOTIFY. |
 | | `sql_firewall.syslog_alerts` | `off` | Mirror alerts to syslog for SIEM. |
+| **Background Worker** | `sql_firewall.approval_worker_database` | `postgres` | Database for background worker to connect to for recording pending approvals. Requires PostgreSQL restart to change. |
 | **Retention** | `sql_firewall.activity_log_retention_days` | `30` | Age cutoff for log pruning. |
 | | `sql_firewall.activity_log_max_rows` | `1000000` | Row count target before pruning. |
 
 Activity logging itself is always enabled outside quiet hours; quiet-hour suppression avoids SPI recursion.
 
+**Note:** The background approval worker requires the database name to be set in `postgresql.conf` before PostgreSQL starts. This is a `Postmaster` context GUC that cannot be changed with `ALTER SYSTEM` alone.
+
 ---
 ## 6. Operational Workflow
 
 ### 6.1 Learn → Approve → Enforce
-1. **Learn** – blocks unapproved commands and logs them for review. Admin must explicitly approve via `sql_firewall_command_approvals`.
+1. **Learn** – blocks unapproved commands and queues them via background worker for admin review. Admin must explicitly approve via `sql_firewall_command_approvals`.
 2. **Review** – admins query activity log and approval tables, verify legitimacy, and set `is_approved=true`.
 3. **Enforce** – unknown or unapproved commands are blocked with `ERRCODE_INSUFFICIENT_PRIVILEGE`. `permissive` mode is available for staging: it logs violations without blocking.
 

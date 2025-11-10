@@ -14,6 +14,7 @@ mod auth_event;
 mod blacklist;
 mod lock_cache;
 mod sql;
+mod structured_log;
 mod worker;
 use crate::sql::{int4_arg, spi_select_one, spi_update, text_arg};
 pub use worker::auth_event_consumer_main;
@@ -134,10 +135,11 @@ unsafe fn register_password_check_hook() {
             // Call our validation function
             match check_password(username_str, password_str) {
                 Ok(_) => {
-                    // SECURITY: Do not log usernames
+                    structured_log::log_password_validated(username_str);
                 }
                 Err(e) => {
-                    // Password validation failed - report error to PostgreSQL
+                    // Password validation failed - log and report error
+                    structured_log::log_password_rejected(username_str, &e.to_string());
                     pgrx::error!("Password validation failed: {}", e);
                 }
             }

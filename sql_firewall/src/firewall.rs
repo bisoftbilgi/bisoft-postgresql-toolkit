@@ -5,7 +5,7 @@ use std::ptr;
 
 use pgrx::pg_sys::{self, errcodes::PgSqlErrorCode};
 
-use crate::{alerts, context::ExecutionContext, guc, spi_checks};
+use crate::{alerts, context::ExecutionContext, guc, spi_checks, structured_log};
 
 thread_local! {
     static INSIDE_FIREWALL: Cell<bool> = Cell::new(false);
@@ -44,7 +44,7 @@ pub enum QueryOrigin {
     Utility,
 }
 
-pub fn inspect_query(origin: QueryOrigin, query: &str, ctx: &ExecutionContext, command: &str) {
+pub fn inspect_query(_origin: QueryOrigin, query: &str, ctx: &ExecutionContext, command: &str) {
     if query.trim().is_empty() {
         return;
     }
@@ -82,7 +82,10 @@ pub fn inspect_query(origin: QueryOrigin, query: &str, ctx: &ExecutionContext, c
     // If in quiet hours, throw error IMMEDIATELY without calling log_activity or other SPI checks
     if let Some(reason) = quiet_hours_violation_reason() {
         if guc::quiet_hours_logging_enabled() {
-            log_quiet_hours_block(ctx, command, query, &reason);
+            if let Some((start, end)) = guc::quiet_hours_window() {
+                structured_log::log_quiet_hours(ctx, command, &start, &end);
+            }
+            spi_checks::log_activity(ctx, command, "BLOCKED (QUIET HOURS)", Some(&reason), query);
         }
         pgrx::ereport!(
             ERROR,
@@ -94,6 +97,7 @@ pub fn inspect_query(origin: QueryOrigin, query: &str, ctx: &ExecutionContext, c
 
     // Now safe to proceed with normal firewall checks that may call log_activity
     if let Some(keyword) = blocked_keyword(query) {
+        structured_log::log_keyword_block(ctx, command, &keyword);
         let message = format!("sql_firewall: Blocked due to blacklisted keyword '{keyword}'.");
         pgrx::ereport!(
             ERROR,
@@ -102,21 +106,24 @@ pub fn inspect_query(origin: QueryOrigin, query: &str, ctx: &ExecutionContext, c
         );
     }
 
+    // Get mode for approval checks (still needed)
     let mode = guc::mode();
-    let keyword = guc::keyword_scan_enabled();
-    let regex = guc::regex_scan_enabled();
-    let quiet = guc::quiet_hours_enabled();
-
-    pgrx::log!(
-        "sql_firewall_rs {:?}: mode={mode:?} keyword_scan={keyword} regex_scan={regex} quiet_hours={quiet}",
-        origin
-    );
-
-    if let Some((start, end)) = guc::quiet_hours_window() {
-        pgrx::log!("sql_firewall_rs quiet hours window {start} - {end}");
-    }
-
-    trace_query(origin, query);
+    
+    // Debug logging - commented out for production
+    // let keyword = guc::keyword_scan_enabled();
+    // let regex = guc::regex_scan_enabled();
+    // let quiet = guc::quiet_hours_enabled();
+    //
+    // pgrx::log!(
+    //     "sql_firewall_rs {:?}: mode={mode:?} keyword_scan={keyword} regex_scan={regex} quiet_hours={quiet}",
+    //     origin
+    // );
+    //
+    // if let Some((start, end)) = guc::quiet_hours_window() {
+    //     pgrx::log!("sql_firewall_rs quiet hours window {start} - {end}");
+    // }
+    //
+    // trace_query(origin, query);
 
     if let Some(reason) = spi_checks::regex_block_reason(ctx, command, query) {
         pgrx::ereport!(
@@ -143,6 +150,7 @@ pub fn inspect_query(origin: QueryOrigin, query: &str, ctx: &ExecutionContext, c
     }
 }
 
+#[allow(dead_code)]
 fn trace_query(origin: QueryOrigin, query: &str) {
     let sample = if query.len() > 256 {
         format!("{}...", &query[..256])
@@ -286,6 +294,7 @@ fn is_firewall_internal_query(query: &str) -> bool {
     lower.contains("sql_firewall_regex_rules")
 }
 
+#[allow(dead_code)]
 fn log_quiet_hours_block(ctx: &ExecutionContext, command: &str, query: &str, reason: &str) {
     let role = ctx.role.as_deref().unwrap_or("unknown");
     let database = ctx.database.as_deref().unwrap_or("unknown");

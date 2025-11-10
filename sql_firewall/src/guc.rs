@@ -48,6 +48,8 @@ pub static ALERT_CHANNEL: GucSetting<Option<CString>> = GucSetting::<Option<CStr
 pub static SYSLOG_ALERTS: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub static ALERT_ONLY_ON_BLOCK: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static ACTIVITY_LOG_RETENTION_DAYS: GucSetting<i32> = GucSetting::<i32>::new(30);
+pub static APPROVAL_WORKER_DATABASE: GucSetting<Option<CString>> = 
+    GucSetting::<Option<CString>>::new(None);
 pub static ACTIVITY_LOG_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 pub static ACTIVITY_LOG_PRUNE_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(300);
 
@@ -339,6 +341,14 @@ pub fn register() {
             GucContext::Suset,
             GucFlags::default(),
         );
+        GucRegistry::define_string_guc(
+            cstr(b"sql_firewall.approval_worker_database\0"),
+            cstr(b"Database for approval worker to connect to.\0"),
+            cstr(b"Background worker will record pending approvals in this database. If not set, uses 'postgres'.\0"),
+            &APPROVAL_WORKER_DATABASE,
+            GucContext::Postmaster,
+            GucFlags::default(),
+        );
         GucRegistry::define_int_guc(
             cstr(b"sql_firewall.activity_log_max_rows\0"),
             cstr(b"Target maximum row count for sql_firewall_activity_log.\0"),
@@ -520,6 +530,13 @@ pub fn alert_only_on_block() -> bool {
 
 pub fn activity_log_retention_days() -> i32 {
     ACTIVITY_LOG_RETENTION_DAYS.get()
+}
+
+pub fn approval_worker_database() -> String {
+    match APPROVAL_WORKER_DATABASE.get() {
+        Some(db) => db.to_string_lossy().to_string(),
+        None => "postgres".to_string(),
+    }
 }
 
 pub fn activity_log_max_rows() -> i64 {

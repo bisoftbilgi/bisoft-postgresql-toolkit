@@ -166,15 +166,30 @@ pub fn approval_requirement(
         return None;
     }
 
+    // SECURITY: "OTHER" commands are less common utility commands
+    // In enforce mode, we should still require approval for safety
+    // Only bypass in learn/permissive modes
     if command == "OTHER" {
-        log_activity(
-            ctx,
-            command,
-            "ALLOWED",
-            Some("Command type is 'OTHER'"),
-            query,
-        );
-        return None;
+        match mode {
+            FirewallMode::Learn | FirewallMode::Permissive => {
+                log_activity(
+                    ctx,
+                    command,
+                    "ALLOWED (OTHER)",
+                    Some("Uncommon utility command - automatically allowed in non-enforce mode"),
+                    query,
+                );
+                return None;
+            }
+            FirewallMode::Enforce => {
+                // In enforce mode, treat OTHER like any other command
+                // Fall through to normal approval logic
+                pgrx::warning!(
+                    "sql_firewall: Uncommon utility command detected for role '{}' - requires approval in enforce mode",
+                    ctx.role.as_deref().unwrap_or("unknown")
+                );
+            }
+        }
     }
 
     let role = match ctx.role.as_deref() {
@@ -210,15 +225,44 @@ pub fn approval_requirement(
     });
 
     let record_pending = || {
-        // CRITICAL: Multiple logging layers to survive transaction abort
+        // CRITICAL: Record approval request FIRST, before any potential rollback
+        // Use separate autonomous-like transaction via INSERT
+        let _ = Spi::run("SAVEPOINT approval_record");
         
-        // 1. PostgreSQL WARNING (survives transaction abort)
+        let insert_result = Spi::connect_mut(|client| {
+            let args = [name_arg(role), text_arg(command)];
+            spi_update(
+                client,
+                "INSERT INTO public.sql_firewall_command_approvals (role_name, command_type, is_approved) \
+                 VALUES ($1, $2, NULL) \
+                 ON CONFLICT (role_name, command_type) DO NOTHING",
+                &args,
+            )
+        });
+        
+        // Commit the approval record even if main transaction fails
+        if insert_result.is_ok() {
+            let _ = Spi::run("RELEASE SAVEPOINT approval_record");
+        } else {
+            let _ = Spi::run("ROLLBACK TO SAVEPOINT approval_record");
+        }
+        
+        // Also log to activity log
+        log_activity(
+            ctx,
+            command,
+            "PENDING APPROVAL",
+            Some("New command detected - awaiting admin approval"),
+            query,
+        );
+        
+        // PostgreSQL WARNING (survives transaction abort)
         pgrx::warning!(
             "sql_firewall: PENDING APPROVAL REQUEST - role='{}' command='{}'", 
             role, command
         );
         
-        // 2. PostgreSQL LOG (also survives abort)
+        // PostgreSQL LOG (also survives abort)
         pgrx::log!(
             "sql_firewall_rs: APPROVAL_NEEDED role='{}' command='{}' database='{}'",
             role,
@@ -226,7 +270,7 @@ pub fn approval_requirement(
             ctx.database.as_deref().unwrap_or("unknown")
         );
         
-        // 3. If syslog alerts enabled, use that too
+        // If syslog alerts enabled, use that too
         if guc::syslog_alerts_enabled() {
             use crate::alerts;
             alerts::emit_block_alert(
@@ -257,10 +301,10 @@ pub fn approval_requirement(
                 }
             }
             FirewallMode::Learn => Decision::Block {
-                action: Cow::Borrowed("BLOCKED (LEARN MODE)"),
-                reason: Some("Command type approval pending".to_string()),
+                action: Cow::Borrowed("BLOCKED (LEARN MODE - PENDING)"),
+                reason: Some("Command type approval pending - admin must approve".to_string()),
                 error: format!(
-                    "sql_firewall: BLOCKED - Approval for command '{}' is pending for role '{}'",
+                    "sql_firewall: BLOCKED - Approval for command '{}' is pending for role '{}' (Learn mode)",
                     command, role
                 ),
             },
@@ -275,12 +319,21 @@ pub fn approval_requirement(
         },
         None => match mode {
             FirewallMode::Learn => {
-                record_pending();
+                // Enqueue to shared memory - background worker will persist it
+                // Include database name so worker knows where to write
+                let db_name = ctx.database.as_deref().unwrap_or("unknown");
+                crate::pending_approvals::enqueue(role, command, db_name);
+                
+                pgrx::debug1!(
+                    "sql_firewall: Learn mode - queued approval for role={}, command={}, db={}",
+                    role, command, db_name
+                );
+                
                 Decision::Block {
-                    action: Cow::Borrowed("BLOCKED (LEARN MODE)"),
-                    reason: Some("New command type detected".to_string()),
+                    action: Cow::Borrowed("BLOCKED (LEARN MODE - QUEUED)"),
+                    reason: Some("Command type approval queued for admin review".to_string()),
                     error: format!(
-                        "sql_firewall: BLOCKED - Approval required for command '{}' for role '{}'",
+                        "sql_firewall: BLOCKED - Command '{}' for role '{}' queued for admin approval (Learn mode)",
                         command, role
                     ),
                 }
@@ -344,13 +397,14 @@ pub fn log_activity(
 
     let role = ctx.role.as_deref().unwrap_or("unknown");
     let database = ctx.database.as_deref().unwrap_or("unknown");
-    pgrx::log!(
-        "sql_firewall_rs log_activity: role='{}' database='{}' action='{}' command='{}'",
-        role,
-        database,
-        action,
-        command
-    );
+    // Debug logging - commented out for production
+    // pgrx::log!(
+    //     "sql_firewall_rs log_activity: role='{}' database='{}' action='{}' command='{}'",
+    //     role,
+    //     database,
+    //     action,
+    //     command
+    // );
     Spi::connect_mut(|client| {
         let reason_arg = reason
             .map(text_arg)

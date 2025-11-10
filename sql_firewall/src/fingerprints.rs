@@ -179,17 +179,11 @@ fn record_fingerprint_hit(
             text_arg(&summary.sample),
         ];
 
+        // Use SECURITY DEFINER function to bypass PUBLIC permission restrictions
+        // is_approved is set to false for new fingerprints (require explicit approval)
         if let Err(err) = spi_update(
             client,
-            "INSERT INTO public.sql_firewall_query_fingerprints
-                (fingerprint, normalized_query, role_name, command_type, sample_query)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (fingerprint, role_name, command_type)
-             DO UPDATE
-                 SET hit_count = sql_firewall_query_fingerprints.hit_count + 1,
-                     last_seen = now(),
-                     normalized_query = EXCLUDED.normalized_query,
-                     sample_query = EXCLUDED.sample_query",
+            "SELECT public.sql_firewall_internal_upsert_fingerprint($1, $2, $3, $4, $5, false)",
             &upsert_args,
         ) {
             pgrx::warning!("sql_firewall: fingerprint upsert failed: {err}");

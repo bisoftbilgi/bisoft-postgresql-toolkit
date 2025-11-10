@@ -74,7 +74,13 @@ unsafe extern "C-unwind" fn process_utility_hook(
 ) {
     if let Some(query) = cstr_to_string(query_string) {
         let ctx = ExecutionContext::collect();
-        firewall::inspect_query(firewall::QueryOrigin::Utility, &query, &ctx, "OTHER");
+        // Extract real command from utility statement instead of hard-coded "OTHER"
+        let command = if !pstmt.is_null() {
+            extract_utility_command(pstmt, &query)
+        } else {
+            "OTHER"
+        };
+        firewall::inspect_query(firewall::QueryOrigin::Utility, &query, &ctx, command);
     }
 
     if let Some(prev) = PREV_PROCESS_UTILITY {
@@ -116,6 +122,74 @@ fn command_from_cmdtype(cmd: pg_sys::CmdType::Type) -> &'static str {
         value if value == pg_sys::CmdType::CMD_INSERT => "INSERT",
         value if value == pg_sys::CmdType::CMD_UPDATE => "UPDATE",
         value if value == pg_sys::CmdType::CMD_DELETE => "DELETE",
+        _ => "OTHER",
+    }
+}
+
+// Extract command type from utility statement by parsing query string
+// This is simpler and more reliable than node inspection
+unsafe fn extract_utility_command(_pstmt: *mut pg_sys::PlannedStmt, query: &str) -> &'static str {
+    // Simple keyword-based extraction from query string
+    // Remove trailing semicolons and comments
+    let cleaned = query.trim().trim_end_matches(';').trim();
+    let query_upper = cleaned.to_uppercase();
+    let first_word = query_upper.split_whitespace().next().unwrap_or("");
+    
+    match first_word {
+        // DDL commands - these should be controlled
+        "CREATE" => "CREATE",
+        "DROP" => "DROP",
+        "ALTER" => "ALTER",
+        "TRUNCATE" => "TRUNCATE",
+        "COMMENT" => "COMMENT",
+        "RENAME" => "RENAME",
+        
+        // Security/Access control
+        "GRANT" => "GRANT",
+        "REVOKE" => "REVOKE",
+        
+        // Maintenance commands
+        "VACUUM" => "VACUUM",
+        "ANALYZE" => "ANALYZE",
+        "REINDEX" => "REINDEX",
+        "CLUSTER" => "CLUSTER",
+        
+        // Materialized views
+        "REFRESH" => "REFRESH",
+        
+        // Data manipulation
+        "COPY" => "COPY",
+        "LOCK" => "LOCK",
+        
+        // Transaction control
+        "BEGIN" | "START" => "BEGIN",
+        "COMMIT" | "END" => "COMMIT",
+        "ROLLBACK" | "ABORT" => "ROLLBACK",
+        "SAVEPOINT" => "SAVEPOINT",
+        "RELEASE" => "RELEASE",
+        "PREPARE" => "PREPARE",
+        "EXECUTE" => "EXECUTE",
+        "DEALLOCATE" => "DEALLOCATE",
+        
+        // Session/Config
+        "SET" => "SET",
+        "SHOW" => "SHOW",
+        "RESET" => "RESET",
+        
+        // Special utility
+        "EXPLAIN" => "EXPLAIN",
+        "LISTEN" => "LISTEN",
+        "NOTIFY" => "NOTIFY",
+        "UNLISTEN" => "UNLISTEN",
+        "CHECKPOINT" => "CHECKPOINT",
+        "DISCARD" => "DISCARD",
+        "LOAD" => "LOAD",
+        
+        // Replication
+        "CREATE_REPLICATION_SLOT" => "CREATE_REPLICATION_SLOT",
+        "DROP_REPLICATION_SLOT" => "DROP_REPLICATION_SLOT",
+        
+        // Everything else
         _ => "OTHER",
     }
 }

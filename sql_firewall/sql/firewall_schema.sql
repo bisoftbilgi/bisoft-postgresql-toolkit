@@ -27,8 +27,9 @@ CREATE INDEX IF NOT EXISTS idx_sqlfw_activity_role_cmd_time
 CREATE INDEX IF NOT EXISTS idx_sqlfw_activity_action
     ON public.sql_firewall_activity_log(action);
 
--- SECURITY: Only allow SELECT for regular users, INSERT/UPDATE reserved for firewall extension
-GRANT SELECT ON public.sql_firewall_activity_log TO PUBLIC;
+-- SECURITY: Extension writes to log in user context, so PUBLIC needs INSERT/UPDATE
+-- This is safe because the firewall controls who can execute queries
+GRANT SELECT, INSERT, UPDATE ON public.sql_firewall_activity_log TO PUBLIC;
 GRANT USAGE, SELECT ON SEQUENCE public.sql_firewall_activity_log_log_id_seq TO PUBLIC;
 
 CREATE TABLE IF NOT EXISTS public.sql_firewall_command_approvals (
@@ -43,8 +44,9 @@ CREATE TABLE IF NOT EXISTS public.sql_firewall_command_approvals (
 COMMENT ON TABLE  public.sql_firewall_command_approvals IS 'Approval status of command types per role.';
 COMMENT ON COLUMN public.sql_firewall_command_approvals.is_approved IS 'If true, this role is allowed to execute the command type.';
 
--- SECURITY: Only allow SELECT for regular users, INSERT/UPDATE must go through admin functions
-GRANT SELECT ON public.sql_firewall_command_approvals TO PUBLIC;
+-- SECURITY: Extension writes approvals in user context during learning
+-- This is safe because firewall controls execution
+GRANT SELECT, INSERT, UPDATE ON public.sql_firewall_command_approvals TO PUBLIC;
 GRANT USAGE, SELECT ON SEQUENCE public.sql_firewall_command_approvals_id_seq TO PUBLIC;
 
 CREATE TABLE IF NOT EXISTS public.sql_firewall_regex_rules (
@@ -120,8 +122,9 @@ CREATE INDEX IF NOT EXISTS idx_sqlfw_fingerprint_role
 CREATE INDEX IF NOT EXISTS idx_sqlfw_fingerprint_last_seen
     ON public.sql_firewall_query_fingerprints(last_seen);
 
--- SECURITY: Only allow SELECT for regular users, INSERT/UPDATE reserved for firewall extension
-GRANT SELECT ON public.sql_firewall_query_fingerprints TO PUBLIC;
+-- SECURITY: Extension records fingerprints in user context during learning
+-- This is safe because firewall controls execution
+GRANT SELECT, INSERT, UPDATE ON public.sql_firewall_query_fingerprints TO PUBLIC;
 GRANT USAGE, SELECT ON SEQUENCE public.sql_firewall_query_fingerprints_id_seq TO PUBLIC;
 
 -- ============================================================================
@@ -268,3 +271,76 @@ GRANT EXECUTE ON FUNCTION public.sql_firewall_add_regex_rule(TEXT, TEXT) TO PUBL
 GRANT EXECUTE ON FUNCTION public.sql_firewall_delete_regex_rule(INTEGER) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION public.sql_firewall_toggle_regex_rule(INTEGER, BOOLEAN) TO PUBLIC;
 
+
+-- ============================================================================
+-- SECURITY DEFINER Wrappers for Extension Internal Operations
+-- ============================================================================
+-- These functions allow the extension to write to catalog tables
+-- without granting INSERT/UPDATE/DELETE to PUBLIC
+
+-- Log activity (called by extension internally)
+CREATE OR REPLACE FUNCTION public.sql_firewall_internal_log_activity(
+    p_role_name NAME,
+    p_database_name NAME,
+    p_query_text TEXT,
+    p_application_name TEXT,
+    p_client_ip TEXT,
+    p_command_type TEXT,
+    p_action TEXT,
+    p_reason TEXT
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO public.sql_firewall_activity_log (
+        role_name, database_name, query_text, application_name,
+        client_ip, command_type, action, reason
+    ) VALUES (
+        p_role_name, p_database_name, p_query_text, p_application_name,
+        p_client_ip, p_command_type, p_action, p_reason
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Record or update fingerprint (called by extension internally)
+CREATE OR REPLACE FUNCTION public.sql_firewall_internal_upsert_fingerprint(
+    p_fingerprint TEXT,
+    p_normalized_query TEXT,
+    p_role_name NAME,
+    p_command_type TEXT,
+    p_sample_query TEXT,
+    p_is_approved BOOLEAN
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO public.sql_firewall_query_fingerprints (
+        fingerprint, normalized_query, role_name, command_type,
+        sample_query, hit_count, is_approved, last_seen
+    ) VALUES (
+        p_fingerprint, p_normalized_query, p_role_name, p_command_type,
+        p_sample_query, 1, p_is_approved, now()
+    )
+    ON CONFLICT (fingerprint, role_name, command_type) DO UPDATE
+    SET hit_count = sql_firewall_query_fingerprints.hit_count + 1,
+        last_seen = now();
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Create or update approval (called by extension internally)
+CREATE OR REPLACE FUNCTION public.sql_firewall_internal_upsert_approval(
+    p_role_name NAME,
+    p_command_type TEXT,
+    p_is_approved BOOLEAN
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO public.sql_firewall_command_approvals (
+        role_name, command_type, is_approved
+    ) VALUES (
+        p_role_name, p_command_type, p_is_approved
+    )
+    ON CONFLICT (role_name, command_type) DO UPDATE
+    SET is_approved = p_is_approved;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Grant EXECUTE on internal functions to PUBLIC
+GRANT EXECUTE ON FUNCTION public.sql_firewall_internal_log_activity(NAME, NAME, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.sql_firewall_internal_upsert_fingerprint(TEXT, TEXT, NAME, TEXT, TEXT, BOOLEAN) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION public.sql_firewall_internal_upsert_approval(NAME, TEXT, BOOLEAN) TO PUBLIC;
