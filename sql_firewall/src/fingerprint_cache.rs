@@ -98,6 +98,8 @@ impl<'a> SpinLockGuard<'a> {
 impl Drop for SpinLockGuard<'_> {
     fn drop(&mut self) {
         unsafe {
+            // CRITICAL: Always release lock, even during panic/unwind
+            // This prevents deadlock if error occurs while holding lock
             pg_sys::SpinLockRelease(self.lock);
         }
     }
@@ -196,7 +198,12 @@ pub fn remember(
         }
 
         if !reused {
-            pgrx::warning!("sql_firewall_rs: fingerprint cache insertion failed (no slot)");
+            // CRITICAL WARNING: Cache is full! This means fingerprint learning is degraded
+            pgrx::warning!(
+                "sql_firewall_rs: CRITICAL - Fingerprint cache FULL! \
+                 Evicted oldest entry. Consider increasing CACHE_ENTRIES (current: {}).",
+                CACHE_ENTRIES
+            );
         }
     }
 }

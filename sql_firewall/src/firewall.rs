@@ -49,9 +49,8 @@ pub fn inspect_query(origin: QueryOrigin, query: &str, ctx: &ExecutionContext, c
         return;
     }
 
-    // Firewall kendi sorgularını kontrol etmesin
     // CRITICAL: Bypass sql_firewall tables to prevent infinite loop
-    if is_firewall_internal_query(query) || query.contains("sql_firewall") {
+    if is_firewall_internal_query(query) {
         return;
     }
 
@@ -266,7 +265,25 @@ fn is_superuser() -> bool {
 }
 
 fn is_firewall_internal_query(query: &str) -> bool {
-    query.to_ascii_lowercase().contains("sql_firewall_")
+    // CRITICAL: More precise check to prevent recursive loops
+    // Check for actual table access patterns, not just string presence
+    let lower = query.to_ascii_lowercase();
+    
+    // Skip if it's accessing firewall tables
+    let has_table_keyword = lower.contains("from ") || 
+                            lower.contains("into ") || 
+                            lower.contains("update ") ||
+                            lower.contains("join ");
+    
+    if !has_table_keyword {
+        return false;
+    }
+    
+    // Check for specific firewall table names
+    lower.contains("sql_firewall_activity_log") ||
+    lower.contains("sql_firewall_command_approvals") ||
+    lower.contains("sql_firewall_query_fingerprints") ||
+    lower.contains("sql_firewall_regex_rules")
 }
 
 fn log_quiet_hours_block(ctx: &ExecutionContext, command: &str, query: &str, reason: &str) {

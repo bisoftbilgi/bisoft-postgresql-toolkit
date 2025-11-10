@@ -19,30 +19,45 @@ pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) ->
         return None;
     }
 
-    // Firewall kendi sorgularını kontrol etmesin (recursive loop önleme)
-    if query.contains("sql_firewall_") {
+    // CRITICAL: More precise check - skip only actual firewall table access
+    let lower = query.to_ascii_lowercase();
+    if (lower.contains("from ") || lower.contains("into ") || lower.contains("update ")) &&
+       (lower.contains("sql_firewall_activity_log") || 
+        lower.contains("sql_firewall_command_approvals") ||
+        lower.contains("sql_firewall_query_fingerprints") ||
+        lower.contains("sql_firewall_regex_rules")) {
         return None;
     }
 
-    let matched = Spi::connect(|client| {
-        match spi_select_one::<bool>(
+    let matched = Spi::connect_mut(|client| {
+        // CRITICAL: Set statement timeout to prevent ReDoS attacks
+        // Set 100ms timeout for regex check
+        let _ = spi_update(client, "SET LOCAL statement_timeout = 100", &[]);
+        
+        let result = match spi_select_one::<bool>(
             client,
             "SELECT EXISTS (SELECT 1 FROM public.sql_firewall_regex_rules \
-             WHERE is_active = true AND action = 'BLOCK' AND $1 ~* pattern)",
+             WHERE is_active = true AND action = 'BLOCK' AND $1 ~* pattern LIMIT 1)",
             &[text_arg(query)],
         ) {
             Ok(result) => result.unwrap_or(false),
             Err(err) => {
+                let err_str = err.to_string();
+                // Check for timeout
+                if err_str.contains("timeout") || err_str.contains("canceling statement") {
+                    pgrx::warning!("sql_firewall: regex check timeout - possible ReDoS attack pattern");
+                    return false;
+                }
                 // Tablo yoksa sessizce geç (bootstrap sırasında)
-                if err.to_string().contains("does not exist")
-                    || err.to_string().contains("mevcut değil")
-                {
+                if err_str.contains("does not exist") || err_str.contains("mevcut değil") {
                     return false;
                 }
                 pgrx::warning!("sql_firewall: regex check failed: {err}");
                 false
             }
-        }
+        };
+        
+        result
     });
 
     if matched {
@@ -66,7 +81,13 @@ pub fn rate_limit_violation(ctx: &ExecutionContext, command: &str, query: &str) 
         return None;
     }
 
-    if query.contains("sql_firewall_") {
+    // CRITICAL: More precise check - skip only actual firewall table access
+    let lower = query.to_ascii_lowercase();
+    if (lower.contains("from ") || lower.contains("into ") || lower.contains("update ")) &&
+       (lower.contains("sql_firewall_activity_log") || 
+        lower.contains("sql_firewall_command_approvals") ||
+        lower.contains("sql_firewall_query_fingerprints") ||
+        lower.contains("sql_firewall_regex_rules")) {
         return None;
     }
 
@@ -121,8 +142,13 @@ pub fn approval_requirement(
         return None;
     }
 
-    // Firewall kendi sorgularını kontrol etmesin
-    if query.contains("sql_firewall_") {
+    // CRITICAL: More precise check - skip only actual firewall table access
+    let lower = query.to_ascii_lowercase();
+    if (lower.contains("from ") || lower.contains("into ") || lower.contains("update ")) &&
+       (lower.contains("sql_firewall_activity_log") || 
+        lower.contains("sql_firewall_command_approvals") ||
+        lower.contains("sql_firewall_query_fingerprints") ||
+        lower.contains("sql_firewall_regex_rules")) {
         return None;
     }
 
@@ -143,6 +169,7 @@ pub fn approval_requirement(
             let decision = Decision::Allow {
                 action: Cow::Borrowed("ALLOWED"),
                 reason: Some("Role unknown".to_string()),
+                skip_fingerprint_check: true,  // No role, can't check fingerprints anyway
             };
             return finalize_decision(decision, ctx, command, mode, query);
         }
@@ -168,46 +195,95 @@ pub fn approval_requirement(
         }
     });
 
+    let record_pending = || {
+        // CRITICAL: Multiple logging layers to survive transaction abort
+        
+        // 1. PostgreSQL WARNING (survives transaction abort)
+        pgrx::warning!(
+            "sql_firewall: PENDING APPROVAL REQUEST - role='{}' command='{}'", 
+            role, command
+        );
+        
+        // 2. PostgreSQL LOG (also survives abort)
+        pgrx::log!(
+            "sql_firewall_rs: APPROVAL_NEEDED role='{}' command='{}' database='{}'",
+            role,
+            command,
+            ctx.database.as_deref().unwrap_or("unknown")
+        );
+        
+        // 3. If syslog alerts enabled, use that too
+        if guc::syslog_alerts_enabled() {
+            use crate::alerts;
+            alerts::emit_block_alert(
+                ctx,
+                command,
+                "PENDING APPROVAL - awaiting admin action"
+            );
+        }
+    };
+
     let decision = match approval {
         Some(true) => Decision::Allow {
             action: Cow::Borrowed("ALLOWED"),
             reason: Some("Approved command type".to_string()),
+            skip_fingerprint_check: true,  // Command approved at command-type level, skip fingerprint
         },
         Some(false) => match mode {
-            FirewallMode::Permissive => Decision::Allow {
-                action: Cow::Borrowed("ALLOWED (PERMISSIVE)"),
+            FirewallMode::Permissive => {
+                pgrx::warning!(
+                    "sql_firewall: role '{}' command '{}' allowed in permissive mode (pending approval)",
+                    role,
+                    command
+                );
+                Decision::Allow {
+                    action: Cow::Borrowed("ALLOWED (PERMISSIVE - PENDING)"),
+                    reason: Some("Command type approval pending".to_string()),
+                    skip_fingerprint_check: false,  // Still check fingerprints in permissive mode
+                }
+            }
+            FirewallMode::Learn => Decision::Block {
+                action: Cow::Borrowed("BLOCKED (LEARN MODE)"),
                 reason: Some("Command type approval pending".to_string()),
+                error: format!(
+                    "sql_firewall: BLOCKED - Approval for command '{}' is pending for role '{}'",
+                    command, role
+                ),
             },
             _ => Decision::Block {
                 action: Cow::Borrowed("BLOCKED"),
                 reason: Some("Command type approval pending".to_string()),
                 error: format!(
-                    "sql_firewall: Approval for command '{}' is pending for role '{}'",
+                    "sql_firewall: BLOCKED - Approval for command '{}' is pending for role '{}'",
                     command, role
                 ),
             },
         },
         None => match mode {
             FirewallMode::Learn => {
-                Spi::connect_mut(|client| {
-                    if let Err(err) = spi_update(
-                        client,
-                        "INSERT INTO public.sql_firewall_command_approvals (role_name, command_type) \
-                         VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                        &[name_arg(role), text_arg(command)],
-                    ) {
-                        pgrx::warning!("sql_firewall: failed to insert approval row: {err}");
-                    }
-                });
-                Decision::Allow {
-                    action: Cow::Borrowed("LEARNED (Command)"),
+                record_pending();
+                Decision::Block {
+                    action: Cow::Borrowed("BLOCKED (LEARN MODE)"),
                     reason: Some("New command type detected".to_string()),
+                    error: format!(
+                        "sql_firewall: BLOCKED - Approval required for command '{}' for role '{}'",
+                        command, role
+                    ),
                 }
             }
-            FirewallMode::Permissive => Decision::Allow {
-                action: Cow::Borrowed("ALLOWED (PERMISSIVE)"),
-                reason: Some("No rule for command type".to_string()),
-            },
+            FirewallMode::Permissive => {
+                record_pending();
+                pgrx::warning!(
+                    "sql_firewall: role '{}' command '{}' auto-approved in permissive mode (no rule)",
+                    role,
+                    command
+                );
+                Decision::Allow {
+                    action: Cow::Borrowed("ALLOWED (PERMISSIVE - AUTO)"),
+                    reason: Some("No rule for command type".to_string()),
+                    skip_fingerprint_check: false,  // Still check fingerprints
+                }
+            }
             FirewallMode::Enforce => Decision::Block {
                 action: Cow::Borrowed("BLOCKED"),
                 reason: Some("No rule for command type".to_string()),
@@ -314,6 +390,7 @@ enum Decision {
     Allow {
         action: Cow<'static, str>,
         reason: Option<String>,
+        skip_fingerprint_check: bool,  // If true, skip fingerprint enforcement (command already approved)
     },
     Block {
         action: Cow<'static, str>,
@@ -330,9 +407,12 @@ fn finalize_decision(
     query: &str,
 ) -> Option<String> {
     match decision {
-        Decision::Allow { action, reason } => {
-            if let Some(reason_text) = fingerprints::enforce(ctx, command, mode, query) {
-                return Some(reason_text);
+        Decision::Allow { action, reason, skip_fingerprint_check } => {
+            // Check fingerprints if needed (Learn mode always checks to track, others check to enforce)
+            if !skip_fingerprint_check && guc::fingerprint_learning_enabled() {
+                if let Some(reason_text) = fingerprints::enforce(ctx, command, mode, query) {
+                    return Some(reason_text);
+                }
             }
             log_activity(ctx, command, action.as_ref(), reason.as_deref(), query);
             None

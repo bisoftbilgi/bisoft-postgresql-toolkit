@@ -18,6 +18,8 @@ COMMENT ON TABLE  public.sql_firewall_activity_log IS 'Log of all actions perfor
 COMMENT ON COLUMN public.sql_firewall_activity_log.action IS 'Action performed: ALLOWED, BLOCKED, LEARNED, etc.';
 COMMENT ON COLUMN public.sql_firewall_activity_log.reason IS 'Reason for the action: Rate limit, blacklisted keyword, etc.';
 
+ALTER TABLE public.sql_firewall_activity_log SET LOGGED;
+
 CREATE INDEX IF NOT EXISTS idx_sqlfw_activity_role_time
     ON public.sql_firewall_activity_log(role_name, log_time);
 CREATE INDEX IF NOT EXISTS idx_sqlfw_activity_role_cmd_time
@@ -54,6 +56,35 @@ CREATE TABLE IF NOT EXISTS public.sql_firewall_regex_rules (
 
 COMMENT ON TABLE  public.sql_firewall_regex_rules IS 'Regex rules used to match and block SQL queries.';
 COMMENT ON COLUMN public.sql_firewall_regex_rules.pattern IS 'Regex pattern to apply on the query text.';
+
+-- CRITICAL: Validate regex patterns to prevent ReDoS attacks
+CREATE OR REPLACE FUNCTION validate_firewall_regex_pattern()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Check for dangerous patterns that can cause ReDoS
+    IF NEW.pattern ~ '.*\(\?.*\{.*\}.*\).*' THEN
+        RAISE EXCEPTION 'Complex nested quantifiers not allowed (ReDoS risk)';
+    END IF;
+    
+    -- Check for excessive repetition operators
+    IF NEW.pattern ~ '.*((\+\+)|(\*\*)|(\+\*)).*' THEN
+        RAISE EXCEPTION 'Multiple adjacent quantifiers not allowed (ReDoS risk)';
+    END IF;
+    
+    -- Test pattern with a simple string to ensure it's valid
+    BEGIN
+        PERFORM 'test' ~ NEW.pattern;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE EXCEPTION 'Invalid regex pattern: %', SQLERRM;
+    END;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER validate_regex_trigger
+BEFORE INSERT OR UPDATE ON public.sql_firewall_regex_rules
+FOR EACH ROW EXECUTE FUNCTION validate_firewall_regex_pattern();
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.sql_firewall_regex_rules TO PUBLIC;
 GRANT USAGE, SELECT ON SEQUENCE public.sql_firewall_regex_rules_id_seq TO PUBLIC;

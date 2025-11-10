@@ -28,6 +28,8 @@ COMMENT ON TABLE  public.sql_firewall_activity_log IS 'Log of all actions perfor
 COMMENT ON COLUMN public.sql_firewall_activity_log.action IS 'Action performed: ALLOWED, BLOCKED, LEARNED, etc.';
 COMMENT ON COLUMN public.sql_firewall_activity_log.reason IS 'Reason for the action: Rate limit, blacklisted keyword, etc.';
 
+ALTER TABLE public.sql_firewall_activity_log SET LOGGED;
+
 CREATE INDEX IF NOT EXISTS idx_sqlfw_activity_role_time
     ON public.sql_firewall_activity_log(role_name, log_time);
 CREATE INDEX IF NOT EXISTS idx_sqlfw_activity_role_cmd_time
@@ -83,4 +85,3 @@ STRICT
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'sql_firewall_status_wrapper';
 /* </end connected objects> */
-

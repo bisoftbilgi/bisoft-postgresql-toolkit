@@ -88,7 +88,7 @@ pub fn enforce(
     let hit_count = raw_hit_count.max(1);
 
     let mut approved = is_approved;
-    if !approved && mode == FirewallMode::Learn {
+    if !approved && (mode == FirewallMode::Learn || mode == FirewallMode::Permissive) {
         let threshold = guc::fingerprint_learn_threshold().max(1);
         if hit_count >= threshold {
             if promote_fingerprint(&fingerprint_hex, role, command) {
@@ -109,6 +109,8 @@ pub fn enforce(
     } else {
         CacheState::Pending
     };
+    let hit_count = hit_count.max(1);
+
     fingerprint_cache::remember(
         ctx.role_oid,
         summary.hash,
@@ -121,29 +123,20 @@ pub fn enforce(
         return None;
     }
 
-    let is_new_entry = hit_count == 1;
-    if is_new_entry {
-        spi_checks::log_activity(
-            ctx,
-            command,
-            "LEARNED (FINGERPRINT)",
-            Some("New fingerprint recorded"),
-            query,
-        );
-    }
-
     match mode {
         FirewallMode::Learn => {
-            if !is_new_entry {
-                spi_checks::log_activity(
-                    ctx,
-                    command,
-                    "LEARNED (FINGERPRINT)",
-                    Some("Fingerprint pending approval"),
-                    query,
-                );
-            }
-            None
+            // Learn mode now blocks unapproved commands and waits for admin approval
+            spi_checks::log_activity(
+                ctx,
+                command,
+                "BLOCKED (LEARN)",
+                Some("Fingerprint pending approval"),
+                query,
+            );
+            Some(format!(
+                "sql_firewall: Fingerprint '{}' for role '{}' is pending approval (Learn mode).",
+                fingerprint_hex, role
+            ))
         }
         FirewallMode::Permissive => {
             spi_checks::log_activity(
@@ -204,9 +197,12 @@ fn record_fingerprint_hit(
         }
 
         match client.select(
+            // CRITICAL: Use SELECT FOR UPDATE to prevent race condition
+            // This ensures concurrent updates don't cause lost hit counts
             "SELECT hit_count, is_approved
              FROM public.sql_firewall_query_fingerprints
-             WHERE fingerprint = $1 AND role_name = $2 AND command_type = $3",
+             WHERE fingerprint = $1 AND role_name = $2 AND command_type = $3
+             FOR UPDATE",
             Some(1),
             &[text_arg(fingerprint_hex), name_arg(role), text_arg(command)],
         ) {

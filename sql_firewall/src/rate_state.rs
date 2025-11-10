@@ -274,6 +274,8 @@ impl<'a> SpinLockGuard<'a> {
 impl Drop for SpinLockGuard<'_> {
     fn drop(&mut self) {
         unsafe {
+            // CRITICAL: Always release lock, even during panic/unwind
+            // This prevents deadlock if error occurs while holding lock
             pg_sys::SpinLockRelease(self.lock);
         }
     }
