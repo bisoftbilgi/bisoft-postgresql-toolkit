@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  logstash:
+    build: ./docker
+    container_name: logstash
+    environment:
+      PG_HOST: host.docker.internal
+      PG_PORT: 
+      PG_DB:
+      PG_USER:
+      PG_PASS:
+      PG_ADMIN_USER:
+      PG_ADMIN_PASS:
+      CLUSTER_NAME:
+      LOG_PATH:
+    volumes:
+      - <path>:<path>:ro
+    ports:
+      - "5044:5044"
+      - "9600:9600"
+    restart: unless-stopped
