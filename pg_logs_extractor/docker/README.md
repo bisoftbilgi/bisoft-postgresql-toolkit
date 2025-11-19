@@ -9,7 +9,7 @@ This folder contains the Docker configuration required to run the PostgreSQL Log
 ## 1. Prerequisites
 ### Before running the stack, ensure:
 - PostgreSQL is already installed on the host
-- PostgreSQL logging is enabled (log_destination = 'stderr', logging_collector = on)
+- PostgreSQL must already be configured with the required logging settings before running the container
 - Logs are written to a directory (example):
 ```bash
 /var/log/postgresql
