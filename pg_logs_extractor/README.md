@@ -260,5 +260,5 @@ along with their possible causes and recommended solutions.
 ## Docker Support
 
 If you prefer to run this setup inside a containerized environment,  
-see [Docker README](https://github.com/bisoft-postgresql-toolkit/tree/main/pg_logs_extractor/docker/README.md) for Docker Compose examples  
+see [Docker README](https://github.com/bisoftbilgi/bisoft-postgresql-toolkit/pg_logs_extractor/docker/README.md) for Docker Compose examples  
 and container-based Logstash + PostgreSQL configuration.
