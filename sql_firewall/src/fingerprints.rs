@@ -88,7 +88,8 @@ pub fn enforce(
     let hit_count = raw_hit_count.max(1);
 
     let mut approved = is_approved;
-    if !approved && (mode == FirewallMode::Learn || mode == FirewallMode::Permissive) {
+    // Fingerprint learning only in Learn mode
+    if !approved && mode == FirewallMode::Learn {
         let threshold = guc::fingerprint_learn_threshold().max(1);
         if hit_count >= threshold {
             if promote_fingerprint(&fingerprint_hex, role, command) {

@@ -30,6 +30,10 @@ pub fn int4_arg(value: i32) -> DatumWithOid<'static> {
     unsafe { DatumWithOid::new(value, pg_sys::INT4OID) }
 }
 
+pub fn bool_arg(value: bool) -> DatumWithOid<'static> {
+    unsafe { DatumWithOid::new(value, pg_sys::BOOLOID) }
+}
+
 pub fn spi_select_one<'a, T: IntoDatum + FromDatum>(
     client: &SpiClient<'_>,
     query: &str,

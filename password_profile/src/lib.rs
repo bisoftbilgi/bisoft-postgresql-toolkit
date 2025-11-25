@@ -1094,6 +1094,55 @@ fn remove_from_blacklist(password: &str) -> Result<String, Box<dyn std::error::E
 }
 
 #[pg_extern]
+fn load_blacklist_from_file(
+    file_path: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    // Default path: $PGDATA/../share/extension/password_profile_blacklist.txt
+    let path = if let Some(p) = file_path {
+        p.to_string()
+    } else {
+        // Try to get PGDATA
+        let pgdata = std::env::var("PGDATA").unwrap_or_else(|_| "/var/lib/pgsql/16/data".to_string());
+        format!("{}/password_profile_blacklist.txt", pgdata)
+    };
+
+    let file = File::open(&path).map_err(|e| {
+        format!("Failed to open blacklist file '{}': {}", path, e)
+    })?;
+
+    let reader = BufReader::new(file);
+    let mut count = 0;
+    let mut errors = 0;
+
+    for line in reader.lines() {
+        if let Ok(password) = line {
+            let password = password.trim();
+            if password.is_empty() || password.starts_with('#') {
+                continue;
+            }
+
+            match Spi::run_with_args(
+                "INSERT INTO password_profile.blacklist (password, reason)
+                 VALUES ($1, 'Loaded from file')
+                 ON CONFLICT (password) DO NOTHING",
+                &[text_arg(password)],
+            ) {
+                Ok(_) => count += 1,
+                Err(_) => errors += 1,
+            }
+        }
+    }
+
+    Ok(format!(
+        "Loaded {} passwords from '{}' ({} errors)",
+        count, path, errors
+    ))
+}
+
+#[pg_extern]
 fn get_password_stats(username: &str) -> Result<String, Box<dyn std::error::Error>> {
     // Get various stats
     let history_query = "

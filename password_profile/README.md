@@ -47,12 +47,20 @@ cargo pgrx package --pg-config /usr/pgsql-16/bin/pg_config
 # Copy artifacts into PostgreSQL
 sudo cp -r target/release/password_profile_pure-pg16/usr/pgsql-16/* /usr/pgsql-16/
 
+# Copy blacklist file to PGDATA directory
+sudo cp blacklist.txt /var/lib/pgsql/16/data/password_profile_blacklist.txt
+sudo chown postgres:postgres /var/lib/pgsql/16/data/password_profile_blacklist.txt
+
 # Enable in postgresql.conf
 echo \"shared_preload_libraries = 'password_profile_pure'\" | sudo tee -a /var/lib/pgsql/16/data/postgresql.conf
 sudo systemctl restart postgresql-16
 
 # Create in each database where you need it
 psql -d mydb -c \"CREATE EXTENSION password_profile_pure;\"
+psql -d mydb -c \"SELECT init_login_attempts_table();\"
+
+# Load common password blacklist (10,000+ entries)
+psql -d mydb -c \"SELECT load_blacklist_from_file(NULL);\"
 ```
 
 Repeat for pg15/pg14 by pointing `cargo pgrx package` to the corresponding `pg_config`.
@@ -89,6 +97,7 @@ Changes take effect immediately; no restart is required after shared_preload_lib
 | `check_user_access(username)` | Returns error message if locked; otherwise “Access granted”. |
 | `check_password_expiry(username)` | Indicates expiry/grace status. |
 | `add_to_blacklist(password[, reason])`, `remove_from_blacklist(password)` | Manage dynamic blacklist entries. |
+| `load_blacklist_from_file([file_path])` | Load common passwords from file (default: PGDATA/password_profile_blacklist.txt). |
 | `get_password_stats(username)` | Aggregated history/expiry/fail info. |
 | `get_lock_cache_stats()` | Shared cache metrics for monitoring. |
 

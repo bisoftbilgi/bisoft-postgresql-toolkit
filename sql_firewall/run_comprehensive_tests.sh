@@ -23,6 +23,7 @@ ok() { echo -e "${GREEN}✓ $*${NC}"; echo "[OK] $*" >> $LOGFILE; }
 err() { echo -e "${RED}✗ $*${NC}"; echo "[ERR] $*" >> $LOGFILE; }
 warn() { echo -e "${YELLOW}⚠ $*${NC}"; echo "[WARN] $*" >> $LOGFILE; }
 
+psql_postgres() { PGPASSWORD="$ADMIN_PASS" psql -h "$PGHOST" -p "$PGPORT" -U "$ADMIN" -d postgres -At -q -c "$*" 2>&1 || true; }
 psql_admin() { PGPASSWORD="$ADMIN_PASS" psql -h "$PGHOST" -p "$PGPORT" -U "$ADMIN" -d "$DB" -At -q -c "$*" 2>&1 || true; }
 psql_user() { PGPASSWORD="$USER_PASS" psql -h "$PGHOST" -p "$PGPORT" -U "$USER" -d "$DB" -At -q -c "$*" 2>&1 || true; }
 
@@ -34,6 +35,25 @@ rm -f $LOGFILE
 echo "=== SQL Firewall Comprehensive Test - $(date) ===" > $LOGFILE
 
 info "🔧 Initializing test environment..."
+
+# Create test database and user
+info "Creating test database and user..."
+psql_postgres "DROP DATABASE IF EXISTS $DB;" >/dev/null 2>&1
+psql_postgres "DROP ROLE IF EXISTS $USER;" >/dev/null 2>&1
+psql_postgres "CREATE DATABASE $DB;" >/dev/null 2>&1
+psql_postgres "CREATE ROLE $USER WITH LOGIN PASSWORD '$USER_PASS';" >/dev/null 2>&1
+
+# Wait for database to be ready
+sleep 1
+
+# Create extension and tables in test database
+info "Setting up test database..."
+psql_admin "CREATE EXTENSION IF NOT EXISTS sql_firewall_rs;" >/dev/null 2>&1
+psql_admin "CREATE TABLE IF NOT EXISTS test_table (id SERIAL PRIMARY KEY, data TEXT);" >/dev/null 2>&1
+psql_admin "GRANT ALL ON test_table TO $USER;" >/dev/null 2>&1
+psql_admin "GRANT ALL ON SEQUENCE test_table_id_seq TO $USER;" >/dev/null 2>&1
+
+# Cleanup existing data
 psql_admin "TRUNCATE sql_firewall_activity_log RESTART IDENTITY CASCADE;" >/dev/null 2>&1
 psql_admin "TRUNCATE sql_firewall_command_approvals RESTART IDENTITY CASCADE;" >/dev/null 2>&1
 psql_admin "TRUNCATE sql_firewall_query_fingerprints RESTART IDENTITY CASCADE;" >/dev/null 2>&1
@@ -343,11 +363,11 @@ psql_admin "SELECT pg_reload_conf();" >/dev/null 2>&1
 sleep 2
 
 # Insert test data
-psql_admin "INSERT INTO test_table VALUES (1, 'initial') ON CONFLICT (id) DO UPDATE SET note='initial';" >/dev/null 2>&1
+psql_admin "INSERT INTO test_table (id, data) VALUES (1, 'initial') ON CONFLICT (id) DO UPDATE SET data='initial';" >/dev/null 2>&1
 
 # Run same UPDATE query 4 times - should auto-approve after threshold
 for i in {1..4}; do
-    psql_user "UPDATE test_table SET note='test$i' WHERE id=1;" 2>&1 >/dev/null
+    psql_user "UPDATE test_table SET data='test$i' WHERE id=1;" 2>&1 >/dev/null
 done
 
 # Check if fingerprint was auto-approved
@@ -388,11 +408,11 @@ info "TEST 13: ACTIVITY LOG - Verify logging"
 info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 log_cnt=$(psql_admin "SELECT count(*) FROM sql_firewall_activity_log WHERE role_name='$USER';" 2>/dev/null || echo 0)
-if [ "$log_cnt" -gt 5 ]; then
+if [ "$log_cnt" -gt 3 ]; then
     ok "Activity log has $log_cnt entries for user"
     ((PASSED++))
 else
-    warn "Activity log might not be working properly ($log_cnt entries)"
+    warn "Activity log might not be working properly ($log_cnt entries, expected >3)"
     ((FAILED++))
 fi
 

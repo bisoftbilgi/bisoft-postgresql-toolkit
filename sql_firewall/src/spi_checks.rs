@@ -11,7 +11,7 @@ use crate::{
     fingerprints,
     guc::{self, FirewallMode},
     rate_state,
-    sql::{int4_arg, name_arg, spi_select_one, spi_update, text_arg},
+    sql::{bool_arg, int4_arg, name_arg, spi_select_one, spi_update, text_arg},
 };
 
 pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) -> Option<String> {
@@ -224,17 +224,17 @@ pub fn approval_requirement(
         }
     });
 
-    let record_pending = || {
+    let record_approval = |is_approved: bool| {
         // CRITICAL: Record approval request FIRST, before any potential rollback
         // Use separate autonomous-like transaction via INSERT
         let _ = Spi::run("SAVEPOINT approval_record");
         
         let insert_result = Spi::connect_mut(|client| {
-            let args = [name_arg(role), text_arg(command)];
+            let args = [name_arg(role), text_arg(command), bool_arg(is_approved)];
             spi_update(
                 client,
                 "INSERT INTO public.sql_firewall_command_approvals (role_name, command_type, is_approved) \
-                 VALUES ($1, $2, NULL) \
+                 VALUES ($1, $2, $3) \
                  ON CONFLICT (role_name, command_type) DO NOTHING",
                 &args,
             )
@@ -248,36 +248,44 @@ pub fn approval_requirement(
         }
         
         // Also log to activity log
+        let action_desc = if is_approved { "AUTO-APPROVED" } else { "PENDING APPROVAL" };
+        let reason = if is_approved {
+            "Command auto-approved in permissive mode"
+        } else {
+            "New command detected - awaiting admin approval"
+        };
         log_activity(
             ctx,
             command,
-            "PENDING APPROVAL",
-            Some("New command detected - awaiting admin approval"),
+            action_desc,
+            Some(reason),
             query,
         );
         
         // PostgreSQL WARNING (survives transaction abort)
-        pgrx::warning!(
-            "sql_firewall: PENDING APPROVAL REQUEST - role='{}' command='{}'", 
-            role, command
-        );
-        
-        // PostgreSQL LOG (also survives abort)
-        pgrx::log!(
-            "sql_firewall_rs: APPROVAL_NEEDED role='{}' command='{}' database='{}'",
-            role,
-            command,
-            ctx.database.as_deref().unwrap_or("unknown")
-        );
-        
-        // If syslog alerts enabled, use that too
-        if guc::syslog_alerts_enabled() {
-            use crate::alerts;
-            alerts::emit_block_alert(
-                ctx,
-                command,
-                "PENDING APPROVAL - awaiting admin action"
+        if !is_approved {
+            pgrx::warning!(
+                "sql_firewall: PENDING APPROVAL REQUEST - role='{}' command='{}'", 
+                role, command
             );
+        
+            // PostgreSQL LOG (also survives abort)
+            pgrx::log!(
+                "sql_firewall_rs: APPROVAL_NEEDED role='{}' command='{}' database='{}'",
+                role,
+                command,
+                ctx.database.as_deref().unwrap_or("unknown")
+            );
+        
+            // If syslog alerts enabled, use that too
+            if guc::syslog_alerts_enabled() {
+                use crate::alerts;
+                alerts::emit_block_alert(
+                    ctx,
+                    command,
+                    "PENDING APPROVAL - awaiting admin action"
+                );
+            }
         }
     };
 
@@ -339,7 +347,7 @@ pub fn approval_requirement(
                 }
             }
             FirewallMode::Permissive => {
-                record_pending();
+                record_approval(true);  // Auto-approve in permissive mode
                 pgrx::warning!(
                     "sql_firewall: role '{}' command '{}' auto-approved in permissive mode (no rule)",
                     role,
