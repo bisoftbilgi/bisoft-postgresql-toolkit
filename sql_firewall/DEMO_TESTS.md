@@ -1,6 +1,12 @@
-# SQL FIREWALL - KAPSAMLI DEMO REHBERİ
+# SQL FIREWALL - DEMO REHBERİ
 
-Bu rehber SQL Firewall'un öne çıkan özelliklerini PostgreSQL 16 üzerinde tek tek göstermeyi amaçlar. Senaryo boyunca yalnızca uzantının sağladığı tabloları (`public.sql_firewall_activity_log`, `public.sql_firewall_command_approvals`, `public.sql_firewall_query_fingerprints`, `public.sql_firewall_regex_rules`) ve GUC ayarlarını kullanıyoruz; IP/app/role bazlı politikalar doğrudan `sql_firewall.*` GUC'ları üzerinden tanımlanır.
+Bu rehber SQL Firewall'un özelliklerini PostgreSQL 16 üzerinde göstermeyi amaçlar.
+
+## ⚠️ ÖNEMLİ UYARILAR
+
+1.  **Transaction Block Hatası:** `ALTER SYSTEM` komutları transaction bloğu içinde çalıştırılamaz. `psql -c "komut1; komut2"` şeklinde zincirleme komut kullanırken veya DBeaver gibi araçlarda dikkatli olun. Komutları tek tek çalıştırın.
+2.  **Temizlik:** Her testten sonra, o testte açtığınız özellikleri kapatmayı (Cleanup adımlarını uygulamayı) unutmayın. Aksi takdirde sonraki testler başarısız olabilir.
+3.  **Reload:** `ALTER SYSTEM` ile yapılan değişikliklerin aktif olması için mutlaka `SELECT pg_reload_conf();` çalıştırılmalıdır.
 
 ## Hazırlık
 
@@ -11,7 +17,7 @@ DROP DATABASE IF EXISTS demo_db;
 CREATE DATABASE demo_db;
 \c demo_db
 
--- Extension yükle (shared_preload_libraries içinde olmalı)
+-- Extension yükle
 CREATE EXTENSION IF NOT EXISTS sql_firewall_rs;
 
 -- Test kullanıcıları
@@ -27,12 +33,7 @@ SELECT 'Demo ortamı hazır!' AS status;
 SQL
 ```
 
-> **Not:** Background worker **otomatik olarak her veritabanına** yazabilir. `sql_firewall.approval_worker_database` sadece worker'ın başlangıç bağlantısı içindir. Worker, engellenmiş komutları `dblink` kullanarak ilgili veritabanının kendi `sql_firewall_command_approvals` tablosuna yazar. Bu sayede tek worker tüm veritabanları için çalışır.
-> 
-> Worker durumunu kontrol etmek için:
-> ```sql
-> SELECT sql_firewall_approval_worker_status();  -- 'running', 'paused', 'stopped' vb.
-> ```
+> **Not:** Background worker `sql_firewall.approval_worker_database` ayarı ile belirtilen veritabanına bağlanır. Worker durumunu kontrol etmek için: `SELECT sql_firewall_approval_worker_status();`
 
 ---
 
@@ -42,16 +43,13 @@ SQL
 echo "=== TEST 1: ENFORCE MODE ==="
 psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.mode = 'enforce';
+SELECT pg_reload_conf();
 
 -- test_user1 için SELECT komutunu manuel onayla
 INSERT INTO public.sql_firewall_command_approvals(role_name, command_type, is_approved)
 VALUES ('test_user1', 'SELECT', true)
 ON CONFLICT (role_name, command_type) DO UPDATE SET is_approved = EXCLUDED.is_approved;
 SQL
-
-# ÖNEMLİ: Mode değişikliği için PostgreSQL restart gerekli!
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
-# veya: systemctl restart postgresql-16
 
 # Onaylı komut (SELECT) çalışır
 psql -U test_user1 -h localhost -d demo_db -c "SELECT 1 AS test;"
@@ -60,9 +58,9 @@ psql -U test_user1 -h localhost -d demo_db -c "SELECT 1 AS test;"
 psql -U test_user1 -h localhost -d demo_db -c "INSERT INTO demo_table(data) VALUES ('x');" 2>&1 | grep -i "error"
 ```
 
-**Beklenen Çıktı:**
-- `SELECT 1` → Başarılı (onaylı)
-- `INSERT` → ERROR: sql_firewall: No rule found for command 'INSERT'
+**Beklenen:**
+- `SELECT 1` → Başarılı
+- `INSERT` → ERROR: sql_firewall: No rule found
 
 ---
 
@@ -72,10 +70,8 @@ psql -U test_user1 -h localhost -d demo_db -c "INSERT INTO demo_table(data) VALU
 echo "=== TEST 2: LEARN MODE ==="
 psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.mode = 'learn';
+SELECT pg_reload_conf();
 SQL
-
-# ÖNEMLİ: Mode değişikliği için PostgreSQL restart gerekli!
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # test_user1 yeni bir UPDATE komutu çalıştırır → bloklanır ve pending'e düşer
 psql -U test_user1 -h localhost -d demo_db -c "UPDATE demo_table SET data = 'learn' WHERE id = 2;" 2>&1
@@ -90,11 +86,9 @@ LIMIT 3;
 SQL
 ```
 
-**Beklenen Çıktı:**
-- UPDATE komutu: ERROR ile pending'e düşer
+**Beklenen:**
+- UPDATE komutu: ERROR (pending)
 - Tabloda `is_approved = false` kaydı görünür
-
-**Arka plan işçisi:** `sql_firewall.approval_worker_database = 'demo_db'` ayarlıysa ve PostgreSQL restart edildiyse pending kayıtlar bu tabloya worker tarafından yazılır.
 
 ---
 
@@ -104,10 +98,8 @@ SQL
 echo "=== TEST 3: PERMISSIVE MODE ==="
 psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.mode = 'permissive';
+SELECT pg_reload_conf();
 SQL
-
-# ÖNEMLİ: Mode değişikliği için PostgreSQL restart gerekli!
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # DELETE komutu çalışır + warning verir + otomatik onaylanır
 psql -U test_user1 -h localhost -d demo_db -c "DELETE FROM demo_table WHERE id = 1;" 2>&1
@@ -127,9 +119,9 @@ WHERE role_name = 'test_user1' AND command_type = 'DELETE';
 SQL
 ```
 
-**Beklenen Çıktı:**
-- DELETE çalışır + WARNING: auto-approved in permissive mode
-- Activity log'da 3 kayıt (AUTO-APPROVED, ALLOWED PERMISSIVE)
+**Beklenen:**
+- DELETE çalışır + WARNING
+- Activity log'da kayıt oluşur
 - DELETE komutu `is_approved = true` olarak kaydedilir
 
 ---
@@ -142,19 +134,21 @@ psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.mode = 'enforce';
 ALTER SYSTEM SET sql_firewall.enable_keyword_scan = on;
 ALTER SYSTEM SET sql_firewall.blacklisted_keywords = 'drop,truncate';
+SELECT pg_reload_conf();
 SQL
 
-# ÖNEMLİ: Keyword blacklist için PostgreSQL restart gerekli!
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
-
-# DROP komutu bloklanır (regex rule sayesinde)
+# DROP komutu bloklanır
 psql -U test_user1 -h localhost -d demo_db -c "DROP TABLE demo_table;" 2>&1
 ```
 
-**Beklenen Çıktı:**
+**Beklenen:**
 - ERROR: sql_firewall: Query blocked by security regex pattern.
 
-**Not:** DROP komutu aslında `sql_firewall_regex_rules` tablosundaki `(DROP|TRUNCATE)` pattern'i ile bloklanır.
+**Cleanup:**
+```sql
+ALTER SYSTEM SET sql_firewall.enable_keyword_scan = off;
+SELECT pg_reload_conf();
+```
 
 ---
 
@@ -170,25 +164,26 @@ ON CONFLICT (pattern) DO NOTHING;
 
 -- Regex scanning'i aktif et
 ALTER SYSTEM SET sql_firewall.enable_regex_scan = on;
+SELECT pg_reload_conf();
 
--- SELECT komutunu onayla (regex testini yapabilmek için)
+-- SELECT komutunu onayla
 INSERT INTO public.sql_firewall_command_approvals(role_name, command_type, is_approved)
 VALUES ('test_user1', 'SELECT', true)
 ON CONFLICT (role_name, command_type) DO UPDATE SET is_approved = true;
-
--- Mevcut regex kurallarını göster
-SELECT pattern, description FROM public.sql_firewall_regex_rules;
 SQL
-
-# Regex scan zaten aktifse reload yeterli, değilse restart gerekli
-sudo -u postgres psql -c "SELECT pg_reload_conf();"
 
 # SQL injection denemesi - OR 1=1 pattern'i bloklanır
 psql -U test_user1 -h localhost -d demo_db -c "SELECT * FROM demo_table WHERE data = 'x' OR 1=1;" 2>&1
 ```
 
-**Beklenen Çıktı:**
+**Beklenen:**
 - ERROR: sql_firewall: Query blocked by security regex pattern.
+
+**Cleanup:**
+```sql
+ALTER SYSTEM SET sql_firewall.enable_regex_scan = off;
+SELECT pg_reload_conf();
+```
 
 ---
 
@@ -199,13 +194,8 @@ echo "=== TEST 6: IP BLOCKING ==="
 psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.enable_ip_blocking = on;
 ALTER SYSTEM SET sql_firewall.blocked_ips = '203.0.113.10,198.51.100.20,::1';
+SELECT pg_reload_conf();
 SQL
-
-# ÖNEMLİ: IP blocking için PostgreSQL restart gerekli!
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
-
-# Ayarları kontrol et
-sudo -u postgres psql -c "SHOW sql_firewall.blocked_ips;"
 
 # IPv6 localhost (::1) bloklandığı için hata alınır
 psql -U test_user1 -h localhost -d demo_db -c "SELECT 'test';" 2>&1
@@ -216,16 +206,15 @@ psql -U test_user1 -h 127.0.0.1 -d demo_db -c "SELECT 'IPv4 test';" 2>&1
 # 127.0.0.1'i de bloklayalım
 sudo -u postgres psql <<'SQL'
 ALTER SYSTEM SET sql_firewall.blocked_ips = '203.0.113.10,198.51.100.20,::1,127.0.0.1';
+SELECT pg_reload_conf();
 SQL
-
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # Şimdi IPv4 de bloklanır
 psql -U test_user1 -h 127.0.0.1 -d demo_db -c "SELECT 'blocked';" 2>&1
 ```
 
-**Beklenen Çıktı:**
-- ::1 bloklu: ERROR: Connection from blocked IP address '::1' is not allowed
+**Beklenen:**
+- ::1 bloklu: ERROR: Connection from blocked IP address
 - 127.0.0.1 ilk önce çalışır, sonra bloklanır
 
 **Test sonrası blokları temizle:**
@@ -233,8 +222,8 @@ psql -U test_user1 -h 127.0.0.1 -d demo_db -c "SELECT 'blocked';" 2>&1
 sudo -u postgres psql <<'SQL'
 ALTER SYSTEM SET sql_firewall.blocked_ips = '203.0.113.10,198.51.100.20';
 ALTER SYSTEM SET sql_firewall.enable_ip_blocking = off;
+SELECT pg_reload_conf();
 SQL
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 ```
 
 ---
@@ -246,10 +235,8 @@ echo "=== TEST 7: APPLICATION BLOCKING ==="
 psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.enable_application_blocking = on;
 ALTER SYSTEM SET sql_firewall.blocked_applications = 'hacktool,sqlmap';
+SELECT pg_reload_conf();
 SQL
-
-# ÖNEMLİ: Application blocking için PostgreSQL restart gerekli!
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # Normal psql çalışır
 PGAPPNAME=psql psql -U test_user1 -h localhost -d demo_db -c "SELECT 'normal app';" 2>&1
@@ -261,10 +248,16 @@ PGAPPNAME=hacktool psql -U test_user1 -h localhost -d demo_db -c "SELECT 'hacker
 PGAPPNAME=sqlmap psql -U test_user1 -h localhost -d demo_db -c "SELECT 'injection';" 2>&1
 ```
 
-**Beklenen Çıktı:**
+**Beklenen:**
 - psql: Çalışır
 - hacktool: ERROR: Connections from application 'hacktool' are not allowed
 - sqlmap: ERROR: Connections from application 'sqlmap' are not allowed
+
+**Cleanup:**
+```sql
+ALTER SYSTEM SET sql_firewall.enable_application_blocking = off;
+SELECT pg_reload_conf();
+```
 
 ---
 
@@ -276,10 +269,8 @@ psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.enable_rate_limiting = on;
 ALTER SYSTEM SET sql_firewall.rate_limit_count = 3;
 ALTER SYSTEM SET sql_firewall.rate_limit_seconds = 5;
+SELECT pg_reload_conf();
 SQL
-
-# ÖNEMLİ: Rate limiting için PostgreSQL restart gerekli!
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # 6 sorgu gönder - ilk 3'ü geçer, sonraki 3'ü bloklanır
 for i in {1..6}; do
@@ -289,9 +280,15 @@ for i in {1..6}; do
 done
 ```
 
-**Beklenen Çıktı:**
+**Beklenen:**
 - Query 1-3: Başarılı
-- Query 4-6: ERROR: Rate limit exceeded for role 'test_user1'
+- Query 4-6: ERROR: Rate limit exceeded
+
+**Cleanup:**
+```sql
+ALTER SYSTEM SET sql_firewall.enable_rate_limiting = off;
+SELECT pg_reload_conf();
+```
 
 ---
 
@@ -309,10 +306,8 @@ ALTER SYSTEM SET sql_firewall.enable_quiet_hours = on;
 -- Şu anki dakikayı quiet hours'a al (örnek: 13:24-13:26)
 ALTER SYSTEM SET sql_firewall.quiet_hours_start = '13:24';
 ALTER SYSTEM SET sql_firewall.quiet_hours_end = '13:26';
+SELECT pg_reload_conf();
 SQL
-
-# ÖNEMLİ: Quiet hours için PostgreSQL restart gerekli!
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # Quiet hours içinde sorgu çalıştır
 psql -U test_user1 -h localhost -d demo_db -c "SELECT now();" 2>&1
@@ -320,13 +315,13 @@ psql -U test_user1 -h localhost -d demo_db -c "SELECT now();" 2>&1
 # Test sonrası quiet hours'u kapat
 sudo -u postgres psql <<'SQL'
 ALTER SYSTEM SET sql_firewall.enable_quiet_hours = off;
+SELECT pg_reload_conf();
 SQL
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 ```
 
-**Beklenen Çıktı (quiet hours içindeyse):**
+**Beklenen (quiet hours içindeyse):**
 - WARNING: Blocked during quiet hours
-- ERROR: sql_firewall: Blocked during quiet hours (13:24 - 13:26)
+- ERROR: sql_firewall: Blocked during quiet hours
 
 **Not:** Quiet hours dışındaysanız start/end saatlerini şu anki dakikaya göre ayarlayın.
 
@@ -344,10 +339,8 @@ ALTER SYSTEM SET sql_firewall.role_ip_bindings = 'test_user2@127.0.0.1,test_user
 INSERT INTO public.sql_firewall_command_approvals(role_name, command_type, is_approved)
 VALUES ('test_user2', 'SELECT', true)
 ON CONFLICT (role_name, command_type) DO UPDATE SET is_approved = true;
+SELECT pg_reload_conf();
 SQL
-
-# ÖNEMLİ: Role-IP binding için PostgreSQL restart gerekli!
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # İzin verilen IP'den (localhost) bağlanır
 psql -U test_user2 -h localhost -d demo_db -c "SELECT 'allowed from localhost' AS result;" 2>&1
@@ -356,10 +349,16 @@ psql -U test_user2 -h localhost -d demo_db -c "SELECT 'allowed from localhost' A
 psql -U test_user2 -h 127.0.0.1 -d demo_db -c "SELECT 'allowed from 127.0.0.1' AS result;" 2>&1
 ```
 
-**Beklenen Çıktı:**
-- localhost (::1): Başarılı - "allowed from localhost"
-- 127.0.0.1: Başarılı - "allowed from 127.0.0.1"
-- Başka IP'den bağlanırsa: ERROR (test ortamında yapılamaz)
+**Beklenen:**
+- localhost (::1): Başarılı
+- 127.0.0.1: Başarılı
+- Başka IP'den bağlanırsa: ERROR
+
+**Cleanup:**
+```sql
+ALTER SYSTEM SET sql_firewall.enable_role_ip_binding = off;
+SELECT pg_reload_conf();
+```
 
 ---
 
@@ -383,14 +382,13 @@ SELECT 'Tüm komutlar başarılı - superuser bypass çalışıyor!' AS result;
 SQL
 ```
 
-**Beklenen Çıktı:**
-- Tüm komutlar (DROP, CREATE, INSERT, SELECT) başarıyla çalışır
-- Normal kullanıcılarda bloklanacak komutlar superuser için çalışır
+**Beklenen:**
+- Tüm komutlar başarıyla çalışır
 
 **Not:** Superuser bypass'i kapatmak için:
 ```sql
 ALTER SYSTEM SET sql_firewall.allow_superuser_auth_bypass = off;
--- Restart sonrası superuser da kurallara tabi olur
+SELECT pg_reload_conf();
 ```
 
 ---
@@ -400,6 +398,8 @@ ALTER SYSTEM SET sql_firewall.allow_superuser_auth_bypass = off;
 ```bash
 echo "=== TEST 12: BACKGROUND WORKER ==="
 # Worker'ın doğru DB'ye yazdığını doğrula
+# NOT: Yeni versiyonda worker varsayılan olarak 'postgres' DB'sinde çalışır ve dblink kullanır.
+# Bu ayarı değiştirmek zorunlu değildir, ancak test etmek isterseniz:
 psql -U postgres -h localhost <<'SQL'
 ALTER SYSTEM SET sql_firewall.approval_worker_database = 'demo_db';
 SQL
@@ -410,9 +410,8 @@ sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 # Learn mode'a al
 sudo -u postgres psql -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.mode = 'learn';
+SELECT pg_reload_conf();
 SQL
-
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # Onaysız komut çalıştır - worker tabloya yazmalı
 psql -U test_user1 -h localhost -d demo_db -c "CREATE TABLE worker_test(id int);" 2>&1
@@ -430,7 +429,7 @@ SQL
 sudo tail -20 /var/lib/pgsql/16/data/log/postgresql-*.log | grep -i "sql_firewall.*worker\|approval"
 ```
 
-**Beklenen Çıktı:**
+**Beklenen:**
 - CREATE komutu bloklanır ve pending'e düşer
 - `sql_firewall_command_approvals` tablosunda `is_approved = false` kaydı görünür
 - PostgreSQL log'unda worker ile ilgili mesajlar görünür
@@ -452,13 +451,9 @@ ALTER SYSTEM SET sql_firewall.enable_role_ip_binding = off;
 ALTER SYSTEM SET sql_firewall.blocked_ips = '';
 ALTER SYSTEM SET sql_firewall.blocked_applications = '';
 ALTER SYSTEM SET sql_firewall.role_ip_bindings = '';
-SQL
+SELECT pg_reload_conf();
 
-# Restart
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
-
-# Test verilerini temizle
-psql -U postgres -h localhost <<'SQL'
+-- Test verilerini temizle
 \c demo_db
 TRUNCATE public.sql_firewall_activity_log;
 TRUNCATE public.sql_firewall_command_approvals CASCADE;
@@ -473,8 +468,6 @@ DROP ROLE IF EXISTS test_user2;
 SELECT sql_firewall_pause_approval_worker();
 \c postgres
 DROP DATABASE IF EXISTS demo_db;
--- demo_db yeniden oluşturulacaksa, CREATE DATABASE + CREATE EXTENSION sonrasında:
--- SELECT sql_firewall_resume_approval_worker();
 SQL
 ```
 
@@ -484,31 +477,28 @@ SQL
 
 | # | Özellik | Restart Gerekli? | Test Durumu | Açıklama |
 |---|---------|------------------|-------------|----------|
-| 1 | Enforce Mode | ✅ Evet | ✅ Başarılı | Komut bazlı approval zorunlu |
-| 2 | Learn Mode | ✅ Evet | ✅ Başarılı | Pending queue + worker yazımı |
-| 3 | Permissive Mode | ✅ Evet | ✅ Başarılı | İzin ver + activity log |
-| 4 | Keyword Scan | ✅ Evet | ✅ Başarılı | Regex rules ile DROP/TRUNCATE bloklanır |
-| 5 | Regex Rules | ⚠️ İlk kez evet | ✅ Başarılı | SQL injection (OR 1=1) bloklanır |
-| 6 | IP Blocking | ✅ Evet | ✅ Başarılı | IPv4/IPv6 bloklaması çalışır |
-| 7 | Application Blocking | ✅ Evet | ✅ Başarılı | hacktool, sqlmap bloklanır |
-| 8 | Rate Limiting | ✅ Evet | ✅ Başarılı | İlk N sorgu geçer, sonrakiler bloklanır |
-| 9 | Quiet Hours | ✅ Evet | ✅ Başarılı | Zaman bazlı blok çalışır |
-| 10 | Role-IP Binding | ✅ Evet | ✅ Başarılı | Belirtilen IP'lerden bağlantı izni |
+| 1 | Enforce Mode | ❌ Hayır | ✅ Başarılı | Komut bazlı approval zorunlu |
+| 2 | Learn Mode | ❌ Hayır | ✅ Başarılı | Pending queue + worker yazımı |
+| 3 | Permissive Mode | ❌ Hayır | ✅ Başarılı | İzin ver + activity log |
+| 4 | Keyword Scan | ❌ Hayır | ✅ Başarılı | Regex rules ile DROP/TRUNCATE bloklanır |
+| 5 | Regex Rules | ❌ Hayır | ✅ Başarılı | SQL injection (OR 1=1) bloklanır |
+| 6 | IP Blocking | ❌ Hayır | ✅ Başarılı | IPv4/IPv6 bloklaması çalışır |
+| 7 | Application Blocking | ❌ Hayır | ✅ Başarılı | hacktool, sqlmap bloklanır |
+| 8 | Rate Limiting | ❌ Hayır | ✅ Başarılı | İlk N sorgu geçer, sonrakiler bloklanır |
+| 9 | Quiet Hours | ❌ Hayır | ✅ Başarılı | Zaman bazlı blok çalışır |
+| 10 | Role-IP Binding | ❌ Hayır | ✅ Başarılı | Belirtilen IP'lerden bağlantı izni |
 | 11 | Superuser Bypass | ❌ Hayır | ✅ Başarılı | Superuser tüm kuralları bypass eder |
 | 12 | Background Worker | ✅ Evet | ✅ Başarılı | Pending approvals tabloya yazılır |
 
 **ÖNEMLİ NOTLAR:**
 
-1. **Mode Değişiklikleri (enforce/learn/permissive):** Her zaman PostgreSQL restart gerektirir
-2. **GUC Parametreleri:** Çoğu GUC parametresi (IP blocking, app blocking, rate limiting, vb.) restart gerektirir
-3. **Regex Rules:** Tabloya ekleme restart gerektirmez, ancak `enable_regex_scan` ilk kez açılırken restart gerekir
-4. **Reload vs Restart:** `SELECT pg_reload_conf()` sadece bazı parametreler için yeterlidir, çoğu özellik restart ister
+1. **Reload vs Restart:** Çoğu GUC parametresi için `SELECT pg_reload_conf()` yeterlidir.
+2. **Background Worker:** `sql_firewall.approval_worker_database` değişikliği restart gerektirir.
+3. **Regex Rules:** Tabloya ekleme anında etki eder.
 
-**Restart Komutu:**
-```bash
-sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
-# veya
-systemctl restart postgresql-16
+**Reload Komutu:**
+```sql
+SELECT pg_reload_conf();
 ```
 
 **Test Sonucu: 12/12 Özellik Başarıyla Test Edildi!** 🎉
