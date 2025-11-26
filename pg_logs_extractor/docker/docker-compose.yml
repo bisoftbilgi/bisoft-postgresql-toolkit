@@ -1,11 +1,9 @@
-version: '3.8'
-
 services:
   logstash:
     build: ./docker
     container_name: logstash
     environment:
-      PG_HOST: host.docker.internal
+      PG_HOST: 
       PG_PORT: 
       PG_DB:
       PG_USER:
