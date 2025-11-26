@@ -6,7 +6,7 @@ Bu rehber SQL Firewall'un öne çıkan özelliklerini PostgreSQL 16 üzerinde te
 
 ```bash
 # Demo ortamını hazırlayın
-PGPASSWORD=caghan psql -U postgres -h localhost <<'SQL'
+psql -U postgres -h localhost <<'SQL'
 DROP DATABASE IF EXISTS demo_db;
 CREATE DATABASE demo_db;
 \c demo_db
@@ -42,7 +42,7 @@ SQL
 
 ```bash
 echo "=== TEST 1: ENFORCE MODE ==="
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.mode = 'enforce';
 
 -- test_user1 için SELECT komutunu manuel onayla
@@ -56,10 +56,10 @@ sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 # veya: systemctl restart postgresql-16
 
 # Onaylı komut (SELECT) çalışır
-PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "SELECT 1 AS test;"
+psql -U test_user1 -h localhost -d demo_db -c "SELECT 1 AS test;"
 
 # INSERT komutu onaysız olduğu için bloklanır
-PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "INSERT INTO demo_table(data) VALUES ('x');" 2>&1 | grep -i "error"
+psql -U test_user1 -h localhost -d demo_db -c "INSERT INTO demo_table(data) VALUES ('x');" 2>&1 | grep -i "error"
 ```
 
 **Beklenen Çıktı:**
@@ -72,7 +72,7 @@ PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "INSERT INTO de
 
 ```bash
 echo "=== TEST 2: LEARN MODE ==="
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.mode = 'learn';
 SQL
 
@@ -80,10 +80,10 @@ SQL
 sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # test_user1 yeni bir UPDATE komutu çalıştırır → bloklanır ve pending'e düşer
-PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "UPDATE demo_table SET data = 'learn' WHERE id = 2;" 2>&1
+psql -U test_user1 -h localhost -d demo_db -c "UPDATE demo_table SET data = 'learn' WHERE id = 2;" 2>&1
 
 # Pending kaydı tabloya yazıldı mı?
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 SELECT role_name, command_type, is_approved, created_at
 FROM public.sql_firewall_command_approvals
 WHERE role_name = 'test_user1'
@@ -104,7 +104,7 @@ SQL
 
 ```bash
 echo "=== TEST 3: PERMISSIVE MODE ==="
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.mode = 'permissive';
 SQL
 
@@ -112,17 +112,17 @@ SQL
 sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # DELETE komutu çalışır + warning verir + otomatik onaylanır
-PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "DELETE FROM demo_table WHERE id = 1;" 2>&1
+psql -U test_user1 -h localhost -d demo_db -c "DELETE FROM demo_table WHERE id = 1;" 2>&1
 
 # Activity log'da kayıt arayın
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 SELECT role_name, command_type, action, reason, log_time
 FROM public.sql_firewall_activity_log
 ORDER BY log_time DESC LIMIT 5;
 SQL
 
 # Komutun otomatik onaylandığını kontrol et
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 SELECT role_name, command_type, is_approved 
 FROM public.sql_firewall_command_approvals 
 WHERE role_name = 'test_user1' AND command_type = 'DELETE';
@@ -140,7 +140,7 @@ SQL
 
 ```bash
 echo "=== TEST 4: KEYWORD BLACKLIST ==="
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.mode = 'enforce';
 ALTER SYSTEM SET sql_firewall.enable_keyword_scan = on;
 ALTER SYSTEM SET sql_firewall.blacklisted_keywords = 'drop,truncate';
@@ -150,7 +150,7 @@ SQL
 sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # DROP komutu bloklanır (regex rule sayesinde)
-PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "DROP TABLE demo_table;" 2>&1
+psql -U test_user1 -h localhost -d demo_db -c "DROP TABLE demo_table;" 2>&1
 ```
 
 **Beklenen Çıktı:**
@@ -164,7 +164,7 @@ PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "DROP TABLE dem
 
 ```bash
 echo "=== TEST 5: REGEX RULES ==="
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 -- SQL injection regex pattern ekle
 INSERT INTO public.sql_firewall_regex_rules(pattern, description)
 VALUES ('(?i)or\s+1\s*=\s*1', 'Block tautology injection')
@@ -186,7 +186,7 @@ SQL
 sudo -u postgres psql -c "SELECT pg_reload_conf();"
 
 # SQL injection denemesi - OR 1=1 pattern'i bloklanır
-PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "SELECT * FROM demo_table WHERE data = 'x' OR 1=1;" 2>&1
+psql -U test_user1 -h localhost -d demo_db -c "SELECT * FROM demo_table WHERE data = 'x' OR 1=1;" 2>&1
 ```
 
 **Beklenen Çıktı:**
@@ -198,7 +198,7 @@ PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "SELECT * FROM 
 
 ```bash
 echo "=== TEST 6: IP BLOCKING ==="
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.enable_ip_blocking = on;
 ALTER SYSTEM SET sql_firewall.blocked_ips = '203.0.113.10,198.51.100.20,::1';
 SQL
@@ -210,10 +210,10 @@ sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 sudo -u postgres psql -c "SHOW sql_firewall.blocked_ips;"
 
 # IPv6 localhost (::1) bloklandığı için hata alınır
-PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "SELECT 'test';" 2>&1
+psql -U test_user1 -h localhost -d demo_db -c "SELECT 'test';" 2>&1
 
 # IPv4 (127.0.0.1) bloklu değil, çalışır
-PGPASSWORD=test123 psql -U test_user1 -h 127.0.0.1 -d demo_db -c "SELECT 'IPv4 test';" 2>&1
+psql -U test_user1 -h 127.0.0.1 -d demo_db -c "SELECT 'IPv4 test';" 2>&1
 
 # 127.0.0.1'i de bloklayalım
 sudo -u postgres psql <<'SQL'
@@ -223,7 +223,7 @@ SQL
 sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # Şimdi IPv4 de bloklanır
-PGPASSWORD=test123 psql -U test_user1 -h 127.0.0.1 -d demo_db -c "SELECT 'blocked';" 2>&1
+psql -U test_user1 -h 127.0.0.1 -d demo_db -c "SELECT 'blocked';" 2>&1
 ```
 
 **Beklenen Çıktı:**
@@ -245,7 +245,7 @@ sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 ```bash
 echo "=== TEST 7: APPLICATION BLOCKING ==="
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.enable_application_blocking = on;
 ALTER SYSTEM SET sql_firewall.blocked_applications = 'hacktool,sqlmap';
 SQL
@@ -254,13 +254,13 @@ SQL
 sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # Normal psql çalışır
-PGAPPNAME=psql PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "SELECT 'normal app';" 2>&1
+PGAPPNAME=psql psql -U test_user1 -h localhost -d demo_db -c "SELECT 'normal app';" 2>&1
 
 # hacktool bloklanır
-PGAPPNAME=hacktool PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "SELECT 'hacker';" 2>&1
+PGAPPNAME=hacktool psql -U test_user1 -h localhost -d demo_db -c "SELECT 'hacker';" 2>&1
 
 # sqlmap bloklanır
-PGAPPNAME=sqlmap PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "SELECT 'injection';" 2>&1
+PGAPPNAME=sqlmap psql -U test_user1 -h localhost -d demo_db -c "SELECT 'injection';" 2>&1
 ```
 
 **Beklenen Çıktı:**
@@ -274,7 +274,7 @@ PGAPPNAME=sqlmap PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -
 
 ```bash
 echo "=== TEST 8: RATE LIMITING ==="
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.enable_rate_limiting = on;
 ALTER SYSTEM SET sql_firewall.rate_limit_count = 3;
 ALTER SYSTEM SET sql_firewall.rate_limit_seconds = 5;
@@ -286,7 +286,7 @@ sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 # 6 sorgu gönder - ilk 3'ü geçer, sonraki 3'ü bloklanır
 for i in {1..6}; do
   echo "Query $i:"
-  PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "SELECT $i AS query_num;" 2>&1 | head -2
+  psql -U test_user1 -h localhost -d demo_db -c "SELECT $i AS query_num;" 2>&1 | head -2
   sleep 0.5
 done
 ```
@@ -306,7 +306,7 @@ echo "=== TEST 9: QUIET HOURS ==="
 CURRENT_TIME=$(sudo -u postgres psql -t -c "SELECT to_char(now(), 'HH24:MI');")
 echo "Şu anki saat: $CURRENT_TIME"
 
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.enable_quiet_hours = on;
 -- Şu anki dakikayı quiet hours'a al (örnek: 13:24-13:26)
 ALTER SYSTEM SET sql_firewall.quiet_hours_start = '13:24';
@@ -317,7 +317,7 @@ SQL
 sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # Quiet hours içinde sorgu çalıştır
-PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "SELECT now();" 2>&1
+psql -U test_user1 -h localhost -d demo_db -c "SELECT now();" 2>&1
 
 # Test sonrası quiet hours'u kapat
 sudo -u postgres psql <<'SQL'
@@ -338,7 +338,7 @@ sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 ```bash
 echo "=== TEST 10: ROLE-IP BINDING ==="
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 ALTER SYSTEM SET sql_firewall.enable_role_ip_binding = on;
 ALTER SYSTEM SET sql_firewall.role_ip_bindings = 'test_user2@127.0.0.1,test_user2@::1';
 
@@ -352,10 +352,10 @@ SQL
 sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # İzin verilen IP'den (localhost) bağlanır
-PGPASSWORD=test456 psql -U test_user2 -h localhost -d demo_db -c "SELECT 'allowed from localhost' AS result;" 2>&1
+psql -U test_user2 -h localhost -d demo_db -c "SELECT 'allowed from localhost' AS result;" 2>&1
 
 # İzin verilen başka IP (IPv4)
-PGPASSWORD=test456 psql -U test_user2 -h 127.0.0.1 -d demo_db -c "SELECT 'allowed from 127.0.0.1' AS result;" 2>&1
+psql -U test_user2 -h 127.0.0.1 -d demo_db -c "SELECT 'allowed from 127.0.0.1' AS result;" 2>&1
 ```
 
 **Beklenen Çıktı:**
@@ -369,7 +369,7 @@ PGPASSWORD=test456 psql -U test_user2 -h 127.0.0.1 -d demo_db -c "SELECT 'allowe
 
 ```bash
 echo "=== TEST 11: SUPERUSER BYPASS ==="
-PGPASSWORD=caghan psql -U postgres -h localhost -d demo_db <<'SQL'
+psql -U postgres -h localhost -d demo_db <<'SQL'
 -- Superuser bypass zaten açık (default on)
 SHOW sql_firewall.allow_superuser_auth_bypass;
 
@@ -402,7 +402,7 @@ ALTER SYSTEM SET sql_firewall.allow_superuser_auth_bypass = off;
 ```bash
 echo "=== TEST 12: BACKGROUND WORKER ==="
 # Worker'ın doğru DB'ye yazdığını doğrula
-PGPASSWORD=caghan psql -U postgres -h localhost <<'SQL'
+psql -U postgres -h localhost <<'SQL'
 ALTER SYSTEM SET sql_firewall.approval_worker_database = 'demo_db';
 SQL
 
@@ -417,7 +417,7 @@ SQL
 sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # Onaysız komut çalıştır - worker tabloya yazmalı
-PGPASSWORD=test123 psql -U test_user1 -h localhost -d demo_db -c "CREATE TABLE worker_test(id int);" 2>&1
+psql -U test_user1 -h localhost -d demo_db -c "CREATE TABLE worker_test(id int);" 2>&1
 
 # Worker'ın yazdığı kaydı kontrol et
 sudo -u postgres psql -d demo_db <<'SQL'
@@ -443,7 +443,7 @@ sudo tail -20 /var/lib/pgsql/16/data/log/postgresql-*.log | grep -i "sql_firewal
 
 ```bash
 echo "=== CLEANUP ==="
-PGPASSWORD=caghan psql -U postgres -h localhost <<'SQL'
+psql -U postgres -h localhost <<'SQL'
 -- Tüm firewall ayarlarını sıfırla
 ALTER SYSTEM SET sql_firewall.mode = 'enforce';
 ALTER SYSTEM SET sql_firewall.enable_ip_blocking = off;
@@ -460,7 +460,7 @@ SQL
 sudo -u postgres pg_ctl restart -D /var/lib/pgsql/16/data -m fast
 
 # Test verilerini temizle
-PGPASSWORD=caghan psql -U postgres -h localhost <<'SQL'
+psql -U postgres -h localhost <<'SQL'
 \c demo_db
 TRUNCATE public.sql_firewall_activity_log;
 TRUNCATE public.sql_firewall_command_approvals CASCADE;
