@@ -190,11 +190,48 @@ fn encode_username(username: &str) -> [u8; LOCK_USERNAME_BYTES] {
     buf
 }
 
+/// Check database for lockout status when cache miss occurs
+fn check_lockout_from_db(username: &str) -> Option<i64> {
+    use pgrx::spi::Spi;
+    use crate::sql::text_arg;
+    
+    // Check if we can connect to database
+    let my_db_id = unsafe { std::ptr::addr_of!(pg_sys::MyDatabaseId).read() };
+    if my_db_id == pg_sys::InvalidOid {
+        return None;
+    }
+    
+    let result = Spi::connect(|client| -> pgrx::spi::Result<Option<i64>> {
+        let args = [text_arg(username)];
+        let table = client.select(
+            "SELECT GREATEST(
+                COALESCE(ROUND(EXTRACT(EPOCH FROM (lockout_until - now())))::bigint, 0),
+                0
+             ) as remaining_seconds
+             FROM password_profile.login_attempts
+             WHERE username = $1 AND fail_count >= 3",
+            Some(1),
+            &args,
+        )?;
+        
+        Ok(table.first().get_one::<i64>()?)
+    });
+    
+    match result {
+        Ok(Some(secs)) if secs > 0 => Some(secs),
+        _ => None,
+    }
+}
+
 unsafe extern "C" fn client_auth_hook(port: *mut pg_sys::Port, status: c_int) {
     let username_ptr = password_profile_port_username(port);
     if !username_ptr.is_null() {
         if let Ok(username_str) = CStr::from_ptr(username_ptr).to_str() {
-            if let Some(seconds) = unsafe { lock_cache::remaining_seconds(username_str) } {
+            // First check cache, if not found then check database
+            let remaining_secs = unsafe { lock_cache::remaining_seconds(username_str) }
+                .or_else(|| check_lockout_from_db(username_str));
+            
+            if let Some(seconds) = remaining_secs {
                 if seconds > 0 {
                     // SECURITY: Do not log usernames
                     add_timing_jitter();

@@ -97,7 +97,7 @@ void password_profile_raise_lockout_error(const char *username, int remaining_se
     /* Use %s with quote_identifier-like safety (ereport escapes automatically) */
     ereport(FATAL,
             (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-             errmsg("Account locked! Too many failed login attempts."),
-             errdetail("User \"%s\" must wait %d minute(s) and %d second(s) before trying again.", 
-                       safe_username, minutes, seconds)));
+             errmsg("Account locked! Please wait %d minute(s) and %d second(s). Too many failed login attempts.", 
+                    minutes, seconds),
+             errdetail("User \"%s\" attempted login while locked.", safe_username)));
 }
