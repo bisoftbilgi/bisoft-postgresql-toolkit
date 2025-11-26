@@ -10,7 +10,6 @@
 
 use crate::guc;
 use crate::pending_approvals;
-use crate::sql::text_arg;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
 use pgrx::prelude::*;

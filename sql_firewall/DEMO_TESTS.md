@@ -8,6 +8,13 @@ Bu rehber SQL Firewall'un özelliklerini PostgreSQL 16 üzerinde göstermeyi ama
 2.  **Temizlik:** Her testten sonra, o testte açtığınız özellikleri kapatmayı (Cleanup adımlarını uygulamayı) unutmayın. Aksi takdirde sonraki testler başarısız olabilir.
 3.  **Reload:** `ALTER SYSTEM` ile yapılan değişikliklerin aktif olması için mutlaka `SELECT pg_reload_conf();` çalıştırılmalıdır.
 
+## 📖 Nasıl Kullanılır?
+
+1.  **Terminal Açın:** Bu testleri PostgreSQL sunucusunun çalıştığı makinede bir terminal (bash) üzerinden çalıştırın.
+2.  **Kopyala-Yapıştır:** Kod bloklarını sırasıyla kopyalayıp terminale yapıştırın.
+3.  **Hataları Bekleyin:** Firewall engelleme testlerinde **"ERROR: SQL Firewall violation"** hatası almanız beklenir. Bu, korumanın çalıştığını gösterir.
+4.  **Sırayla Gidin:** Testler birbirine bağımlı olabilir, atlamadan ilerleyin.
+
 ## Hazırlık
 
 ```bash

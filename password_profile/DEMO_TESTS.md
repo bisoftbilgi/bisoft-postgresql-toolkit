@@ -9,6 +9,13 @@ Bu rehber Password Profile eklentisinin özelliklerini PostgreSQL 16 üzerinde g
 3.  **Reload:** GUC değişikliklerinden sonra `SELECT pg_reload_conf();` çalıştırılmalıdır.
 4.  **Temizlik:** Test bitiminde `CLEANUP` adımını uygulayarak sistemi temiz bırakın.
 
+## 📖 Nasıl Kullanılır?
+
+1.  **Terminal Açın:** Bu testleri PostgreSQL sunucusunun çalıştığı makinede bir terminal (bash) üzerinden çalıştırın.
+2.  **Kopyala-Yapıştır:** Kod bloklarını sırasıyla kopyalayıp terminale yapıştırın.
+3.  **Hataları Bekleyin:** Bu bir güvenlik eklentisi olduğu için, testlerin çoğu **"ERROR"** veya **"FATAL"** mesajı üretmelidir. Örneğin "Password too short" veya "Account locked" gibi hatalar, korumanın çalıştığını gösterir.
+4.  **Sırayla Gidin:** Testler birbirine bağımlı olabilir, atlamadan ilerleyin.
+
 ## Hazırlık
 
 ```bash
