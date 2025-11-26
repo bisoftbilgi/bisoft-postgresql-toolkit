@@ -22,7 +22,7 @@ This folder contains the Docker configuration required to run the PostgreSQL Log
 ### Before starting, edit the environment variables based on your system:
 ```bash
 environment:
-  PG_HOST: host.docker.internal     # Host machine
+  PG_HOST:
   PG_PORT: 
   PG_DB: 
   PG_USER: 
