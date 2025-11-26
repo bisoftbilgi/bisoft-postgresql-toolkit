@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 
 GRANT INSERT, SELECT ON connection_logs, audit_logs TO $PG_USER;
 GRANT USAGE, SELECT ON SEQUENCE audit_logs_id_seq TO $PG_USER;
+CREATE EXTENSION IF NOT EXISTS pgaudit;
 EOF
 echo "✅ Tables ready."
 
