@@ -27,16 +27,12 @@ SELECT 'Demo ortamı hazır!' AS status;
 SQL
 ```
 
-> Not: Aşağıdaki `ALTER SYSTEM` komutları PostgreSQL yeniden yüklemeyi gerektirir. İlk adımda `sql_firewall.approval_worker_database` değerini demo veritabanına (`demo_db`) ayarlayıp PostgreSQL'i yeniden başlatmanız önerilir; böylece Learn Mode testlerine geldiğinizde background worker'ın pending approval kayıtlarını doğru yere yazdığını baştan doğrulamış olursunuz.
+> **Not:** Background worker **otomatik olarak her veritabanına** yazabilir. `sql_firewall.approval_worker_database` sadece worker'ın başlangıç bağlantısı içindir. Worker, engellenmiş komutları `dblink` kullanarak ilgili veritabanının kendi `sql_firewall_command_approvals` tablosuna yazar. Bu sayede tek worker tüm veritabanları için çalışır.
 > 
+> Worker durumunu kontrol etmek için:
 > ```sql
-> ALTER SYSTEM SET sql_firewall.approval_worker_database = 'demo_db';
-> -- Bu GUC Postmaster seviyesinde, bu yüzden ALTER sonrası PostgreSQL'i tamamen yeniden başlatın.
+> SELECT sql_firewall_approval_worker_status();  -- 'running', 'paused', 'stopped' vb.
 > ```
-> 
-> Diğer Postmaster GUC'lar da tam restart ister, kalan ayarlar `SELECT pg_reload_conf();` ile etkinleşir.
->
-> **Worker bağlantısı:** `demo_db` gibi worker'ın bağlı olduğu veritabanını `DROP DATABASE` ile temizlemeden önce `SELECT sql_firewall_pause_approval_worker();` çalıştırıp bağlantıyı bırakın. Veritabanını yeniden oluşturduktan sonra `SELECT sql_firewall_resume_approval_worker();` ile worker'ı tekrar devreye alın. Bu fonksiyonları uzantının kurulu olduğu herhangi bir veritabanında çağırabilirsiniz.
 
 ---
 

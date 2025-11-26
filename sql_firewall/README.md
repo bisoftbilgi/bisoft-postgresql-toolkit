@@ -98,25 +98,26 @@ All knobs live under `sql_firewall.*` and may be set via `ALTER SYSTEM`, `postgr
 | **Alerts** | `sql_firewall.enable_alert_notifications` | `off` | Emit NOTIFY events for blocks. |
 | | `sql_firewall.alert_channel` | `sql_firewall_alerts` | Channel name for LISTEN/NOTIFY. |
 | | `sql_firewall.syslog_alerts` | `off` | Mirror alerts to syslog for SIEM. |
-| **Background Worker** | `sql_firewall.approval_worker_database` | `postgres` | Database for background worker to connect to for recording pending approvals. Requires PostgreSQL restart to change. |
+| **Background Worker** | `sql_firewall.approval_worker_database` | `postgres` | Default database for background worker. Worker uses **dblink** to write approvals to the actual database where commands were blocked, supporting multi-database environments with a single worker. Requires PostgreSQL restart to change. |
 | **Retention** | `sql_firewall.activity_log_retention_days` | `30` | Age cutoff for log pruning. |
 | | `sql_firewall.activity_log_max_rows` | `1000000` | Row count target before pruning. |
 
 Activity logging itself is always enabled outside quiet hours; quiet-hour suppression avoids SPI recursion.
 
-**Note:** The background approval worker requires the database name to be set in `postgresql.conf` before PostgreSQL starts. This is a `Postmaster` context GUC that cannot be changed with `ALTER SYSTEM` alone.
+**Note:** The background approval worker supports **multi-database environments**. When a command is blocked in any database, the worker automatically writes the approval record to that specific database using PostgreSQL's `dblink` extension. The `approval_worker_database` setting is only used as the worker's initial connection point.
 
 ### Approval worker maintenance
 - `SELECT sql_firewall_pause_approval_worker();` pauses the background worker without requiring a postmaster restart. The worker disconnects from its database and remains idle.
 - `SELECT sql_firewall_resume_approval_worker();` reconnects the worker and resumes processing pending approvals.
-- Always pause the worker before dropping the database defined in `sql_firewall.approval_worker_database`. Without a pause the worker holds an open connection and PostgreSQL refuses to drop that database.
+- `SELECT sql_firewall_approval_worker_status();` returns current worker state: `stopped`, `starting`, `paused`, `running`, or `stopping`.
+- The worker uses `dblink` for cross-database writes, so ensure the `dblink` extension is available (it's included in PostgreSQL contrib).
 
 ---
 ## 6. Operational Workflow
 
 ### 6.1 Learn → Approve → Enforce
-1. **Learn** – blocks unapproved commands and queues them via background worker for admin review. Admin must explicitly approve via `sql_firewall_command_approvals`.
-2. **Review** – admins query activity log and approval tables, verify legitimacy, and set `is_approved=true`.
+1. **Learn** – blocks unapproved commands and queues them via background worker for admin review. Worker automatically writes to the correct database using dblink. Admin must explicitly approve via `sql_firewall_command_approvals`.
+2. **Review** – admins query activity log and approval tables in each database, verify legitimacy, and set `is_approved=true`.
 3. **Enforce** – unknown or unapproved commands are blocked with `ERRCODE_INSUFFICIENT_PRIVILEGE`. `permissive` mode is available for staging: it logs violations without blocking.
 
 ### 6.2 Fingerprint Pipeline

@@ -80,38 +80,42 @@ pub unsafe extern "C" fn approval_worker_main(_arg: pg_sys::Datum) {
                     db
                 );
 
-                // Connect to the specific database and run INSERT in its own transaction
-                // This allows multi-database support without multiple workers
+                // Use dblink for cross-database INSERT
                 let result = BackgroundWorker::transaction(|| {
-                    // Worker connects to default DB, need to use dblink or reconnect
-                    // For now, log which DB it should go to - admin can manually handle
-                    // TODO: Implement dynamic database connection switching
-                    pgrx::log!(
-                        "sql_firewall: worker recording to current database (intended: {})",
-                        db
-                    );
-
-                    Spi::run_with_args(
-                        "INSERT INTO public.sql_firewall_command_approvals 
-                         (role_name, command_type, is_approved) 
-                         VALUES ($1, $2, false) 
+                    // Ensure dblink extension exists (one-time setup)
+                    let _ = Spi::run("CREATE EXTENSION IF NOT EXISTS dblink");
+                    
+                    // Build INSERT command
+                    let insert_sql = format!(
+                        "INSERT INTO public.sql_firewall_command_approvals \
+                         (role_name, command_type, is_approved) \
+                         VALUES ('{}', '{}', false) \
                          ON CONFLICT (role_name, command_type) DO NOTHING",
-                        &[text_arg(&role), text_arg(&cmd)],
-                    )?;
-
+                        role.replace("'", "''"),  // Escape single quotes
+                        cmd.replace("'", "''")
+                    );
+                    
+                    // Execute via dblink
+                    let dblink_query = format!(
+                        "SELECT dblink_exec('dbname={}', $${}$$)",
+                        db.replace("'", "''"),
+                        insert_sql
+                    );
+                    
+                    Spi::run(&dblink_query)?;
+                    
                     Ok::<(), spi::Error>(())
                 });
 
                 if let Err(e) = result {
                     pgrx::warning!(
-                        "sql_firewall: worker failed to record approval for role={}, command={}: {:?}",
-                        role, cmd, e
+                        "sql_firewall: worker failed to record approval for role={}, command={}, db={}: {:?}",
+                        role, cmd, db, e
                     );
                 } else {
                     pgrx::log!(
-                        "sql_firewall: recorded pending approval: role={}, command={}",
-                        role,
-                        cmd
+                        "sql_firewall: recorded approval to database '{}': role={}, command={}",
+                        db, role, cmd
                     );
                 }
             } else {
