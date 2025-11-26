@@ -20,6 +20,7 @@ use crate::sql::{int4_arg, spi_select_one, spi_update, text_arg};
 pub use worker::auth_event_consumer_main;
 
 ::pgrx::pg_module_magic!();
+pgrx::extension_sql_file!("../sql/password_profile_schema.sql");
 
 const LOCK_CACHE_SIZE: usize = 2048;
 const LOCK_USERNAME_BYTES: usize = 64;
