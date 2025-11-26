@@ -4,15 +4,15 @@
 
 ```bash
 # Demo database ve kullanıcılar oluştur
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres << 'SQL'
+sudo -u postgres psql << 'SQL'
 DROP DATABASE IF EXISTS password_demo_db;
 CREATE DATABASE password_demo_db;
 
 \c password_demo_db
 
--- Extension yükle
+-- Extension yükle (tablolar otomatik oluşur)
 CREATE EXTENSION IF NOT EXISTS password_profile;
-SELECT init_login_attempts_table();
+CREATE EXTENSION IF NOT EXISTS sql_firewall_rs;
 
 -- Test kullanıcıları
 CREATE ROLE alice WITH LOGIN PASSWORD 'SecurePass123!';
@@ -35,13 +35,13 @@ SQL
 echo "=== TEST 1: PASSWORD COMPLEXITY ==="
 
 # Çok kısa şifre (min_length=8)
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "CREATE ROLE short_pw WITH LOGIN PASSWORD '12345';" 2>&1 | grep -E "ERROR|WARNING"
+sudo -u postgres psql -d password_demo_db -c "CREATE ROLE short_pw WITH LOGIN PASSWORD '12345';" 2>&1 | grep -E "ERROR|WARNING"
 
 # Kullanıcı adı içeren şifre (prevent_username=on)
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "CREATE ROLE john WITH LOGIN PASSWORD 'john123';" 2>&1 | grep -E "ERROR|WARNING"
+sudo -u postgres psql -d password_demo_db -c "CREATE ROLE john WITH LOGIN PASSWORD 'john123';" 2>&1 | grep -E "ERROR|WARNING"
 
 # Geçerli şifre
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "CREATE ROLE charlie WITH LOGIN PASSWORD 'SecurePass2024!'; SELECT 'Charlie oluşturuldu!' as result;"
+sudo -u postgres psql -d password_demo_db -c "CREATE ROLE charlie WITH LOGIN PASSWORD 'SecurePass2024!'; SELECT 'Charlie oluşturuldu!' as result;"
 ```
 
 **Beklenen:**
@@ -69,7 +69,7 @@ PGPASSWORD=wrong psql -h 127.0.0.1 -U alice -d password_demo_db -c "SELECT 1;" 2
 sleep 2
 
 # Login attempts tablosunu kontrol et
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT username, fail_count, lockout_until FROM password_profile.login_attempts WHERE username='alice';"
+sudo -u postgres psql -d password_demo_db -c "SELECT username, fail_count, lockout_until FROM password_profile.login_attempts WHERE username='alice';"
 
 # 4. deneme (hesap kilitli olmalı)
 echo ""
@@ -90,10 +90,10 @@ PGPASSWORD='SecurePass123!' psql -h 127.0.0.1 -U alice -d password_demo_db -c "S
 echo "=== TEST 3: CLEAR LOGIN ATTEMPTS ==="
 
 # Kilidi kaldır
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT clear_login_attempts('alice');"
+sudo -u postgres psql -d password_demo_db -c "SELECT clear_login_attempts('alice');"
 
 # Kontrol et
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT username, fail_count FROM password_profile.login_attempts WHERE username='alice';"
+sudo -u postgres psql -d password_demo_db -c "SELECT username, fail_count FROM password_profile.login_attempts WHERE username='alice';"
 
 # Şimdi doğru şifre ile giriş yapabilmeli
 echo "Doğru şifre ile login:"
@@ -113,7 +113,7 @@ PGPASSWORD='SecurePass123!' psql -h 127.0.0.1 -U alice -d password_demo_db -c "S
 echo "=== TEST 4: PASSWORD BLACKLIST ==="
 
 # Yaygın şifreleri blacklist'e ekle
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db << 'SQL'
+sudo -u postgres psql -d password_demo_db << 'SQL'
 SELECT add_to_blacklist('Password123', 'Common password');
 SELECT add_to_blacklist('Admin123', 'Common admin password');
 SELECT add_to_blacklist('Qwerty123', 'Keyboard pattern');
@@ -125,10 +125,10 @@ SQL
 # Blacklist'teki şifre ile kullanıcı oluşturmayı dene
 echo ""
 echo "Blacklist'teki şifre ile kullanıcı oluşturma:"
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "CREATE ROLE hacker WITH LOGIN PASSWORD 'Password123';" 2>&1 | grep -E "ERROR|WARNING"
+sudo -u postgres psql -d password_demo_db -c "CREATE ROLE hacker WITH LOGIN PASSWORD 'Password123';" 2>&1 | grep -E "ERROR|WARNING"
 
 # Blacklist'te olmayan şifre
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "CREATE ROLE david WITH LOGIN PASSWORD 'David2024!'; SELECT 'David oluşturuldu!' as result;"
+sudo -u postgres psql -d password_demo_db -c "CREATE ROLE david WITH LOGIN PASSWORD 'David2024!'; SELECT 'David oluşturuldu!' as result;"
 ```
 
 **Beklenen:**
@@ -144,18 +144,18 @@ echo "=== TEST 5: PASSWORD HISTORY ==="
 
 # Bob'un mevcut şifresini kontrol et
 echo "Bob'un şifresini değiştir:"
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "ALTER ROLE bob PASSWORD 'NewBob2024!';"
+sudo -u postgres psql -d password_demo_db -c "ALTER ROLE bob PASSWORD 'NewBob2024!';"
 
 # Password history tablosunu kontrol et
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT username, created_at FROM password_profile.password_history WHERE username='bob' ORDER BY created_at DESC LIMIT 3;"
+sudo -u postgres psql -d password_demo_db -c "SELECT username, changed_at FROM password_profile.password_history WHERE username='bob' ORDER BY changed_at DESC LIMIT 3;"
 
 # Aynı şifreyi tekrar kullanmayı dene
 echo ""
 echo "Son 5 şifreden birini tekrar kullanma denemesi:"
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "ALTER ROLE bob PASSWORD 'NewBob2024!';" 2>&1 | grep -E "ERROR|WARNING"
+sudo -u postgres psql -d password_demo_db -c "ALTER ROLE bob PASSWORD 'NewBob2024!';" 2>&1 | grep -E "ERROR|WARNING"
 
 # Farklı şifre ile başarılı olmalı
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "ALTER ROLE bob PASSWORD 'AnotherBob2024!';"
+sudo -u postgres psql -d password_demo_db -c "ALTER ROLE bob PASSWORD 'AnotherBob2024!';"
 ```
 
 **Beklenen:**
@@ -171,7 +171,7 @@ PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "ALTER RO
 echo "=== TEST 6: PASSWORD EXPIRY ==="
 
 # Charlie için şifre süresini geçmiş yap
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db << 'SQL'
+sudo -u postgres psql -d password_demo_db << 'SQL'
 INSERT INTO password_profile.password_expiry (username, last_changed, must_change_by, grace_logins_remaining)
 VALUES ('charlie', NOW() - INTERVAL '100 days', NOW() - INTERVAL '10 days', 3)
 ON CONFLICT (username) DO UPDATE 
@@ -198,7 +198,7 @@ PGPASSWORD='Charlie2024!' psql -h 127.0.0.1 -U charlie -d password_demo_db -c "S
 sleep 2
 
 # Grace login kalan kontrol
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT username, grace_logins_remaining FROM password_profile.password_expiry WHERE username='charlie';"
+sudo -u postgres psql -d password_demo_db -c "SELECT username, grace_logins_remaining FROM password_profile.password_expiry WHERE username='charlie';"
 
 # 4. deneme (grace login bitti)
 echo ""
@@ -219,22 +219,19 @@ PGPASSWORD='Charlie2024!' psql -h 127.0.0.1 -U charlie -d password_demo_db -c "S
 echo "=== TEST 7: HELPER FUNCTIONS ==="
 
 # is_user_locked kontrolü
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT is_user_locked('alice');"
+sudo -u postgres psql -d password_demo_db -c "SELECT is_user_locked('alice');"
 
 # check_password_expiry
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT check_password_expiry('charlie');"
+sudo -u postgres psql -d password_demo_db -c "SELECT check_password_expiry('charlie');"
 
 # get_password_stats
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT get_password_stats('bob');"
+sudo -u postgres psql -d password_demo_db -c "SELECT get_password_stats('bob');"
 
 # check_user_access (combined check)
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT check_user_access('alice');"
+sudo -u postgres psql -d password_demo_db -c "SELECT check_user_access('alice');"
 
 # Lock cache stats
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT * FROM get_lock_cache_stats();"
-
-# Blacklist listele
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT list_blacklist();"
+sudo -u postgres psql -d password_demo_db -c "SELECT * FROM get_lock_cache_stats();"
 ```
 
 ---
@@ -248,7 +245,7 @@ echo "=== TEST 8: SUPERUSER BYPASS ==="
 PGPASSWORD=wrong psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT 1;" 2>&1 | head -1
 
 # Kontrol et (postgres kaydedilmemeli)
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT COUNT(*) as postgres_fail_count FROM password_profile.login_attempts WHERE username='postgres';"
+sudo -u postgres psql -d password_demo_db -c "SELECT COUNT(*) as postgres_fail_count FROM password_profile.login_attempts WHERE username='postgres';"
 ```
 
 **Beklenen:**
@@ -263,7 +260,7 @@ PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT C
 echo "=== TEST 9: ROLE-SPECIFIC SETTINGS ==="
 
 # David için custom ayarlar
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db << 'SQL'
+sudo -u postgres psql -d password_demo_db << 'SQL'
 -- David için özel lockout süresi (5 dakika)
 ALTER ROLE david SET password_profile.lockout_minutes = 5;
 
@@ -282,7 +279,7 @@ for i in {1..3}; do
 done
 
 # Kontrol et (henüz kilitlenmemeli)
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT username, fail_count, lockout_until FROM password_profile.login_attempts WHERE username='david';"
+sudo -u postgres psql -d password_demo_db -c "SELECT username, fail_count, lockout_until FROM password_profile.login_attempts WHERE username='david';"
 ```
 
 **Beklenen:**
@@ -297,13 +294,13 @@ PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT u
 echo "=== TEST 10: REMOVE FROM BLACKLIST ==="
 
 # Blacklist'ten kaldır
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT remove_from_blacklist('Password123');"
+sudo -u postgres psql -d password_demo_db -c "SELECT remove_from_blacklist('Password123');"
 
 # Kontrol et
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT COUNT(*) as count FROM password_profile.blacklist WHERE password='Password123';"
+sudo -u postgres psql -d password_demo_db -c "SELECT COUNT(*) as count FROM password_profile.blacklist WHERE password='Password123';"
 
 # Şimdi kullanılabilmeli
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "CREATE ROLE test_user WITH LOGIN PASSWORD 'Password123';"
+sudo -u postgres psql -d password_demo_db -c "CREATE ROLE test_user WITH LOGIN PASSWORD 'Password123';"
 ```
 
 **Beklenen:**
@@ -318,7 +315,7 @@ PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db -c "CREATE R
 echo "=== TEST 11: ACTIVITY MONITORING ==="
 
 # Son 10 login attempt
-PGPASSWORD=caghan psql -h 127.0.0.1 -U postgres -d password_demo_db << 'SQL'
+sudo -u postgres psql -d password_demo_db << 'SQL'
 SELECT 
     username,
     fail_count,
