@@ -128,16 +128,11 @@ sudo -u postgres psql -d password_demo_db << 'SQL'
 DROP ROLE IF EXISTS history_user;
 CREATE ROLE history_user WITH LOGIN PASSWORD 'FirstPassword123!';
 
--- İlk şifreyi kaydet
-SELECT record_password_change('history_user', 'FirstPassword123!');
-
--- Şifre değiştir ve kaydet
+-- Şifre değiştir (otomatik kaydedilir)
 ALTER ROLE history_user WITH PASSWORD 'SecondPassword456!';
-SELECT record_password_change('history_user', 'SecondPassword456!');
 
--- Tekrar değiştir
+-- Tekrar değiştir (otomatik kaydedilir)
 ALTER ROLE history_user WITH PASSWORD 'ThirdPassword789!';
-SELECT record_password_change('history_user', 'ThirdPassword789!');
 
 -- Password history'e bak
 SELECT username, changed_at FROM password_profile.password_history 
@@ -159,7 +154,7 @@ sudo -u postgres psql -d password_demo_db -c "ALTER ROLE history_user WITH PASSW
 - ❌ Eski şifre (FirstPassword123!) → Password was used recently. Cannot reuse last 5 passwords
 - ✅ Yeni şifre (FourthPassword000!) → Başarılı
 
-**NOT:** `record_password_change()` fonksiyonu ile şifre değişikliklerini history'e kaydetmelisiniz.
+**NOT:** Şifre değişiklikleri artık otomatik olarak password history'e kaydedilir.
 
 ---
 
