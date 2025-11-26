@@ -3,7 +3,6 @@ use crate::clear_login_attempts_internal;
 use crate::record_failed_login;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
-use std::thread;
 use std::time::Duration;
 
 #[no_mangle]
@@ -28,7 +27,7 @@ pub unsafe extern "C" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
                     if event.is_failure {
                         record_failed_login(&username)?;
                     } else {
-                        clear_login_attempts_internal(&username)?;
+                        clear_login_attempts_internal(&username, false)?;
                     }
                     Ok::<(), Box<dyn std::error::Error>>(())
                 });

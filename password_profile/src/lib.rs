@@ -194,7 +194,6 @@ fn encode_username(username: &str) -> [u8; LOCK_USERNAME_BYTES] {
 /// Check database for lockout status when cache miss occurs
 fn check_lockout_from_db(username: &str) -> Option<i64> {
     use pgrx::spi::Spi;
-    use crate::sql::text_arg;
     
     // Check if we can connect to database
     let my_db_id = unsafe { std::ptr::addr_of!(pg_sys::MyDatabaseId).read() };
@@ -244,6 +243,12 @@ unsafe extern "C" fn client_auth_hook(port: *mut pg_sys::Port, status: c_int) {
                     unsafe {
                         password_profile_raise_lockout_error(c_username.as_ptr(), seconds as c_int);
                     }
+                    // User is locked - don't process this as a successful login
+                    // Call previous hook and return early
+                    if let Some(prev_hook) = PREV_CLIENT_AUTH_HOOK {
+                        pg_guard_ffi_boundary(|| prev_hook(port, status));
+                    }
+                    return;
                 }
             }
 
@@ -991,15 +996,28 @@ fn clear_login_attempts(username: &str) -> Result<String, Box<dyn std::error::Er
         .into());
     }
 
-    clear_login_attempts_internal(username)?;
+    clear_login_attempts_internal(username, true)?;
     Ok("Login attempts cleared".to_string())
 }
 
-fn clear_login_attempts_internal(username: &str) -> Result<(), Box<dyn std::error::Error>> {
-    Spi::run_with_args(
-        "DELETE FROM password_profile.login_attempts WHERE username = $1",
-        &[text_arg(username)],
-    )?;
+fn clear_login_attempts_internal(username: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if force {
+        Spi::run_with_args(
+            "DELETE FROM password_profile.login_attempts WHERE username = $1",
+            &[text_arg(username)],
+        )?;
+    } else {
+        // When clearing automatically (e.g. after successful login),
+        // do NOT clear if the user is currently locked.
+        // This prevents a race condition where a successful login slips through
+        // before the lockout is committed, and then clears the lockout.
+        Spi::run_with_args(
+            "DELETE FROM password_profile.login_attempts 
+             WHERE username = $1 
+             AND (lockout_until IS NULL OR lockout_until < now())",
+            &[text_arg(username)],
+        )?;
+    }
 
     unsafe {
         lock_cache::clear(username);

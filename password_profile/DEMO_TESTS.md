@@ -1,3 +1,13 @@
+# PASSWORD PROFILE - DEMO REHBERİ
+
+Bu rehber Password Profile eklentisinin özelliklerini PostgreSQL 16 üzerinde göstermeyi amaçlar.
+
+## ⚠️ ÖNEMLİ UYARILAR
+
+1.  **Server Crash Riski:** Background worker'lar aktifken `DROP DATABASE` komutu çalıştırmak sunucunun kilitlenmesine veya çökmesine neden olabilir. Bu yüzden veritabanını silmek yerine `DROP SCHEMA public CASCADE; CREATE SCHEMA public;` yöntemini veya mevcut veritabanını temizlemeyi tercih edin.
+2.  **Transaction Block:** `ALTER SYSTEM` komutları transaction bloğu içinde çalıştırılamaz.
+3.  **Reload:** GUC değişikliklerinden sonra `SELECT pg_reload_conf();` çalıştırılmalıdır.
+4.  **Temizlik:** Test bitiminde `CLEANUP` adımını uygulayarak sistemi temiz bırakın.
 
 ## Hazırlık
 
@@ -35,20 +45,6 @@ GRANT SELECT ON company_data TO alice, bob;
 
 SELECT 'Demo ortamı hazır!' as status;
 SQL
-```
-
-**Beklenen Çıktı:**
-```
-CREATE EXTENSION
-CREATE EXTENSION
-DO
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-GRANT
-       status       
---------------------
- Demo ortamı hazır!
 ```
 
 > **NOT:** Extension `shared_preload_libraries` içinde olmalı. PostgreSQL restart edildikten sonra extension'ın background worker'ları otomatik başlar.
@@ -100,36 +96,6 @@ echo "Test 1f: Geçerli şifre (SecurePass2024!)"
 sudo -u postgres psql -d password_demo_db -c "DROP ROLE IF EXISTS charlie; CREATE ROLE charlie WITH LOGIN PASSWORD 'SecurePass2024!'; SELECT 'Charlie oluşturuldu!' as result;"
 ```
 
-**Beklenen Çıktı:**
-```
-Test 1a: Kısa şifre (12345)
-WARNING:  [PASSWORD_PROFILE][REJECTED][user=short_pw] Password too short
-ERROR:  Password validation failed: Password too short
-
-Test 1b: Kullanıcı adı içeren şifre (john123)
-WARNING:  [PASSWORD_PROFILE][REJECTED][user=john] Password too short
-ERROR:  Password validation failed: Password too short
-
-Test 1c: Büyük harf eksik (lowercase123!)
-WARNING:  [PASSWORD_PROFILE][REJECTED][user=no_upper] Password must contain at least one uppercase letter
-ERROR:  Password validation failed: Password must contain at least one uppercase letter
-
-Test 1d: Rakam eksik (NoDigits!)
-WARNING:  [PASSWORD_PROFILE][REJECTED][user=no_digit] Password must contain at least one digit
-ERROR:  Password validation failed: Password must contain at least one digit
-
-Test 1e: Özel karakter eksik (NoSpecial123)
-WARNING:  [PASSWORD_PROFILE][REJECTED][user=no_special] Password must contain at least one special character
-ERROR:  Password validation failed: Password must contain at least one special character
-
-Test 1f: Geçerli şifre (SecurePass2024!)
-DROP ROLE
-CREATE ROLE
-        result        
-----------------------
- Charlie oluşturuldu!
-```
-
 ---
 
 ## TEST 2: FAILED LOGIN ATTEMPTS & ACCOUNT LOCKOUT
@@ -173,30 +139,6 @@ echo "Test 2f: 5. deneme (hala kilitli)"
 PGPASSWORD='SecurePass123!' psql -h 127.0.0.1 -U alice -d password_demo_db -c "SELECT 1;" 2>&1 | head -2
 ```
 
-**Beklenen Çıktı:**
-```
-Test 2a: Başarısız deneme 1
-psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  password authentication failed for user "alice"
-
-Test 2b: Başarısız deneme 2
-psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  password authentication failed for user "alice"
-
-Test 2c: Başarısız deneme 3
-psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  password authentication failed for user "alice"
-
-Test 2d: Login attempts tablosunu kontrol et
- username | fail_count |        lockout_until        
-----------+------------+-----------------------------
- alice    |          3 | 2025-11-26 11:15:30.123+03
-(1 row)
-
-Test 2e: 4. deneme (doğru şifre ile - hesap kilitli)
-psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  Account locked for user: alice. Try again after 1 minute 30 seconds
-
-Test 2f: 5. deneme (hala kilitli)
-psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  Account locked for user: alice. Try again after 1 minute 20 seconds
-```
-
 > **NOT:** Hesap kilidi `lockout_duration_minutes` süresi kadar devam eder. Bu süre sonunda otomatik olarak kilidi açılır.
 
 ---
@@ -226,31 +168,6 @@ PGPASSWORD='SecurePass123!' psql -h 127.0.0.1 -U alice -d password_demo_db -c "S
 echo ""
 echo "Test 3d: Başarılı girişten sonra tablo durumu"
 sudo -u postgres psql -d password_demo_db -c "SELECT username, fail_count, lockout_until FROM password_profile.login_attempts WHERE username='alice';"
-```
-
-**Beklenen Çıktı:**
-```
-Test 3a: Alice'in kilidini kaldır
-      clear_login_attempts      
---------------------------------
- Login attempts cleared for alice
-(1 row)
-
-Test 3b: Login attempts tablosunu kontrol et
- username | fail_count | lockout_until 
-----------+------------+---------------
-(0 rows)
-
-Test 3c: Doğru şifre ile giriş
-        result        
-----------------------
- Başarılı login!
-(1 row)
-
-Test 3d: Başarılı girişten sonra tablo durumu
- username | fail_count | lockout_until 
-----------+------------+---------------
-(0 rows)
 ```
 
 > **NOT:** `clear_login_attempts()` fonksiyonu kullanıcının tüm başarısız giriş kayıtlarını siler ve hesabın kilidini açar.
@@ -317,48 +234,6 @@ echo "Test 4h: Toplam kaç şifre history'de"
 sudo -u postgres psql -d password_demo_db -c "SELECT COUNT(*) as total_passwords FROM password_profile.password_history WHERE username = 'history_user';"
 ```
 
-**Beklenen Çıktı:**
-```
-Test 4a: Yeni kullanıcı oluştur ve ilk şifre history'e kaydedilir
-DROP ROLE
-CREATE ROLE
-
-Test 4b: Şifre değiştir (2. şifre)
-ALTER ROLE
-
-Test 4c: Şifre değiştir (3. şifre)
-ALTER ROLE
-
-Test 4d: Password history tablosunu kontrol et
-   username    |          changed_at           |  password_hash_preview  
----------------+-------------------------------+-------------------------
- history_user  | 2025-11-26 11:20:15.123+03   | $2b$12$abcdef123456...
- history_user  | 2025-11-26 11:20:14.456+03   | $2b$12$xyz789012345...
- history_user  | 2025-11-26 11:20:13.789+03   | $2b$12$qwerty098765...
-(3 rows)
-
-Test 4e: Eski şifreyi (FirstPassword123!) kullanmayı dene
-WARNING:  [PASSWORD_PROFILE][REJECTED][user=history_user] Password was used recently. Cannot reuse last 5 passwords.
-ERROR:  Password validation failed: Password was used recently. Cannot reuse last 5 passwords.
-
-Test 4f: 2. eski şifreyi (SecondPassword456!) kullanmayı dene
-WARNING:  [PASSWORD_PROFILE][REJECTED][user=history_user] Password was used recently. Cannot reuse last 5 passwords.
-ERROR:  Password validation failed: Password was used recently. Cannot reuse last 5 passwords.
-
-Test 4g: Yeni bir şifre (FourthPassword000!) kullan
-ALTER ROLE
-        result        
-----------------------
- Şifre değiştirildi!
-(1 row)
-
-Test 4h: Toplam kaç şifre history'de
- total_passwords 
------------------
-               4
-(1 row)
-```
-
 > **NOT:** Şifre değişiklikleri artık otomatik olarak `password_profile.password_history` tablosuna kaydedilir. Manuel kayıt gerekmez.
 
 ---
@@ -408,52 +283,11 @@ sudo -u postgres psql -d password_demo_db -c "SELECT remove_from_blacklist('Pass
 echo ""
 echo "Test 5g: Kaldırılan şifre artık kullanılabilir mi?"
 sudo -u postgres psql -d password_demo_db -c "DROP ROLE IF EXISTS test_removed; CREATE ROLE test_removed WITH LOGIN PASSWORD 'Password123';" 2>&1
-```
 
-**Beklenen Çıktı:**
-```
-Test 5a: Blacklist'e yaygın şifreler ekle
-    add_to_blacklist    
-------------------------
- Added to blacklist
-(1 row)
-...
-
-Test 5b: Blacklist'i göster
-  password   |       reason        |          created_at
--------------+---------------------+------------------------------
- Abc123456!  | Simple sequential   | 2025-11-26 11:25:10.123+03
- Welcome1!   | Welcome password    | 2025-11-26 11:25:09.456+03
- Qwerty123   | Keyboard pattern    | 2025-11-26 11:25:08.789+03
- Admin123    | Common admin pass   | 2025-11-26 11:25:08.123+03
- Password123 | Common password     | 2025-11-26 11:25:07.456+03
-(5 rows)
-
-Test 5c: Blacklist'teki şifre ile kullanıcı oluşturma (Password123)
-WARNING:  [PASSWORD_PROFILE][REJECTED][user=hacker1] Password is in blacklist (too common)
-ERROR:  Password validation failed: Password is in blacklist (too common)
-
-Test 5d: Blacklist'teki başka bir şifre (Admin123)
-WARNING:  [PASSWORD_PROFILE][REJECTED][user=hacker2] Password is in blacklist (too common)
-ERROR:  Password validation failed: Password is in blacklist (too common)
-
-Test 5e: Blacklist'te olmayan geçerli şifre (David2024!)
-DROP ROLE
-CREATE ROLE
-        result        
-----------------------
- David oluşturuldu!
-(1 row)
-
-Test 5f: Blacklist'ten şifre kaldır
-  remove_from_blacklist  
--------------------------
- Removed from blacklist
-(1 row)
-
-Test 5g: Kaldırılan şifre artık kullanılabilir mi?
-DROP ROLE
-CREATE ROLE
+# Test sonrası blacklist temizliği
+sudo -u postgres psql -d password_demo_db << 'SQL'
+TRUNCATE password_profile.blacklist;
+SQL
 ```
 
 > **NOT:** Blacklist kontrolü büyük/küçük harf duyarlıdır. "password123" ve "Password123" farklı şifrelerdir.
@@ -472,13 +306,9 @@ VALUES ('charlie', NOW() - INTERVAL '100 days', NOW() - INTERVAL '10 days', 3)
 ON CONFLICT (username) DO UPDATE 
 SET must_change_by = NOW() - INTERVAL '10 days', 
     grace_logins_remaining = 3;
-
-SELECT username, must_change_by, grace_logins_remaining 
-FROM password_profile.password_expiry WHERE username='charlie';
 SQL
 
 # Grace login denemesi 1
-echo ""
 echo "Grace login 1:"
 PGPASSWORD='Charlie2024!' psql -h 127.0.0.1 -U charlie -d password_demo_db -c "SELECT 'Grace login 1' as result;" 2>&1 | grep -E "expired|Grace|result"
 
@@ -490,28 +320,17 @@ PGPASSWORD='Charlie2024!' psql -h 127.0.0.1 -U charlie -d password_demo_db -c "S
 echo "Grace login 3:"
 PGPASSWORD='Charlie2024!' psql -h 127.0.0.1 -U charlie -d password_demo_db -c "SELECT 'Grace login 3' as result;" 2>&1 | grep -E "expired|Grace|result"
 
-sleep 2
-
-# Grace login kalan kontrol
-sudo -u postgres psql -d password_demo_db -c "SELECT username, grace_logins_remaining FROM password_profile.password_expiry WHERE username='charlie';"
-
 # 4. deneme (grace login bitti)
-echo ""
 echo "4. deneme (grace login tükendi):"
 PGPASSWORD='Charlie2024!' psql -h 127.0.0.1 -U charlie -d password_demo_db -c "SELECT 1;" 2>&1 | head -2
 ```
 
-**Beklenen:**
-- ✅ Grace login 1, 2, 3 → Başarılı (warning ile)
-- grace_logins_remaining → 0'a düştü
-- ❌ 4. deneme → FATAL: Password expired
-
 ---
 
-## TEST 5: HELPER FUNCTIONS
+## TEST 7: HELPER FUNCTIONS
 
 ```bash
-echo "=== TEST 5: HELPER FUNCTIONS ==="
+echo "=== TEST 7: HELPER FUNCTIONS ==="
 
 # is_user_locked kontrolü
 sudo -u postgres psql -d password_demo_db -c "SELECT is_user_locked('alice');"
@@ -543,10 +362,6 @@ PGPASSWORD=wrong psql -h 127.0.0.1 -U postgres -d password_demo_db -c "SELECT 1;
 sudo -u postgres psql -d password_demo_db -c "SELECT COUNT(*) as postgres_fail_count FROM password_profile.login_attempts WHERE username='postgres';"
 ```
 
-**Beklenen:**
-- Superuser için failed login tracking YOK
-- postgres_fail_count → 0
-
 ---
 
 ## TEST 9: ROLE-SPECIFIC GUC OVERRIDES
@@ -575,39 +390,20 @@ done
 
 # Kontrol et (henüz kilitlenmemeli)
 sudo -u postgres psql -d password_demo_db -c "SELECT username, fail_count, lockout_until FROM password_profile.login_attempts WHERE username='david';"
-```
 
-**Beklenen:**
-- fail_count → 3
-- lockout_until → NULL (henüz kilitli değil, 5'e kadar izin var)
+# Test sonrası ayarları sıfırla
+sudo -u postgres psql -d password_demo_db << 'SQL'
+ALTER ROLE david RESET password_profile.lockout_minutes;
+ALTER ROLE david RESET password_profile.failed_login_max;
+SQL
+```
 
 ---
 
-## TEST 10: BLACKLIST'TEN ÇIKARMA
+## TEST 10: ACTIVITY LOG İNCELEME
 
 ```bash
-echo "=== TEST 10: REMOVE FROM BLACKLIST ==="
-
-# Blacklist'ten kaldır
-sudo -u postgres psql -d password_demo_db -c "SELECT remove_from_blacklist('Password123');"
-
-# Kontrol et
-sudo -u postgres psql -d password_demo_db -c "SELECT COUNT(*) as count FROM password_profile.blacklist WHERE password='Password123';"
-
-# Şimdi kullanılabilmeli
-sudo -u postgres psql -d password_demo_db -c "CREATE ROLE test_user WITH LOGIN PASSWORD 'Password123';"
-```
-
-**Beklenen:**
-- ✅ Blacklist'ten kaldırıldı
-- ✅ Şimdi "Password123" kullanılabilir
-
----
-
-## TEST 11: ACTIVITY LOG İNCELEME
-
-```bash
-echo "=== TEST 11: ACTIVITY MONITORING ==="
+echo "=== TEST 10: ACTIVITY MONITORING ==="
 
 # Son 10 login attempt
 sudo -u postgres psql -d password_demo_db << 'SQL'
@@ -634,6 +430,41 @@ SQL
 
 ---
 
+## Temizlik
+
+```bash
+echo "=== CLEANUP ==="
+sudo -u postgres psql -d password_demo_db << 'SQL'
+-- Test kullanıcılarını temizle
+DROP ROLE IF EXISTS alice;
+DROP ROLE IF EXISTS bob;
+DROP ROLE IF EXISTS charlie;
+DROP ROLE IF EXISTS david;
+DROP ROLE IF EXISTS short_pw;
+DROP ROLE IF EXISTS john;
+DROP ROLE IF EXISTS no_upper;
+DROP ROLE IF EXISTS no_digit;
+DROP ROLE IF EXISTS no_special;
+DROP ROLE IF EXISTS history_user;
+DROP ROLE IF EXISTS hacker1;
+DROP ROLE IF EXISTS hacker2;
+DROP ROLE IF EXISTS test_removed;
+
+-- Tabloları temizle
+TRUNCATE password_profile.login_attempts;
+TRUNCATE password_profile.password_history;
+TRUNCATE password_profile.blacklist;
+TRUNCATE password_profile.password_expiry;
+
+-- Demo tablosunu sil
+DROP TABLE IF EXISTS company_data;
+
+SELECT 'Temizlik tamamlandı!' as status;
+SQL
+```
+
+---
+
 ## DEMO TAMAMLANDI! 🎉
 
 ```bash
@@ -645,14 +476,13 @@ echo ""
 echo "Tüm özellikler test edildi:"
 echo "✅ Password Complexity Rules"
 echo "✅ Failed Login Tracking"
-echo "✅ Account Lockout (3 failed attempts)"
+echo "✅ Account Lockout"
 echo "✅ Password Blacklist"
-echo "✅ Password History (reuse prevention)"
+echo "✅ Password History"
 echo "✅ Password Expiry & Grace Logins"
 echo "✅ Helper Functions"
 echo "✅ Superuser Bypass"
 echo "✅ Role-specific GUC Overrides"
-echo "✅ Blacklist Management"
 echo "✅ Activity Monitoring"
 echo ""
 ```
