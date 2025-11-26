@@ -134,7 +134,7 @@ unsafe fn extract_utility_command(_pstmt: *mut pg_sys::PlannedStmt, query: &str)
     let cleaned = query.trim().trim_end_matches(';').trim();
     let query_upper = cleaned.to_uppercase();
     let first_word = query_upper.split_whitespace().next().unwrap_or("");
-    
+
     match first_word {
         // DDL commands - these should be controlled
         "CREATE" => "CREATE",
@@ -143,24 +143,24 @@ unsafe fn extract_utility_command(_pstmt: *mut pg_sys::PlannedStmt, query: &str)
         "TRUNCATE" => "TRUNCATE",
         "COMMENT" => "COMMENT",
         "RENAME" => "RENAME",
-        
+
         // Security/Access control
         "GRANT" => "GRANT",
         "REVOKE" => "REVOKE",
-        
+
         // Maintenance commands
         "VACUUM" => "VACUUM",
         "ANALYZE" => "ANALYZE",
         "REINDEX" => "REINDEX",
         "CLUSTER" => "CLUSTER",
-        
+
         // Materialized views
         "REFRESH" => "REFRESH",
-        
+
         // Data manipulation
         "COPY" => "COPY",
         "LOCK" => "LOCK",
-        
+
         // Transaction control
         "BEGIN" | "START" => "BEGIN",
         "COMMIT" | "END" => "COMMIT",
@@ -170,12 +170,12 @@ unsafe fn extract_utility_command(_pstmt: *mut pg_sys::PlannedStmt, query: &str)
         "PREPARE" => "PREPARE",
         "EXECUTE" => "EXECUTE",
         "DEALLOCATE" => "DEALLOCATE",
-        
+
         // Session/Config
         "SET" => "SET",
         "SHOW" => "SHOW",
         "RESET" => "RESET",
-        
+
         // Special utility
         "EXPLAIN" => "EXPLAIN",
         "LISTEN" => "LISTEN",
@@ -184,11 +184,11 @@ unsafe fn extract_utility_command(_pstmt: *mut pg_sys::PlannedStmt, query: &str)
         "CHECKPOINT" => "CHECKPOINT",
         "DISCARD" => "DISCARD",
         "LOAD" => "LOAD",
-        
+
         // Replication
         "CREATE_REPLICATION_SLOT" => "CREATE_REPLICATION_SLOT",
         "DROP_REPLICATION_SLOT" => "DROP_REPLICATION_SLOT",
-        
+
         // Everything else
         _ => "OTHER",
     }

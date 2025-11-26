@@ -106,6 +106,11 @@ Activity logging itself is always enabled outside quiet hours; quiet-hour suppre
 
 **Note:** The background approval worker requires the database name to be set in `postgresql.conf` before PostgreSQL starts. This is a `Postmaster` context GUC that cannot be changed with `ALTER SYSTEM` alone.
 
+### Approval worker maintenance
+- `SELECT sql_firewall_pause_approval_worker();` pauses the background worker without requiring a postmaster restart. The worker disconnects from its database and remains idle.
+- `SELECT sql_firewall_resume_approval_worker();` reconnects the worker and resumes processing pending approvals.
+- Always pause the worker before dropping the database defined in `sql_firewall.approval_worker_database`. Without a pause the worker holds an open connection and PostgreSQL refuses to drop that database.
+
 ---
 ## 6. Operational Workflow
 
@@ -180,4 +185,3 @@ Advanced tests available via `run_advanced_tests.sh` for stress testing and edge
 | Regex tests miss `'1'='1'` | Patterns missing quoted tautologies. | Insert additional regex rows (e.g., `(?i)or\s*'1'\s*=\s*'1'`). |
 
 If problems persist, capture PostgreSQL logs plus `run_comprehensive_tests.sh` output when filing an issue.
-

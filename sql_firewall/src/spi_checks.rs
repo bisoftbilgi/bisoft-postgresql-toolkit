@@ -21,11 +21,12 @@ pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) ->
 
     // CRITICAL: More precise check - skip only actual firewall table access
     let lower = query.to_ascii_lowercase();
-    if (lower.contains("from ") || lower.contains("into ") || lower.contains("update ")) &&
-       (lower.contains("sql_firewall_activity_log") || 
-        lower.contains("sql_firewall_command_approvals") ||
-        lower.contains("sql_firewall_query_fingerprints") ||
-        lower.contains("sql_firewall_regex_rules")) {
+    if (lower.contains("from ") || lower.contains("into ") || lower.contains("update "))
+        && (lower.contains("sql_firewall_activity_log")
+            || lower.contains("sql_firewall_command_approvals")
+            || lower.contains("sql_firewall_query_fingerprints")
+            || lower.contains("sql_firewall_regex_rules"))
+    {
         return None;
     }
 
@@ -40,10 +41,10 @@ pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) ->
             Ok(Some(val)) => val,
             _ => "0".to_string(),
         };
-        
+
         // Set temporary 100ms timeout to prevent ReDoS attacks
         let _ = spi_update(client, "SET LOCAL statement_timeout = 100", &[]);
-        
+
         let result = match spi_select_one::<bool>(
             client,
             "SELECT EXISTS (SELECT 1 FROM public.sql_firewall_regex_rules \
@@ -55,7 +56,9 @@ pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) ->
                 let err_str = err.to_string();
                 // Check for timeout
                 if err_str.contains("timeout") || err_str.contains("canceling statement") {
-                    pgrx::warning!("sql_firewall: regex check timeout - possible ReDoS attack pattern");
+                    pgrx::warning!(
+                        "sql_firewall: regex check timeout - possible ReDoS attack pattern"
+                    );
                     false
                 } else if err_str.contains("does not exist") || err_str.contains("mevcut değil") {
                     // Tablo yoksa sessizce geç (bootstrap sırasında)
@@ -66,11 +69,11 @@ pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) ->
                 }
             }
         };
-        
+
         // CRITICAL: Restore original statement_timeout before returning
         let restore_query = format!("SET LOCAL statement_timeout = '{}'", saved_timeout);
         let _ = spi_update(client, &restore_query, &[]);
-        
+
         result
     });
 
@@ -97,11 +100,12 @@ pub fn rate_limit_violation(ctx: &ExecutionContext, command: &str, query: &str) 
 
     // CRITICAL: More precise check - skip only actual firewall table access
     let lower = query.to_ascii_lowercase();
-    if (lower.contains("from ") || lower.contains("into ") || lower.contains("update ")) &&
-       (lower.contains("sql_firewall_activity_log") || 
-        lower.contains("sql_firewall_command_approvals") ||
-        lower.contains("sql_firewall_query_fingerprints") ||
-        lower.contains("sql_firewall_regex_rules")) {
+    if (lower.contains("from ") || lower.contains("into ") || lower.contains("update "))
+        && (lower.contains("sql_firewall_activity_log")
+            || lower.contains("sql_firewall_command_approvals")
+            || lower.contains("sql_firewall_query_fingerprints")
+            || lower.contains("sql_firewall_regex_rules"))
+    {
         return None;
     }
 
@@ -158,11 +162,12 @@ pub fn approval_requirement(
 
     // CRITICAL: More precise check - skip only actual firewall table access
     let lower = query.to_ascii_lowercase();
-    if (lower.contains("from ") || lower.contains("into ") || lower.contains("update ")) &&
-       (lower.contains("sql_firewall_activity_log") || 
-        lower.contains("sql_firewall_command_approvals") ||
-        lower.contains("sql_firewall_query_fingerprints") ||
-        lower.contains("sql_firewall_regex_rules")) {
+    if (lower.contains("from ") || lower.contains("into ") || lower.contains("update "))
+        && (lower.contains("sql_firewall_activity_log")
+            || lower.contains("sql_firewall_command_approvals")
+            || lower.contains("sql_firewall_query_fingerprints")
+            || lower.contains("sql_firewall_regex_rules"))
+    {
         return None;
     }
 
@@ -198,7 +203,7 @@ pub fn approval_requirement(
             let decision = Decision::Allow {
                 action: Cow::Borrowed("ALLOWED"),
                 reason: Some("Role unknown".to_string()),
-                skip_fingerprint_check: true,  // No role, can't check fingerprints anyway
+                skip_fingerprint_check: true, // No role, can't check fingerprints anyway
             };
             return finalize_decision(decision, ctx, command, mode, query);
         }
@@ -228,7 +233,7 @@ pub fn approval_requirement(
         // CRITICAL: Record approval request FIRST, before any potential rollback
         // Use separate autonomous-like transaction via INSERT
         let _ = Spi::run("SAVEPOINT approval_record");
-        
+
         let insert_result = Spi::connect_mut(|client| {
             let args = [name_arg(role), text_arg(command), bool_arg(is_approved)];
             spi_update(
@@ -239,36 +244,35 @@ pub fn approval_requirement(
                 &args,
             )
         });
-        
+
         // Commit the approval record even if main transaction fails
         if insert_result.is_ok() {
             let _ = Spi::run("RELEASE SAVEPOINT approval_record");
         } else {
             let _ = Spi::run("ROLLBACK TO SAVEPOINT approval_record");
         }
-        
+
         // Also log to activity log
-        let action_desc = if is_approved { "AUTO-APPROVED" } else { "PENDING APPROVAL" };
+        let action_desc = if is_approved {
+            "AUTO-APPROVED"
+        } else {
+            "PENDING APPROVAL"
+        };
         let reason = if is_approved {
             "Command auto-approved in permissive mode"
         } else {
             "New command detected - awaiting admin approval"
         };
-        log_activity(
-            ctx,
-            command,
-            action_desc,
-            Some(reason),
-            query,
-        );
-        
+        log_activity(ctx, command, action_desc, Some(reason), query);
+
         // PostgreSQL WARNING (survives transaction abort)
         if !is_approved {
             pgrx::warning!(
-                "sql_firewall: PENDING APPROVAL REQUEST - role='{}' command='{}'", 
-                role, command
+                "sql_firewall: PENDING APPROVAL REQUEST - role='{}' command='{}'",
+                role,
+                command
             );
-        
+
             // PostgreSQL LOG (also survives abort)
             pgrx::log!(
                 "sql_firewall_rs: APPROVAL_NEEDED role='{}' command='{}' database='{}'",
@@ -276,15 +280,11 @@ pub fn approval_requirement(
                 command,
                 ctx.database.as_deref().unwrap_or("unknown")
             );
-        
+
             // If syslog alerts enabled, use that too
             if guc::syslog_alerts_enabled() {
                 use crate::alerts;
-                alerts::emit_block_alert(
-                    ctx,
-                    command,
-                    "PENDING APPROVAL - awaiting admin action"
-                );
+                alerts::emit_block_alert(ctx, command, "PENDING APPROVAL - awaiting admin action");
             }
         }
     };
@@ -466,7 +466,7 @@ enum Decision {
     Allow {
         action: Cow<'static, str>,
         reason: Option<String>,
-        skip_fingerprint_check: bool,  // If true, skip fingerprint enforcement (command already approved)
+        skip_fingerprint_check: bool, // If true, skip fingerprint enforcement (command already approved)
     },
     Block {
         action: Cow<'static, str>,
@@ -483,7 +483,11 @@ fn finalize_decision(
     query: &str,
 ) -> Option<String> {
     match decision {
-        Decision::Allow { action, reason, skip_fingerprint_check } => {
+        Decision::Allow {
+            action,
+            reason,
+            skip_fingerprint_check,
+        } => {
             // Check fingerprints if needed (Learn mode always checks to track, others check to enforce)
             if !skip_fingerprint_check && guc::fingerprint_learning_enabled() {
                 if let Some(reason_text) = fingerprints::enforce(ctx, command, mode, query) {

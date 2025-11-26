@@ -35,6 +35,8 @@ SQL
 > ```
 > 
 > Diğer Postmaster GUC'lar da tam restart ister, kalan ayarlar `SELECT pg_reload_conf();` ile etkinleşir.
+>
+> **Worker bağlantısı:** `demo_db` gibi worker'ın bağlı olduğu veritabanını `DROP DATABASE` ile temizlemeden önce `SELECT sql_firewall_pause_approval_worker();` çalıştırıp bağlantıyı bırakın. Veritabanını yeniden oluşturduktan sonra `SELECT sql_firewall_resume_approval_worker();` ile worker'ı tekrar devreye alın. Bu fonksiyonları uzantının kurulu olduğu herhangi bir veritabanında çağırabilirsiniz.
 
 ---
 
@@ -472,8 +474,11 @@ DROP TABLE IF EXISTS demo_table;
 DROP ROLE IF EXISTS test_user1;
 DROP ROLE IF EXISTS test_user2;
 
+SELECT sql_firewall_pause_approval_worker();
 \c postgres
 DROP DATABASE IF EXISTS demo_db;
+-- demo_db yeniden oluşturulacaksa, CREATE DATABASE + CREATE EXTENSION sonrasında:
+-- SELECT sql_firewall_resume_approval_worker();
 SQL
 ```
 

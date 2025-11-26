@@ -125,7 +125,7 @@ pub(crate) fn enqueue(role_name: &str, command_type: &str, database_name: &str) 
         {
             let _guard = SpinLockGuard::new(&mut ring.lock);
             let next_head = (ring.head + 1) % PENDING_APPROVAL_RING_SIZE as u32;
-            
+
             // Ring buffer full - drop oldest
             if next_head == ring.tail {
                 ring.tail = (ring.tail + 1) % PENDING_APPROVAL_RING_SIZE as u32;
@@ -189,13 +189,13 @@ pub(crate) fn get_stats() -> (u32, u32, u64) {
         }
         let ring = &*PENDING_APPROVAL_RING;
         let _guard = SpinLockGuard::new(&mut (*PENDING_APPROVAL_RING).lock);
-        
+
         let pending = if ring.head >= ring.tail {
             ring.head - ring.tail
         } else {
             PENDING_APPROVAL_RING_SIZE as u32 - ring.tail + ring.head
         };
-        
+
         (pending, PENDING_APPROVAL_RING_SIZE as u32, ring.dropped)
     }
 }

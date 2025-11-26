@@ -22,6 +22,7 @@ pub unsafe extern "C" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
         let mut processed = false;
         while let Some(event) = auth_event::dequeue() {
             processed = true;
+            
             if let Some(username) = auth_event::username_from_bytes(&event.username) {
                 let result = BackgroundWorker::transaction(|| {
                     if event.is_failure {
@@ -39,7 +40,8 @@ pub unsafe extern "C" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
         }
 
         if !processed {
-            thread::sleep(Duration::from_millis(25));
+            // Use wait_latch instead of thread::sleep for proper signal handling
+            BackgroundWorker::wait_latch(Some(Duration::from_millis(25)));
         }
     }
 

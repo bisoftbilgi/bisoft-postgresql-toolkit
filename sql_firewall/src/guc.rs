@@ -48,7 +48,7 @@ pub static ALERT_CHANNEL: GucSetting<Option<CString>> = GucSetting::<Option<CStr
 pub static SYSLOG_ALERTS: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub static ALERT_ONLY_ON_BLOCK: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static ACTIVITY_LOG_RETENTION_DAYS: GucSetting<i32> = GucSetting::<i32>::new(30);
-pub static APPROVAL_WORKER_DATABASE: GucSetting<Option<CString>> = 
+pub static APPROVAL_WORKER_DATABASE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 pub static ACTIVITY_LOG_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 pub static ACTIVITY_LOG_PRUNE_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(300);

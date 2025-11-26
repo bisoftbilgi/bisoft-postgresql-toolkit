@@ -88,6 +88,45 @@ fn sql_firewall_status() -> String {
     format!("sql_firewall_rs running in {:?} mode", guc::mode())
 }
 
+#[pg_extern]
+fn sql_firewall_pause_approval_worker() -> String {
+    approval_worker::request_worker_pause();
+    let paused = approval_worker::wait_for_worker_states(
+        &[
+            approval_worker::WorkerStatus::Waiting,
+            approval_worker::WorkerStatus::Stopped,
+        ],
+        Duration::from_secs(5),
+    );
+    if paused {
+        "approval worker paused".to_string()
+    } else {
+        "pause requested (worker still stopping)".to_string()
+    }
+}
+
+#[pg_extern]
+fn sql_firewall_resume_approval_worker() -> String {
+    approval_worker::request_worker_resume();
+    let resumed = approval_worker::wait_for_worker_states(
+        &[
+            approval_worker::WorkerStatus::Running,
+            approval_worker::WorkerStatus::Starting,
+        ],
+        Duration::from_secs(5),
+    );
+    if resumed {
+        "approval worker running".to_string()
+    } else {
+        "resume requested (worker still starting)".to_string()
+    }
+}
+
+#[pg_extern]
+fn sql_firewall_approval_worker_status() -> String {
+    approval_worker::worker_status().as_str().to_string()
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {

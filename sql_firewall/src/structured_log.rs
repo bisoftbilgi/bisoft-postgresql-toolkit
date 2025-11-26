@@ -1,6 +1,5 @@
 /// Structured logging module for sql_firewall_rs
 /// Provides standardized, parseable log format for production monitoring
-
 use crate::context::ExecutionContext;
 use crate::guc::FirewallMode;
 
@@ -12,10 +11,16 @@ pub fn log_block(ctx: &ExecutionContext, command: &str, mode: FirewallMode, reas
     let db = ctx.database.as_deref().unwrap_or("unknown");
     let app = ctx.application_name.as_deref().unwrap_or("unknown");
     let ip = ctx.client_addr.as_deref().unwrap_or("unknown");
-    
+
     pgrx::warning!(
         "[SQL_FIREWALL][BLOCKED][{:?}][user={}][db={}][app={}][ip={}][cmd={}] {}",
-        mode, user, db, app, ip, command, reason
+        mode,
+        user,
+        db,
+        app,
+        ip,
+        command,
+        reason
     );
 }
 
@@ -25,10 +30,13 @@ pub fn log_block(ctx: &ExecutionContext, command: &str, mode: FirewallMode, reas
 pub fn log_learn(ctx: &ExecutionContext, command: &str, fingerprint: &str) {
     let user = ctx.role.as_deref().unwrap_or("unknown");
     let db = ctx.database.as_deref().unwrap_or("unknown");
-    
+
     pgrx::log!(
         "[SQL_FIREWALL][LEARNED][user={}][db={}][cmd={}] Fingerprint: {}",
-        user, db, command, fingerprint
+        user,
+        db,
+        command,
+        fingerprint
     );
 }
 
@@ -38,10 +46,13 @@ pub fn log_learn(ctx: &ExecutionContext, command: &str, fingerprint: &str) {
 pub fn log_allow(ctx: &ExecutionContext, command: &str, mode: FirewallMode) {
     let user = ctx.role.as_deref().unwrap_or("unknown");
     let db = ctx.database.as_deref().unwrap_or("unknown");
-    
+
     pgrx::log!(
         "[SQL_FIREWALL][ALLOWED][{:?}][user={}][db={}][cmd={}] Query permitted",
-        mode, user, db, command
+        mode,
+        user,
+        db,
+        command
     );
 }
 
@@ -51,10 +62,14 @@ pub fn log_allow(ctx: &ExecutionContext, command: &str, mode: FirewallMode) {
 pub fn log_rate_limit(ctx: &ExecutionContext, count: i32, limit: i32, window_secs: i32) {
     let user = ctx.role.as_deref().unwrap_or("unknown");
     let db = ctx.database.as_deref().unwrap_or("unknown");
-    
+
     pgrx::warning!(
         "[SQL_FIREWALL][RATE_LIMIT][user={}][db={}] {}/{} queries in {}s window",
-        user, db, count, limit, window_secs
+        user,
+        db,
+        count,
+        limit,
+        window_secs
     );
 }
 
@@ -63,10 +78,14 @@ pub fn log_rate_limit(ctx: &ExecutionContext, count: i32, limit: i32, window_sec
 pub fn log_quiet_hours(ctx: &ExecutionContext, command: &str, start: &str, end: &str) {
     let user = ctx.role.as_deref().unwrap_or("unknown");
     let db = ctx.database.as_deref().unwrap_or("unknown");
-    
+
     pgrx::warning!(
         "[SQL_FIREWALL][QUIET_HOURS][user={}][db={}][cmd={}] Blocked during {}-{} window",
-        user, db, command, start, end
+        user,
+        db,
+        command,
+        start,
+        end
     );
 }
 
@@ -76,10 +95,13 @@ pub fn log_quiet_hours(ctx: &ExecutionContext, command: &str, start: &str, end: 
 pub fn log_regex_block(ctx: &ExecutionContext, command: &str, pattern: &str) {
     let user = ctx.role.as_deref().unwrap_or("unknown");
     let db = ctx.database.as_deref().unwrap_or("unknown");
-    
+
     pgrx::warning!(
         "[SQL_FIREWALL][REGEX_BLOCK][user={}][db={}][cmd={}] Pattern: {}",
-        user, db, command, pattern
+        user,
+        db,
+        command,
+        pattern
     );
 }
 
@@ -89,10 +111,13 @@ pub fn log_regex_block(ctx: &ExecutionContext, command: &str, pattern: &str) {
 pub fn log_keyword_block(ctx: &ExecutionContext, command: &str, keyword: &str) {
     let user = ctx.role.as_deref().unwrap_or("unknown");
     let db = ctx.database.as_deref().unwrap_or("unknown");
-    
+
     pgrx::warning!(
         "[SQL_FIREWALL][KEYWORD_BLOCK][user={}][db={}][cmd={}] Blacklisted keyword: {}",
-        user, db, command, keyword
+        user,
+        db,
+        command,
+        keyword
     );
 }
 
@@ -102,7 +127,7 @@ pub fn log_keyword_block(ctx: &ExecutionContext, command: &str, keyword: &str) {
 pub fn log_approval_needed(ctx: &ExecutionContext, command: &str, mode: FirewallMode) {
     let user = ctx.role.as_deref().unwrap_or("unknown");
     let db = ctx.database.as_deref().unwrap_or("unknown");
-    
+
     pgrx::warning!(
         "[SQL_FIREWALL][APPROVAL_NEEDED][{:?}][user={}][db={}][cmd={}] Command requires explicit approval",
         mode, user, db, command
@@ -115,10 +140,13 @@ pub fn log_approval_needed(ctx: &ExecutionContext, command: &str, mode: Firewall
 pub fn log_fingerprint_mismatch(ctx: &ExecutionContext, command: &str, fingerprint: &str) {
     let user = ctx.role.as_deref().unwrap_or("unknown");
     let db = ctx.database.as_deref().unwrap_or("unknown");
-    
+
     pgrx::warning!(
         "[SQL_FIREWALL][FINGERPRINT_MISMATCH][user={}][db={}][cmd={}] Unknown pattern: {}",
-        user, db, command, fingerprint
+        user,
+        db,
+        command,
+        fingerprint
     );
 }
 
@@ -129,10 +157,13 @@ pub fn log_connection_block(ctx: &ExecutionContext, reason: &str) {
     let user = ctx.role.as_deref().unwrap_or("unknown");
     let ip = ctx.client_addr.as_deref().unwrap_or("unknown");
     let app = ctx.application_name.as_deref().unwrap_or("unknown");
-    
+
     pgrx::warning!(
         "[SQL_FIREWALL][CONNECTION_BLOCK][user={}][ip={}][app={}] {}",
-        user, ip, app, reason
+        user,
+        ip,
+        app,
+        reason
     );
 }
 

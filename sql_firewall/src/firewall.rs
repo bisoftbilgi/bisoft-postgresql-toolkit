@@ -108,7 +108,7 @@ pub fn inspect_query(_origin: QueryOrigin, query: &str, ctx: &ExecutionContext, 
 
     // Get mode for approval checks (still needed)
     let mode = guc::mode();
-    
+
     // Debug logging - commented out for production
     // let keyword = guc::keyword_scan_enabled();
     // let regex = guc::regex_scan_enabled();
@@ -276,22 +276,22 @@ fn is_firewall_internal_query(query: &str) -> bool {
     // CRITICAL: More precise check to prevent recursive loops
     // Check for actual table access patterns, not just string presence
     let lower = query.to_ascii_lowercase();
-    
+
     // Skip if it's accessing firewall tables
-    let has_table_keyword = lower.contains("from ") || 
-                            lower.contains("into ") || 
-                            lower.contains("update ") ||
-                            lower.contains("join ");
-    
+    let has_table_keyword = lower.contains("from ")
+        || lower.contains("into ")
+        || lower.contains("update ")
+        || lower.contains("join ");
+
     if !has_table_keyword {
         return false;
     }
-    
+
     // Check for specific firewall table names
-    lower.contains("sql_firewall_activity_log") ||
-    lower.contains("sql_firewall_command_approvals") ||
-    lower.contains("sql_firewall_query_fingerprints") ||
-    lower.contains("sql_firewall_regex_rules")
+    lower.contains("sql_firewall_activity_log")
+        || lower.contains("sql_firewall_command_approvals")
+        || lower.contains("sql_firewall_query_fingerprints")
+        || lower.contains("sql_firewall_regex_rules")
 }
 
 #[allow(dead_code)]

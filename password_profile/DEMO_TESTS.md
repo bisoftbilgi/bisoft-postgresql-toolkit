@@ -1,12 +1,3 @@
-# PASSWORD PROFILE - KAPSAMLI DEMO REHBERİ
-
-Bu rehber Password Profile extension'ın tüm özelliklerini PostgreSQL 16 üzerinde adım adım göstermeyi amaçlar. Extension, şifre güvenliği, hesap kilitleme, şifre geçmişi ve blacklist gibi kurumsal düzeyde parola politikalarını sağlar.
-
-## Sistem Gereksinimleri
-
-- PostgreSQL 16
-- `password_profile` extension (`shared_preload_libraries` içinde olmalı)
-- `sql_firewall_rs` extension (opsiyonel, demo için)
 
 ## Hazırlık
 
