@@ -4,21 +4,32 @@
 
 ```bash
 # Demo database ve kullanıcılar oluştur
-sudo -u postgres psql << 'SQL'
-DROP DATABASE IF EXISTS password_demo_db;
-CREATE DATABASE password_demo_db;
+# NOT: Background worker'lar aktif olduğu için DROP DATABASE takılabilir.
+# Bunun yerine veritabanını temizleyip yeniden kullanıyoruz.
 
-\c password_demo_db
+# Veritabanı yoksa oluştur
+sudo -u postgres psql -d postgres -c "SELECT 1 FROM pg_database WHERE datname = 'password_demo_db'" | grep -q 1 || sudo -u postgres createdb password_demo_db
 
+# Veritabanını temizle ve extensionları yükle
+sudo -u postgres psql -d password_demo_db << 'SQL'
 -- Extension yükle (tablolar otomatik oluşur)
 CREATE EXTENSION IF NOT EXISTS password_profile;
 CREATE EXTENSION IF NOT EXISTS sql_firewall_rs;
 
--- Test kullanıcıları
-CREATE ROLE alice WITH LOGIN PASSWORD 'SecurePass123!';
-CREATE ROLE bob WITH LOGIN PASSWORD 'StrongPass456!';
+-- Test kullanıcıları (eğer yoksa oluştur)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'alice') THEN
+        CREATE ROLE alice WITH LOGIN PASSWORD 'SecurePass123!';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'bob') THEN
+        CREATE ROLE bob WITH LOGIN PASSWORD 'StrongPass456!';
+    END IF;
+END
+$$;
 
 -- Demo tablosu
+DROP TABLE IF EXISTS company_data;
 CREATE TABLE company_data (id SERIAL PRIMARY KEY, data TEXT);
 INSERT INTO company_data VALUES (1, 'Confidential Information');
 GRANT SELECT ON company_data TO alice, bob;
@@ -107,10 +118,55 @@ PGPASSWORD='SecurePass123!' psql -h 127.0.0.1 -U alice -d password_demo_db -c "S
 
 ---
 
-## TEST 4: PASSWORD BLACKLIST
+## TEST 4: PASSWORD HISTORY (Son 5 Şifre Tekrar Kullanılamaz)
 
 ```bash
-echo "=== TEST 4: PASSWORD BLACKLIST ==="
+echo "=== TEST 4: PASSWORD HISTORY ==="
+
+# Test kullanıcısı oluştur
+sudo -u postgres psql -d password_demo_db << 'SQL'
+DROP ROLE IF EXISTS history_user;
+CREATE ROLE history_user WITH LOGIN PASSWORD 'FirstPassword123!';
+
+-- İlk şifreyi kaydet
+SELECT record_password_change('history_user', 'FirstPassword123!');
+
+-- Şifre değiştir ve kaydet
+ALTER ROLE history_user WITH PASSWORD 'SecondPassword456!';
+SELECT record_password_change('history_user', 'SecondPassword456!');
+
+-- Tekrar değiştir
+ALTER ROLE history_user WITH PASSWORD 'ThirdPassword789!';
+SELECT record_password_change('history_user', 'ThirdPassword789!');
+
+-- Password history'e bak
+SELECT username, changed_at FROM password_profile.password_history 
+WHERE username = 'history_user' 
+ORDER BY changed_at DESC 
+LIMIT 3;
+SQL
+
+echo ""
+echo "Eski şifreyi (FirstPassword123!) kullanmayı dene:"
+sudo -u postgres psql -d password_demo_db -c "ALTER ROLE history_user WITH PASSWORD 'FirstPassword123!';" 2>&1 | grep -E "ERROR|WARNING"
+
+echo ""
+echo "Yeni bir şifre (FourthPassword000!) kullan:"
+sudo -u postgres psql -d password_demo_db -c "ALTER ROLE history_user WITH PASSWORD 'FourthPassword000!'; SELECT 'Şifre değiştirildi!' as result;"
+```
+
+**Beklenen:**
+- ❌ Eski şifre (FirstPassword123!) → Password was used recently. Cannot reuse last 5 passwords
+- ✅ Yeni şifre (FourthPassword000!) → Başarılı
+
+**NOT:** `record_password_change()` fonksiyonu ile şifre değişikliklerini history'e kaydetmelisiniz.
+
+---
+
+## TEST 5: PASSWORD BLACKLIST
+
+```bash
+echo "=== TEST 5: PASSWORD BLACKLIST ==="
 
 # Yaygın şifreleri blacklist'e ekle
 sudo -u postgres psql -d password_demo_db << 'SQL'
@@ -134,34 +190,6 @@ sudo -u postgres psql -d password_demo_db -c "CREATE ROLE david WITH LOGIN PASSW
 **Beklenen:**
 - ❌ "Password123" → Password is blacklisted
 - ✅ "David2024!" → Başarılı
-
----
-
-## TEST 5: PASSWORD HISTORY (Şifre Tekrarı Engeli)
-
-```bash
-echo "=== TEST 5: PASSWORD HISTORY ==="
-
-# Bob'un mevcut şifresini kontrol et
-echo "Bob'un şifresini değiştir:"
-sudo -u postgres psql -d password_demo_db -c "ALTER ROLE bob PASSWORD 'NewBob2024!';"
-
-# Password history tablosunu kontrol et
-sudo -u postgres psql -d password_demo_db -c "SELECT username, changed_at FROM password_profile.password_history WHERE username='bob' ORDER BY changed_at DESC LIMIT 3;"
-
-# Aynı şifreyi tekrar kullanmayı dene
-echo ""
-echo "Son 5 şifreden birini tekrar kullanma denemesi:"
-sudo -u postgres psql -d password_demo_db -c "ALTER ROLE bob PASSWORD 'NewBob2024!';" 2>&1 | grep -E "ERROR|WARNING"
-
-# Farklı şifre ile başarılı olmalı
-sudo -u postgres psql -d password_demo_db -c "ALTER ROLE bob PASSWORD 'AnotherBob2024!';"
-```
-
-**Beklenen:**
-- ✅ İlk değişiklik başarılı
-- ❌ Aynı şifre → Password was recently used
-- ✅ Farklı şifre → Başarılı
 
 ---
 
@@ -213,10 +241,10 @@ PGPASSWORD='Charlie2024!' psql -h 127.0.0.1 -U charlie -d password_demo_db -c "S
 
 ---
 
-## TEST 7: HELPER FUNCTIONS
+## TEST 5: HELPER FUNCTIONS
 
 ```bash
-echo "=== TEST 7: HELPER FUNCTIONS ==="
+echo "=== TEST 5: HELPER FUNCTIONS ==="
 
 # is_user_locked kontrolü
 sudo -u postgres psql -d password_demo_db -c "SELECT is_user_locked('alice');"

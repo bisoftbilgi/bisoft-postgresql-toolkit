@@ -801,6 +801,20 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
         }
     }
 
+    // 8. Auto-record password change to history (if enabled)
+    if PASSWORD_HISTORY_COUNT.get() > 0 {
+        // Hash password with bcrypt (cost from GUC parameter)
+        let cost = BCRYPT_COST.get().clamp(4, 31) as u32;
+        if let Ok(pwd_hash) = hash(password, cost) {
+            // Insert into history (ignore errors to not block password change)
+            let _ = Spi::run_with_args(
+                "INSERT INTO password_profile.password_history (username, password_hash, changed_at) 
+                 VALUES ($1, $2, now())",
+                &[text_arg(username), text_arg(&pwd_hash)],
+            );
+        }
+    }
+
     Ok("Password accepted".to_string())
 }
 
