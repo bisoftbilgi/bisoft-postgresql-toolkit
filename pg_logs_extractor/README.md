@@ -24,6 +24,7 @@
 ```bash
 # 1) Install PostgreSQL server + contrib packages
 sudo dnf install postgresql17-server postgresql17-contrib -y
+sudo dnf install pgaudit_17
 
 # 2) Initialize the database cluster (creates data dir, default configs)
 sudo /usr/pgsql-17/bin/postgresql-17-setup initdb
