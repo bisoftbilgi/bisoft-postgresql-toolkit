@@ -137,7 +137,7 @@ filter {
   grok {
     match => {
       "message" => [
-        '^%{TIMESTAMP_ISO8601:log_time}\s+(?<tz>(?:[+-]\d{2}(?::?\d{2})?|UTC))\s+\[%{NUMBER:pid}\]\s+user=%{DATA:username},db=%{DATA:database_name}, client_ip=%{DATA:client_ip}\s+app=%{DATA:application_name}\s*LOG:\s+%{GREEDYDATA:pg_message}$'
+        '^%{TIMESTAMP_ISO8601:log_time}\s+(?<tz>(?:[+-]\d{2}(?::?\d{2})?|UTC))\s+\[%{NUMBER:pid}\]\s+user=%{DATA:username},db=%{DATA:database_name}, client_ip=%{DATA:client_ip}\s+app=%{DATA:application_name}\s*(?:LOG|ERROR|FATAL|DETAIL|STATEMENT):\s+%{GREEDYDATA:pg_message}$'
       ]
     }
     tag_on_failure => ["_grokparsefailure"]
@@ -195,7 +195,16 @@ filter {
 
       mutate { add_tag => ["connection_log"] }
     }
+    else if [pg_message] =~ /password authentication failed/ {
 
+      mutate { add_field => { "action" => "connection_failed" } }
+      mutate {
+        strip => ["username", "database_name", "client_ip", "action", "cluster_name", "server_name", "server_ip", "application_name"]
+        remove_field => ["log_time_full", "tz", "pid", "pg_message", "@version", "host", "event", "log", "message"]
+      }
+      mutate { add_tag => ["connection_log"] }
+
+    }
     # Route 2: Audit logs
     else if [pg_message] =~ /^AUDIT:/ {
 
