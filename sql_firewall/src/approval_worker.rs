@@ -38,11 +38,19 @@ pub unsafe extern "C" fn approval_worker_main(_arg: pg_sys::Datum) {
     set_status(WorkerStatus::Starting);
     wait_while_paused();
 
+    // Don't connect to specific database initially, will reconnect for each database
     // Start with default database from GUC
     let default_db = guc::approval_worker_database();
     let db_cstr = std::ffi::CString::new(default_db.as_str()).unwrap();
 
     BackgroundWorker::connect_worker_to_spi(Some(db_cstr.to_str().unwrap()), None);
+    
+    // Force SIGTERM to default handler (terminate process) to ensure clean shutdown
+    unsafe {
+        pg_sys::pqsignal(pg_sys::SIGTERM as i32, None);
+        pg_sys::BackgroundWorkerUnblockSignals();
+    }
+    
     set_status(WorkerStatus::Running);
 
     pgrx::log!(
@@ -65,56 +73,48 @@ pub unsafe extern "C" fn approval_worker_main(_arg: pg_sys::Datum) {
 
         // Process all pending approvals in queue
         while let Some(approval) = pending_approvals::dequeue() {
+            // Check for shutdown signal inside the loop
+            if BackgroundWorker::sigterm_received() {
+                pgrx::log!("sql_firewall: approval worker shutting down (during processing)");
+                break;
+            }
+
             processed = true;
 
             let role_name = pending_approvals::string_from_bytes(&approval.role_name);
             let command_type = pending_approvals::string_from_bytes(&approval.command_type);
             let database_name = pending_approvals::string_from_bytes(&approval.database_name);
 
-            if let (Some(role), Some(cmd), Some(db)) = (role_name, command_type, database_name) {
+            if let (Some(role), Some(cmd), Some(_db)) = (role_name, command_type, database_name) {
                 pgrx::log!(
-                    "sql_firewall: worker processing approval - role={}, command={}, db={}",
+                    "sql_firewall: worker processing approval - role={}, command={}",
                     role,
-                    cmd,
-                    db
+                    cmd
                 );
 
-                // Use dblink for cross-database INSERT
+                // Directly call SECURITY DEFINER function
+                // Note: Worker is connected to default database, approval table should exist there
                 let result = BackgroundWorker::transaction(|| {
-                    // Ensure dblink extension exists (one-time setup)
-                    let _ = Spi::run("CREATE EXTENSION IF NOT EXISTS dblink");
-                    
-                    // Build INSERT command
-                    let insert_sql = format!(
-                        "INSERT INTO public.sql_firewall_command_approvals \
-                         (role_name, command_type, is_approved) \
-                         VALUES ('{}', '{}', false) \
-                         ON CONFLICT (role_name, command_type) DO NOTHING",
-                        role.replace("'", "''"),  // Escape single quotes
+                    let query = format!(
+                        "SELECT public.sql_firewall_internal_upsert_approval('{}', '{}', false)",
+                        role.replace("'", "''"),
                         cmd.replace("'", "''")
                     );
                     
-                    // Execute via dblink
-                    let dblink_query = format!(
-                        "SELECT dblink_exec('dbname={}', $${}$$)",
-                        db.replace("'", "''"),
-                        insert_sql
-                    );
-                    
-                    Spi::run(&dblink_query)?;
+                    Spi::run(&query)?;
                     
                     Ok::<(), spi::Error>(())
                 });
 
                 if let Err(e) = result {
                     pgrx::warning!(
-                        "sql_firewall: worker failed to record approval for role={}, command={}, db={}: {:?}",
-                        role, cmd, db, e
+                        "sql_firewall: worker failed to record approval for role={}, command={}: {:?}",
+                        role, cmd, e
                     );
                 } else {
                     pgrx::log!(
-                        "sql_firewall: recorded approval to database '{}': role={}, command={}",
-                        db, role, cmd
+                        "sql_firewall: recorded approval: role={}, command={}",
+                        role, cmd
                     );
                 }
             } else {
@@ -126,6 +126,7 @@ pub unsafe extern "C" fn approval_worker_main(_arg: pg_sys::Datum) {
         if !processed {
             // Use wait_latch instead of thread::sleep for proper signal handling
             BackgroundWorker::wait_latch(Some(Duration::from_millis(100)));
+            check_for_interrupts!();
         }
     }
 
@@ -148,7 +149,7 @@ fn wait_while_paused() {
         if !pause_requested() || BackgroundWorker::sigterm_received() {
             break;
         }
-        thread::sleep(Duration::from_millis(200));
+        BackgroundWorker::wait_latch(Some(Duration::from_millis(200)));
     }
     set_status(WorkerStatus::Starting);
     if !BackgroundWorker::sigterm_received() {

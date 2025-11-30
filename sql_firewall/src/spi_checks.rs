@@ -45,11 +45,15 @@ pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) ->
         // Set temporary 100ms timeout to prevent ReDoS attacks
         let _ = spi_update(client, "SET LOCAL statement_timeout = 100", &[]);
 
+        let role = ctx.role.as_deref().unwrap_or("unknown");
         let result = match spi_select_one::<bool>(
             client,
             "SELECT EXISTS (SELECT 1 FROM public.sql_firewall_regex_rules \
-             WHERE is_active = true AND action = 'BLOCK' AND $1 ~* pattern LIMIT 1)",
-            &[text_arg(query)],
+             WHERE is_active = true AND action = 'BLOCK' \
+             AND $1 ~* pattern \
+             AND (allowed_roles IS NULL OR NOT ($2::text = ANY(allowed_roles))) \
+             LIMIT 1)",
+            &[text_arg(query), text_arg(role)],
         ) {
             Ok(result) => result.unwrap_or(false),
             Err(err) => {
@@ -80,12 +84,14 @@ pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) ->
     if matched {
         let reason = "Regex pattern match".to_string();
         log_activity(ctx, command, "BLOCKED", Some(&reason), query);
+        log_blocked_query(ctx, command, Some(&reason), query);
         Some("sql_firewall: Query blocked by security regex pattern.".to_string())
     } else {
         let normalized = query.to_ascii_lowercase();
         if matches_builtin_injection(&normalized) {
             let reason = "Built-in injection pattern match".to_string();
             log_activity(ctx, command, "BLOCKED", Some(&reason), query);
+            log_blocked_query(ctx, command, Some(&reason), query);
             Some("sql_firewall: Query matched default injection pattern.".to_string())
         } else {
             None
@@ -238,9 +244,7 @@ pub fn approval_requirement(
             let args = [name_arg(role), text_arg(command), bool_arg(is_approved)];
             spi_update(
                 client,
-                "INSERT INTO public.sql_firewall_command_approvals (role_name, command_type, is_approved) \
-                 VALUES ($1, $2, $3) \
-                 ON CONFLICT (role_name, command_type) DO NOTHING",
+                "SELECT public.sql_firewall_internal_upsert_approval($1, $2, $3)",
                 &args,
             )
         });
@@ -387,7 +391,17 @@ pub fn log_activity(
     reason: Option<&str>,
     query: &str,
 ) {
-    if !in_transaction() {
+    // Check if this is a blocked query
+    let is_blocked = action.starts_with("BLOCKED");
+    
+    // For blocked queries, always attempt to log regardless of transaction state
+    // For other activities, only log if in transaction
+    if !is_blocked && !in_transaction() {
+        return;
+    }
+
+    // Skip activity logging if disabled (but blocked queries are always logged)
+    if !is_blocked && !guc::enable_activity_logging() {
         return;
     }
 
@@ -430,18 +444,16 @@ pub fn log_activity(
         let args = [
             name_arg(role),
             name_arg(database),
-            text_arg(action),
-            reason_arg,
             text_arg(query),
-            text_arg(command),
             app_arg,
             client_arg,
+            text_arg(command),
+            text_arg(action),
+            reason_arg,
         ];
         if let Err(err) = spi_update(
             client,
-            "INSERT INTO public.sql_firewall_activity_log \
-             (role_name, database_name, action, reason, query_text, command_type, application_name, client_ip) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "SELECT public.sql_firewall_internal_log_activity($1, $2, $3, $4, $5, $6, $7, $8)",
             &args,
         ) {
             pgrx::warning!("sql_firewall: failed to log activity: {err}");
@@ -456,6 +468,47 @@ pub fn log_activity(
     }
 
     LOG_GUARD.with(|flag| flag.set(false));
+}
+
+fn log_blocked_query(ctx: &ExecutionContext, command: &str, reason: Option<&str>, query: &str) {
+    let role = ctx.role.as_deref().unwrap_or("unknown");
+    let database = ctx.database.as_deref().unwrap_or("unknown");
+    
+    pgrx::log!("sql_firewall: log_blocked_query called - role={}, command={}, reason={:?}", role, command, reason);
+    
+    // The SQL function sql_firewall_internal_log_blocked_query uses dblink
+    // to perform an autonomous transaction that survives rollback
+    Spi::connect_mut(|client| {
+        let reason_arg = reason
+            .map(text_arg)
+            .unwrap_or_else(|| DatumWithOid::null_oid(pg_sys::TEXTOID));
+        let app_arg = ctx
+            .application_name
+            .as_deref()
+            .map(text_arg)
+            .unwrap_or_else(|| DatumWithOid::null_oid(pg_sys::TEXTOID));
+        let client_arg = ctx
+            .client_addr
+            .as_deref()
+            .map(text_arg)
+            .unwrap_or_else(|| DatumWithOid::null_oid(pg_sys::TEXTOID));
+        let args = [
+            name_arg(role),
+            name_arg(database),
+            text_arg(query),
+            app_arg,
+            client_arg,
+            text_arg(command),
+            reason_arg,
+        ];
+        if let Err(err) = spi_update(
+            client,
+            "SELECT public.sql_firewall_internal_log_blocked_query($1, $2, $3, $4, $5, $6, $7)",
+            &args,
+        ) {
+            pgrx::warning!("sql_firewall: failed to log blocked query: {err}");
+        }
+    });
 }
 
 fn in_transaction() -> bool {
@@ -502,7 +555,11 @@ fn finalize_decision(
             reason,
             error,
         } => {
+            pgrx::log!("sql_firewall: Decision::Block - calling log functions");
             log_activity(ctx, command, action.as_ref(), reason.as_deref(), query);
+            pgrx::log!("sql_firewall: log_activity done");
+            log_blocked_query(ctx, command, reason.as_deref(), query);
+            pgrx::log!("sql_firewall: log_blocked_query done");
             Some(error)
         }
     }

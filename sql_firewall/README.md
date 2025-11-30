@@ -12,7 +12,7 @@ A production-ready SQL firewall extension for PostgreSQL 16 (compatible with 14-
 | **Policy Engine** | `firewall.rs`, `spi_checks.rs` | Applies security checks with transaction-safe logging, panic-safe guards, and improved internal query detection to prevent recursive loops. All SPI use is wrapped in guards that ensure proper transaction context. |
 | **Shared Memory** | `fingerprint_cache`, `rate_state`, `pending_approvals` | Cross-backend caches with deadlock-free SpinLock implementation and panic safety. Tracks normalized query fingerprints (4096 entries), rate-limit counters (512+1024 entries), and pending approvals (1024-entry ring buffer) without SPI overhead. |
 | **Background Worker** | `approval_worker` | Asynchronous worker that processes pending approvals from shared memory queue and persists them to database. Survives transaction rollbacks, enabling Learn mode to block commands while still recording approval requests. |
-| **Catalog Tables** | `sql_firewall_activity_log`, `sql_firewall_command_approvals`, `sql_firewall_query_fingerprints`, `sql_firewall_regex_rules` | Persist audit records, approvals, fingerprint metadata, and regex rules (installed via `sql/firewall_schema.sql`). Includes ReDoS validation trigger on regex_rules table. |
+| **Catalog Tables** | `sql_firewall_activity_log`, `sql_firewall_blocked_queries`, `sql_firewall_command_approvals`, `sql_firewall_query_fingerprints`, `sql_firewall_regex_rules` | Persist audit records, blocked query logs, approvals, fingerprint metadata, and regex rules (installed via `sql/firewall_schema.sql`). Includes ReDoS validation trigger on regex_rules table. Blocked queries are logged via **dblink** autonomous transactions that survive main transaction abort. |
 | **Alerting** | `alerts.rs` | Optional `NOTIFY` + syslog payloads whenever a block happens (regex, keyword, quiet hours, rate limit, approvals). |
 | **Tooling** | `run_comprehensive_tests.sh`, `run_advanced_tests.sh` | Comprehensive test suites that provision throwaway databases and validate all features. Currently 15/15 tests passing with full coverage of security, performance, and edge cases. |
 
@@ -26,9 +26,10 @@ All policy decisions happen synchronously inside the backend with panic-safe gua
 - **Command approvals** – role-based authorization for command types (SELECT, INSERT, UPDATE, DELETE, DDL). Admin approval required in learn mode.
 - **Adaptive fingerprints** – normalized SQL fingerprints with shared memory caching and auto-approval after threshold (configurable, default 10 hits).
 - **Shared-memory rate limits** – global per-role window plus per-command budgets (SELECT/INSERT/UPDATE/DELETE) with deadlock-free SpinLock implementation.
-- **Regex & keyword filters** – SQL injection pattern matching with 100ms ReDoS timeout protection. Validation trigger prevents dangerous patterns.
+- **Regex & keyword filters** – SQL injection pattern matching with 100ms ReDoS timeout protection. Validation trigger prevents dangerous patterns. **Per-user exemptions** supported via `allowed_roles` column in `sql_firewall_regex_rules` table.
 - **Quiet hours** – time-based access restrictions with panic-safe logging (no SPI recursion).
-- **Activity logging** – transaction-safe 3-layer logging (WARNING + LOG + syslog) that survives abort scenarios.
+- **Activity logging** – transaction-safe 3-layer logging (WARNING + LOG + syslog) that survives abort scenarios. Blocked queries are logged to dedicated `sql_firewall_blocked_queries` table using autonomous transactions (dblink).
+- **Activity log control** – `sql_firewall.enable_activity_logging` GUC to toggle activity logging on/off. Blocked queries are always logged regardless of this setting.
 - **Connection policies** – IP blocking, application filtering, and role-IP binding with race condition prevention.
 - **Alert channels** – NOTIFY payloads + optional syslog mirroring for SIEM integration.
 - **Retention jobs** – automatic pruning of activity logs and fingerprint tables.
@@ -99,10 +100,11 @@ All knobs live under `sql_firewall.*` and may be set via `ALTER SYSTEM`, `postgr
 | | `sql_firewall.alert_channel` | `sql_firewall_alerts` | Channel name for LISTEN/NOTIFY. |
 | | `sql_firewall.syslog_alerts` | `off` | Mirror alerts to syslog for SIEM. |
 | **Background Worker** | `sql_firewall.approval_worker_database` | `postgres` | Default database for background worker. Worker uses **dblink** to write approvals to the actual database where commands were blocked, supporting multi-database environments with a single worker. Requires PostgreSQL restart to change. |
+| **Activity Logging** | `sql_firewall.enable_activity_logging` | `on` | Master toggle for activity logging. When enabled, allowed queries are logged to `sql_firewall_activity_log`. Blocked queries are always logged to `sql_firewall_blocked_queries` regardless of this setting. |
 | **Retention** | `sql_firewall.activity_log_retention_days` | `30` | Age cutoff for log pruning. |
 | | `sql_firewall.activity_log_max_rows` | `1000000` | Row count target before pruning. |
 
-Activity logging itself is always enabled outside quiet hours; quiet-hour suppression avoids SPI recursion.
+Quiet-hour suppression uses WARNING logs to avoid SPI recursion.
 
 **Note:** The background approval worker supports **multi-database environments**. When a command is blocked in any database, the worker automatically writes the approval record to that specific database using PostgreSQL's `dblink` extension. The `approval_worker_database` setting is only used as the worker's initial connection point.
 
@@ -136,10 +138,29 @@ Activity logging itself is always enabled outside quiet hours; quiet-hour suppre
 - **Per-command** – `command_limit_seconds` plus the `*_limit_count` knobs constrain SELECT/INSERT/UPDATE/DELETE independently.
 - Counters live in shared memory (`rate_state`), so enforcement is constant-time and does not hit the catalogs.
 
-### 6.5 Alerts & Retention
+### 6.5 Blocked Query Logging
+- **Dedicated table** – All blocked queries are logged to `sql_firewall_blocked_queries` with full context: role, database, query text, command type, reason, timestamp, client IP, and application name.
+- **Autonomous transactions** – Uses PostgreSQL's `dblink` extension to perform autonomous transactions that survive even when the main query transaction is aborted due to blocking.
+- **Always enabled** – Blocked query logging is independent of `sql_firewall.enable_activity_logging` setting and cannot be disabled.
+- **Query blocked queries**: `SELECT * FROM sql_firewall_blocked_queries ORDER BY blocked_at DESC LIMIT 10;`
+
+### 6.6 Per-User Regex Exemptions
+- The `sql_firewall_regex_rules` table includes an `allowed_roles name[]` column for fine-grained control.
+- **NULL allowed_roles** – Rule applies to all users (blocks everyone matching the pattern).
+- **Specified allowed_roles** – Only users NOT in the array are blocked; users in the array are exempt.
+- **Example**: Pattern `DROP\s+TABLE` with `allowed_roles = ARRAY['postgres']` blocks DROP TABLE for all users except postgres.
+- **Insert exemption rule**: `INSERT INTO sql_firewall_regex_rules (pattern, action, description, allowed_roles) VALUES ('dangerous_pattern', 'BLOCK', 'Description', ARRAY['admin_user']::name[]);`
+
+### 6.7 Activity Logging Control
+- **Toggle activity logging** – Set `sql_firewall.enable_activity_logging = off` to disable logging of allowed queries to `sql_firewall_activity_log`.
+- **Blocked queries** – Always logged to `sql_firewall_blocked_queries` regardless of activity logging setting.
+- **Use case** – Reduce log volume in high-traffic environments while maintaining security audit trail of blocked attempts.
+- **Control via SQL**: `ALTER SYSTEM SET sql_firewall.enable_activity_logging = off; SELECT pg_reload_conf();`
+
+### 6.8 Alerts & Retention
 - Set `sql_firewall.enable_alert_notifications = on`, `LISTEN sql_firewall_alerts;`, and consume JSON payloads describing each block.
 - Optional `sql_firewall.syslog_alerts = on` mirrors the same payload into syslog for SIEM pipelines.
-- Retention knobs keep `sql_firewall_activity_log` and fingerprint tables trimmed according to compliance needs.
+- Retention knobs keep `sql_firewall_activity_log`, `sql_firewall_blocked_queries`, and fingerprint tables trimmed according to compliance needs.
 
 ---
 ## 7. Testing & Validation
@@ -184,5 +205,7 @@ Advanced tests available via `run_advanced_tests.sh` for stress testing and edge
 | Race condition on fingerprint updates | Concurrent hit_count updates lost. | Fixed: Uses SELECT FOR UPDATE to prevent race conditions. |
 | Activity log empty | Quiet hours active or table privileges altered. | Disable quiet hours for the test or restore INSERT privileges on `sql_firewall_activity_log`. |
 | Regex tests miss `'1'='1'` | Patterns missing quoted tautologies. | Insert additional regex rows (e.g., `(?i)or\s*'1'\s*=\s*'1'`). |
+| Blocked queries not logged | Transaction abort rolls back INSERT. | Fixed: Uses dblink for autonomous transactions that survive abort. Requires dblink extension. |
+| Regex exemptions not working | Incorrect `allowed_roles` logic. | Fixed: `allowed_roles` array now properly exempts specified users from blocking. |
 
 If problems persist, capture PostgreSQL logs plus `run_comprehensive_tests.sh` output when filing an issue.

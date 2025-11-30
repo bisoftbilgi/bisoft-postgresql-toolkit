@@ -52,6 +52,7 @@ pub static APPROVAL_WORKER_DATABASE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 pub static ACTIVITY_LOG_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 pub static ACTIVITY_LOG_PRUNE_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(300);
+pub static ENABLE_ACTIVITY_LOGGING: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 pub fn register() {
     GucRegistry::define_enum_guc(
@@ -369,6 +370,14 @@ pub fn register() {
             GucContext::Suset,
             GucFlags::default(),
         );
+        GucRegistry::define_bool_guc(
+            cstr(b"sql_firewall.enable_activity_logging\0"),
+            cstr(b"Enable logging of firewall activity to activity_log table.\0"),
+            cstr(b"Set to false to disable activity logging (blocked queries are always logged). Default: true.\0"),
+            &ENABLE_ACTIVITY_LOGGING,
+            GucContext::Suset,
+            GucFlags::default(),
+        );
     }
 }
 
@@ -545,6 +554,10 @@ pub fn activity_log_max_rows() -> i64 {
 
 pub fn activity_log_prune_interval_seconds() -> i32 {
     ACTIVITY_LOG_PRUNE_INTERVAL.get()
+}
+
+pub fn enable_activity_logging() -> bool {
+    ENABLE_ACTIVITY_LOGGING.get()
 }
 
 fn cstr(bytes: &'static [u8]) -> &'static CStr {
