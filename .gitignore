@@ -1,5 +1,6 @@
 *.tar.gz
 
-# Benchmark results
+# Benchmark results and scripts
+sql_firewall/benchmarks/
 benchmark_results_*/
 *.log
