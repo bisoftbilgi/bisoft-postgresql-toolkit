@@ -4,6 +4,7 @@ use pgrx::prelude::*;
 use std::time::Duration;
 
 mod alerts;
+mod approval_cache;
 mod approval_worker;
 mod context;
 mod fingerprint_cache;
@@ -11,6 +12,7 @@ mod fingerprints;
 mod firewall;
 mod guc;
 mod hooks;
+mod launcher;
 mod pending_approvals;
 mod port;
 mod rate_state;
@@ -19,6 +21,7 @@ mod sql;
 mod structured_log;
 
 pub use approval_worker::approval_worker_main;
+pub use launcher::firewall_launcher_main;
 
 pgrx::pg_module_magic!();
 pgrx::extension_sql_file!("../sql/firewall_schema.sql", name = "firewall_schema");
@@ -28,6 +31,8 @@ static mut PREV_SHMEM_STARTUP_HOOK: Option<unsafe extern "C-unwind" fn()> = None
 
 #[pgrx::pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    pgrx::warning!("🚀 DEBUG: sql_firewall_rs _PG_init called - ENTRY POINT");
+    
     unsafe {
         PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
         pg_sys::shmem_request_hook = Some(shmem_request_hook);
@@ -36,19 +41,22 @@ pub extern "C-unwind" fn _PG_init() {
         pg_sys::shmem_startup_hook = Some(shmem_startup_hook);
     }
 
-    // Register background worker for processing pending approvals
-    BackgroundWorkerBuilder::new("sql_firewall_approval_worker")
-        .set_function("approval_worker_main")
-        .set_library("sql_firewall_rs") // MUST match Cargo.toml [package] name
-        .set_argument(None::<i32>.into_datum())
-        .set_restart_time(Some(Duration::from_secs(1)))
-        .enable_spi_access()
-        .load();
-    pgrx::info!("sql_firewall: approval worker background worker registered");
-
+    pgrx::warning!("🚀 DEBUG: registering GUCs");
     guc::register();
+    
+    pgrx::warning!("🚀 DEBUG: installing hooks NOW");
     hooks::install();
-    pgrx::log!("sql_firewall_rs: extension loaded");
+    
+    // Start launcher worker
+    pgrx::warning!("🚀 DEBUG: Starting launcher registration...");
+    BackgroundWorkerBuilder::new("sql_firewall_launcher")
+        .set_function("firewall_launcher_main")
+        .set_library("sql_firewall_rs")
+        .enable_spi_access()
+        .set_start_time(pgrx::bgworkers::BgWorkerStartTime::RecoveryFinished)
+        .load();
+    
+    pgrx::warning!("✅ DEBUG: sql_firewall_rs loaded - HOOKS SHOULD BE ACTIVE");
 }
 
 #[pgrx::pg_guard]
@@ -68,6 +76,7 @@ unsafe extern "C-unwind" fn shmem_request_hook() {
     if let Some(prev) = PREV_SHMEM_REQUEST_HOOK {
         prev();
     }
+    pg_sys::RequestAddinShmemSpace(approval_cache::shared_memory_bytes());
     pg_sys::RequestAddinShmemSpace(fingerprint_cache::shared_memory_bytes());
     pg_sys::RequestAddinShmemSpace(rate_state::shared_memory_bytes());
     pg_sys::RequestAddinShmemSpace(pending_approvals::shared_memory_bytes());
@@ -78,6 +87,7 @@ unsafe extern "C-unwind" fn shmem_startup_hook() {
     if let Some(prev) = PREV_SHMEM_STARTUP_HOOK {
         prev();
     }
+    approval_cache::initialize();
     fingerprint_cache::init();
     rate_state::init();
     pending_approvals::init();
@@ -126,6 +136,8 @@ fn sql_firewall_resume_approval_worker() -> String {
 fn sql_firewall_approval_worker_status() -> String {
     approval_worker::worker_status().as_str().to_string()
 }
+
+
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]

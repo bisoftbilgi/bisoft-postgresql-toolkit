@@ -8,8 +8,8 @@
 // Queue contains database_name, worker reconnects to appropriate database
 // for each approval.
 
-use crate::guc;
 use crate::pending_approvals;
+use crate::sql::{bool_arg, name_arg, text_arg};
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
@@ -38,12 +38,33 @@ pub unsafe extern "C" fn approval_worker_main(_arg: pg_sys::Datum) {
     set_status(WorkerStatus::Starting);
     wait_while_paused();
 
-    // Don't connect to specific database initially, will reconnect for each database
-    // Start with default database from GUC
-    let default_db = guc::approval_worker_database();
-    let db_cstr = std::ffi::CString::new(default_db.as_str()).unwrap();
-
-    BackgroundWorker::connect_worker_to_spi(Some(db_cstr.to_str().unwrap()), None);
+    // 🔥 FIX: Read OID from bgw_extra (set by Launcher), IGNORE GUC!
+    let target_oid = unsafe {
+        let bgw = pg_sys::MyBgworkerEntry;
+        if bgw.is_null() {
+            pgrx::error!("sql_firewall: worker MyBgworkerEntry is null!");
+        }
+        
+        let extra_ptr = (*bgw).bgw_extra.as_ptr();
+        let extra_cstr = std::ffi::CStr::from_ptr(extra_ptr);
+        let extra_str = extra_cstr.to_string_lossy();
+        
+        pgrx::log!("sql_firewall: worker reading bgw_extra: '{}'", extra_str);
+        
+        match extra_str.parse::<u32>() {
+            Ok(oid_u32) => {
+                let oid = pg_sys::Oid::from(oid_u32);
+                pgrx::log!("sql_firewall: worker connecting to DB OID: {}", oid);
+                pg_sys::BackgroundWorkerInitializeConnectionByOid(oid, pg_sys::InvalidOid, 0);
+                oid_u32
+            }
+            Err(e) => {
+                pgrx::error!("sql_firewall: worker failed to parse OID from bgw_extra '{}': {}", extra_str, e);
+            }
+        }
+    };
+    
+    pgrx::log!("sql_firewall: worker connected to DB OID: {}", target_oid);
     
     // Force SIGTERM to default handler (terminate process) to ensure clean shutdown
     unsafe {
@@ -53,11 +74,27 @@ pub unsafe extern "C" fn approval_worker_main(_arg: pg_sys::Datum) {
     
     set_status(WorkerStatus::Running);
 
-    pgrx::log!(
-        "sql_firewall: approval worker started (default database: {})",
-        default_db
-    );
-    pgrx::log!("sql_firewall: worker will process approvals for all databases in queue");
+    pgrx::log!("sql_firewall: approval worker started (launcher-based, processes all databases)");
+
+    // 🛡️ SECURITY CHECK: Is SQL Firewall extension installed in this database?
+    let is_extension_active: Result<bool, spi::Error> = BackgroundWorker::transaction(|| {
+        let exists = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pg_extension WHERE extname = 'sql_firewall_rs'"
+        );
+        Ok(exists.unwrap_or(Some(0)).unwrap_or(0) > 0)
+    });
+    
+    if !is_extension_active.unwrap_or(false) {
+        pgrx::log!("sql_firewall: Extension NOT installed in DB OID {}. Worker exiting gracefully.", target_oid);
+        return;
+    }
+    
+    pgrx::log!("sql_firewall: Extension found active in DB OID {}. Shield ON 🛡️", target_oid);
+
+    // Initialize cursor to current write position (start reading from now)
+    // Alternatively: start from 0 to process all existing events
+    let mut my_cursor = pending_approvals::get_write_pos();
+    pgrx::log!("sql_firewall: worker cursor initialized at {}", my_cursor);
 
     loop {
         if BackgroundWorker::sigterm_received() {
@@ -69,62 +106,194 @@ pub unsafe extern "C" fn approval_worker_main(_arg: pg_sys::Datum) {
             break;
         }
 
-        let mut processed = false;
+        let current_write_pos = pending_approvals::get_write_pos();
 
-        // Process all pending approvals in queue
-        while let Some(approval) = pending_approvals::dequeue() {
-            // Check for shutdown signal inside the loop
-            if BackgroundWorker::sigterm_received() {
-                pgrx::log!("sql_firewall: approval worker shutting down (during processing)");
-                break;
-            }
-
-            processed = true;
-
-            let role_name = pending_approvals::string_from_bytes(&approval.role_name);
-            let command_type = pending_approvals::string_from_bytes(&approval.command_type);
-            let database_name = pending_approvals::string_from_bytes(&approval.database_name);
-
-            if let (Some(role), Some(cmd), Some(_db)) = (role_name, command_type, database_name) {
-                pgrx::log!(
-                    "sql_firewall: worker processing approval - role={}, command={}",
-                    role,
-                    cmd
+        // Check if we have new events to process
+        if my_cursor < current_write_pos {
+            // Backpressure protection: if we're too far behind, skip lost events
+            let buffer_size = pending_approvals::get_capacity() as u64;
+            if current_write_pos - my_cursor > buffer_size {
+                pgrx::warning!(
+                    "sql_firewall: worker too slow! Skipping {} lost events.",
+                    current_write_pos - my_cursor - buffer_size
                 );
-
-                // Directly call SECURITY DEFINER function
-                // Note: Worker is connected to default database, approval table should exist there
-                let result = BackgroundWorker::transaction(|| {
-                    let query = format!(
-                        "SELECT public.sql_firewall_internal_upsert_approval('{}', '{}', false)",
-                        role.replace("'", "''"),
-                        cmd.replace("'", "''")
-                    );
-                    
-                    Spi::run(&query)?;
-                    
-                    Ok::<(), spi::Error>(())
-                });
-
-                if let Err(e) = result {
-                    pgrx::warning!(
-                        "sql_firewall: worker failed to record approval for role={}, command={}: {:?}",
-                        role, cmd, e
-                    );
-                } else {
-                    pgrx::log!(
-                        "sql_firewall: recorded approval: role={}, command={}",
-                        role, cmd
-                    );
-                }
-            } else {
-                pgrx::warning!("sql_firewall: worker failed to decode approval - role_name or command_type is None");
+                my_cursor = current_write_pos - buffer_size;
             }
-        }
 
-        // Sleep if no work was done
-        if !processed {
-            // Use wait_latch instead of thread::sleep for proper signal handling
+            // Process events from cursor to current write position
+            while my_cursor < current_write_pos {
+                // Check for shutdown signal inside the loop
+                if BackgroundWorker::sigterm_received() {
+                    pgrx::log!("sql_firewall: approval worker shutting down (during processing)");
+                    break;
+                }
+
+                // Read event at current cursor position
+                let event = match pending_approvals::read_at_index(my_cursor) {
+                    Some(e) => e,
+                    None => {
+                        my_cursor += 1;
+                        continue;
+                    }
+                };
+
+                // Process event based on type (launcher processes all databases)
+                match event.event_type {
+                pending_approvals::EventType::Approval => unsafe {
+                    let approval_data = &event.data.approval;
+                    let role_name = pending_approvals::string_from_bytes(&approval_data.role_name);
+                    let command_type = pending_approvals::string_from_bytes(&approval_data.command_type);
+                    let database_name = pending_approvals::string_from_bytes(&approval_data.database_name);
+
+                    if let (Some(role), Some(cmd), Some(_db)) = (role_name, command_type, database_name) {
+                        pgrx::log!(
+                            "sql_firewall: worker processing approval - role={}, command={}",
+                            role,
+                            cmd
+                        );
+
+                        // Directly call SECURITY DEFINER function
+                        // Note: Worker is connected to default database, approval table should exist there
+                        let result = BackgroundWorker::transaction(|| {
+                            // SECURITY FIX: Use prepared statement instead of string formatting
+                            Spi::run_with_args(
+                                "SELECT public.sql_firewall_internal_upsert_approval($1, $2, $3)",
+                                &[
+                                    name_arg(&role),
+                                    text_arg(&cmd),
+                                    bool_arg(approval_data.is_approved),
+                                ]
+                            )?;
+                            
+                            Ok::<(), spi::Error>(())
+                        });
+
+                        if let Err(e) = result {
+                            pgrx::warning!(
+                                "sql_firewall: worker failed to record approval for role={}, command={}: {:?}",
+                                role, cmd, e
+                            );
+                        } else {
+                            pgrx::log!(
+                                "sql_firewall: recorded approval: role={}, command={}, is_approved={}",
+                                role, cmd, approval_data.is_approved
+                            );
+                        }
+                    } else {
+                        pgrx::warning!("sql_firewall: worker failed to decode approval - role_name or command_type is None");
+                    }
+                },
+                pending_approvals::EventType::BlockedQuery => unsafe {
+                    let blocked_data = &event.data.blocked_query;
+                    let role_name = pending_approvals::string_from_bytes(&blocked_data.role_name);
+                    let database_name = pending_approvals::string_from_bytes(&blocked_data.database_name);
+                    let query = pending_approvals::string_from_bytes(&blocked_data.query);
+                    let app_name = pending_approvals::string_from_bytes(&blocked_data.application_name);
+                    let client_addr = pending_approvals::string_from_bytes(&blocked_data.client_addr);
+                    let command_type = pending_approvals::string_from_bytes(&blocked_data.command_type);
+                    let reason = pending_approvals::string_from_bytes(&blocked_data.reason);
+
+                    if let (Some(role), Some(db), Some(q), Some(app), Some(cmd), Some(rsn)) = 
+                        (role_name, database_name, query, app_name, command_type, reason) {
+                        
+                        pgrx::log!("sql_firewall: worker processing blocked query: role={}, db={}, cmd={}", role, db, cmd);
+                        
+                        use crate::sql::text_arg;
+                        
+                        pgrx::log!("sql_firewall: worker preparing blocked query INSERT");
+                        
+                        // MUST use BackgroundWorker::transaction for SPI operations in background worker
+                        let result = BackgroundWorker::transaction(|| {
+                            // Real schema: query_text, username, database_name, client_info, block_reason
+                            let query_sql = 
+                                "INSERT INTO firewall.blocked_queries 
+                                 (query_text, username, database_name, client_info, block_reason) 
+                                 VALUES ($1, $2, $3, $4, $5)";
+                            
+                            // Build client_info string
+                            let client_info = if let Some(addr) = client_addr {
+                                format!("app={}, addr={}", app, addr)
+                            } else {
+                                format!("app={}", app)
+                            };
+                            
+                            // Build block_reason string
+                            let block_reason = format!("command={}, reason={}", cmd, rsn);
+                            
+                            pgrx::log!("sql_firewall: worker executing INSERT");
+                            
+                            // Use Spi::run_with_args inside BackgroundWorker::transaction
+                            Spi::run_with_args(
+                                query_sql, 
+                                &[
+                                    text_arg(&q),
+                                    text_arg(&role),
+                                    text_arg(&db),
+                                    text_arg(&client_info),
+                                    text_arg(&block_reason),
+                                ]
+                            )
+                        });
+
+                        match result {
+                            Ok(_) => {
+                                pgrx::log!("sql_firewall: successfully logged blocked query");
+                            },
+                            Err(e) => {
+                                pgrx::warning!("sql_firewall: worker failed to insert blocked query: {:?}", e);
+                            }
+                        }
+                    } else {
+                        pgrx::warning!("sql_firewall: worker failed to decode blocked query - missing required fields");
+                    }
+                },
+                pending_approvals::EventType::FingerprintHit => unsafe {
+                    let fp_data = &event.data.fingerprint_hit;
+                    let fingerprint = pending_approvals::string_from_bytes(&fp_data.fingerprint_hex);
+                    let normalized = pending_approvals::string_from_bytes(&fp_data.normalized_query);
+                    let role_name = pending_approvals::string_from_bytes(&fp_data.role_name);
+                    let command_type = pending_approvals::string_from_bytes(&fp_data.command_type);
+                    let sample_query = pending_approvals::string_from_bytes(&fp_data.sample_query);
+
+                    if let (Some(fp), Some(norm), Some(role), Some(cmd), Some(sample)) = 
+                        (fingerprint, normalized, role_name, command_type, sample_query) {
+                        pgrx::log!("sql_firewall: worker recording fingerprint hit - fp={}", fp);
+
+                        // SECURITY FIX: Use prepared statement for fingerprint recording
+                        let result = BackgroundWorker::transaction(|| {
+                            Spi::run_with_args(
+                                "INSERT INTO public.sql_firewall_query_fingerprints 
+                                 (fingerprint, normalized_query, role_name, command_type, sample_query, first_seen_at, last_seen_at, hit_count, is_approved)
+                                 VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1, true)
+                                 ON CONFLICT (fingerprint, role_name, command_type) 
+                                 DO UPDATE SET 
+                                   last_seen_at = CURRENT_TIMESTAMP,
+                                   hit_count = sql_firewall_query_fingerprints.hit_count + 1",
+                                &[
+                                    text_arg(&fp),
+                                    text_arg(&norm),
+                                    name_arg(&role),
+                                    text_arg(&cmd),
+                                    text_arg(&sample),
+                                ]
+                            )?;
+                            Ok::<(), spi::Error>(())
+                        });
+
+                        if let Err(e) = result {
+                            pgrx::warning!("sql_firewall: worker failed to record fingerprint: {:?}", e);
+                        } else {
+                            pgrx::log!("sql_firewall: worker recorded fingerprint - fp={}", fp);
+                        }
+                    }
+                },
+            }
+
+            // Advance cursor after processing event
+            my_cursor += 1;
+            }
+        } else {
+            // No new events - sleep briefly
             BackgroundWorker::wait_latch(Some(Duration::from_millis(100)));
             check_for_interrupts!();
         }
@@ -206,3 +375,7 @@ pub fn wait_for_worker_states(targets: &[WorkerStatus], timeout: Duration) -> bo
     }
     false
 }
+
+// Note: Launcher-based worker doesn't need liveness check
+// Worker is managed by launcher lifecycle
+

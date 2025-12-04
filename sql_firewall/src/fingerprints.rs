@@ -3,7 +3,7 @@ use crate::{
     fingerprint_cache::{self, CacheState},
     guc::{self, FirewallMode},
     spi_checks,
-    sql::{name_arg, spi_update, text_arg},
+    sql::{name_arg, text_arg},
 };
 use pgrx::{
     pg_sys,
@@ -79,30 +79,47 @@ pub fn enforce(
         }
     }
 
-    let Some((raw_hit_count, is_approved)) =
-        record_fingerprint_hit(&fingerprint_hex, &summary, role, command)
-    else {
-        // Fail open if catalog write failed
-        return None;
+    let fingerprint_exists = record_fingerprint_hit(&fingerprint_hex, &summary, role, command);
+    
+    let (hit_count, mut approved) = match fingerprint_exists {
+        Some((raw_hit, is_app)) => (raw_hit.max(1), is_app),
+        None => (1, false),  // New fingerprint, not approved yet
     };
-    let hit_count = raw_hit_count.max(1);
 
-    let mut approved = is_approved;
-    // Fingerprint learning only in Learn mode
+    // PHASE 3: Learn mode auto-approves via ASYNC worker queue (ZERO LATENCY)
     if !approved && mode == FirewallMode::Learn {
-        let threshold = guc::fingerprint_learn_threshold().max(1);
-        if hit_count >= threshold {
-            if promote_fingerprint(&fingerprint_hex, role, command) {
-                approved = true;
-                spi_checks::log_activity(
-                    ctx,
-                    command,
-                    "LEARNED (FINGERPRINT AUTO)",
-                    Some("Threshold reached, auto-approved"),
-                    query,
-                );
-            }
+        // Immediately mark as approved in cache (zero latency)
+        approved = true;
+        
+        // Enqueue fingerprint to worker for DB persistence (async)
+        let enqueued = crate::pending_approvals::enqueue_fingerprint(
+            &fingerprint_hex,
+            &summary.normalized,
+            role,
+            command,
+            &summary.sample,
+            true, // is_approved = true (auto-approved in learn mode)
+        );
+        
+        if !enqueued {
+            pgrx::warning!(
+                "sql_firewall: Learn mode - failed to enqueue fingerprint (ring buffer full): fp={}, role={}",
+                fingerprint_hex, role
+            );
+        } else {
+            pgrx::debug1!(
+                "sql_firewall: Learn mode - fingerprint queued for async approval: fp={}, role={}, command={}",
+                fingerprint_hex, role, command
+            );
         }
+        
+        spi_checks::log_activity(
+            ctx,
+            command,
+            "LEARNED (FINGERPRINT AUTO)",
+            Some("Learn mode - fingerprint auto-approved"),
+            query,
+        );
     }
 
     let cache_state = if approved {
@@ -126,18 +143,13 @@ pub fn enforce(
 
     match mode {
         FirewallMode::Learn => {
-            // Learn mode now blocks unapproved commands and waits for admin approval
-            spi_checks::log_activity(
-                ctx,
-                command,
-                "BLOCKED (LEARN)",
-                Some("Fingerprint pending approval"),
-                query,
-            );
-            Some(format!(
-                "sql_firewall: Fingerprint '{}' for role '{}' is pending approval (Learn mode).",
+            // PHASE 2: Learn mode should NEVER reach here (all fingerprints auto-approved above)
+            // This is a defensive fallback
+            pgrx::warning!(
+                "sql_firewall: Learn mode fingerprint not approved - this should not happen! fp={}, role={}",
                 fingerprint_hex, role
-            ))
+            );
+            None // Allow in Learn mode even if something went wrong
         }
         FirewallMode::Permissive => {
             spi_checks::log_activity(
@@ -150,6 +162,23 @@ pub fn enforce(
             None
         }
         FirewallMode::Enforce => {
+            // PHASE 2: Enqueue pending fingerprint to worker for admin review
+            let enqueued = crate::pending_approvals::enqueue_fingerprint(
+                &fingerprint_hex,
+                &summary.normalized,
+                role,
+                command,
+                query,
+                false, // is_approved = false (pending admin approval)
+            );
+            
+            if !enqueued {
+                pgrx::warning!(
+                    "sql_firewall: Failed to enqueue pending fingerprint (ring buffer full): fp={}, role={}",
+                    fingerprint_hex, role
+                );
+            }
+            
             spi_checks::log_activity(
                 ctx,
                 command,
@@ -157,9 +186,12 @@ pub fn enforce(
                 Some("Fingerprint pending approval"),
                 query,
             );
+            
             Some(format!(
-                "sql_firewall: Fingerprint '{}' for role '{}' is pending approval.",
-                fingerprint_hex, role
+                "sql_firewall: Fingerprint '{}' for role '{}' is pending approval. \
+                 Admin can approve via: UPDATE sql_firewall_query_fingerprints SET is_approved=true \
+                 WHERE fingerprint='{}' AND role_name='{}'",
+                fingerprint_hex, role, fingerprint_hex, role
             ))
         }
     }
@@ -167,44 +199,29 @@ pub fn enforce(
 
 fn record_fingerprint_hit(
     fingerprint_hex: &str,
-    summary: &FingerprintSummary,
+    _summary: &FingerprintSummary,
     role: &str,
     command: &str,
 ) -> Option<(i32, bool)> {
+    // SIMPLIFIED: Only read existing fingerprint, no INSERT/UPDATE
+    // Worker will handle persistence via enqueue_fingerprint()
     Spi::connect_mut(|client| {
-        let upsert_args = [
-            text_arg(fingerprint_hex),
-            text_arg(&summary.normalized),
-            name_arg(role),
-            text_arg(command),
-            text_arg(&summary.sample),
-        ];
-
-        // Use SECURITY DEFINER function to bypass PUBLIC permission restrictions
-        // is_approved is set to false for new fingerprints (require explicit approval)
-        if let Err(err) = spi_update(
-            client,
-            "SELECT public.sql_firewall_internal_upsert_fingerprint($1, $2, $3, $4, $5, false)",
-            &upsert_args,
-        ) {
-            pgrx::warning!("sql_firewall: fingerprint upsert failed: {err}");
-            return None;
-        }
-
         match client.select(
-            // CRITICAL: Use SELECT FOR UPDATE to prevent race condition
-            // This ensures concurrent updates don't cause lost hit counts
             "SELECT hit_count, is_approved
              FROM public.sql_firewall_query_fingerprints
-             WHERE fingerprint = $1 AND role_name = $2 AND command_type = $3
-             FOR UPDATE",
+             WHERE fingerprint = $1 AND role_name = $2 AND command_type = $3",
             Some(1),
             &[text_arg(fingerprint_hex), name_arg(role), text_arg(command)],
         ) {
             Ok(table) => extract_hit_row(table),
             Err(err) => {
-                pgrx::warning!("sql_firewall: fingerprint fetch failed: {err}");
-                None
+                // Table doesn't exist or query failed - return None (new fingerprint)
+                if err.to_string().contains("does not exist") {
+                    None
+                } else {
+                    pgrx::warning!("sql_firewall: fingerprint fetch failed: {err}");
+                    None
+                }
             }
         }
     })
@@ -223,25 +240,6 @@ fn extract_hit_row(mut table: SpiTupleTable<'_>) -> Option<(i32, bool)> {
             None
         }
     }
-}
-
-fn promote_fingerprint(fingerprint_hex: &str, role: &str, command: &str) -> bool {
-    Spi::connect_mut(|client| {
-        let args = [text_arg(fingerprint_hex), name_arg(role), text_arg(command)];
-        match spi_update(
-            client,
-            "UPDATE public.sql_firewall_query_fingerprints
-             SET is_approved = true
-             WHERE fingerprint = $1 AND role_name = $2 AND command_type = $3 AND is_approved = false",
-            &args,
-        ) {
-            Ok(_) => true,
-            Err(err) => {
-                pgrx::warning!("sql_firewall: failed to auto-approve fingerprint: {err}");
-                false
-            }
-        }
-    })
 }
 
 fn normalize_query(query: &str) -> String {

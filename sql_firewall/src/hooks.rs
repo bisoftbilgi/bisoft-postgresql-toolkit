@@ -10,10 +10,13 @@ static mut PREV_EXECUTOR_START: pg_sys::ExecutorStart_hook_type = None;
 static mut PREV_PROCESS_UTILITY: pg_sys::ProcessUtility_hook_type = None;
 
 pub fn install() {
+    pgrx::warning!("🪝 DEBUG: hooks::install() called");
+    
     if INSTALLED
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
+        pgrx::warning!("🪝 DEBUG: hooks already installed, skipping");
         return;
     }
 
@@ -24,6 +27,8 @@ pub fn install() {
         PREV_PROCESS_UTILITY = pg_sys::ProcessUtility_hook;
         pg_sys::ProcessUtility_hook = Some(process_utility_hook);
     }
+    
+    pgrx::warning!("✅ DEBUG: hooks installed successfully - executor_start_hook and process_utility_hook are now active");
 }
 
 pub fn uninstall() {
@@ -52,6 +57,8 @@ unsafe extern "C-unwind" fn executor_start_hook(query_desc: *mut pg_sys::QueryDe
             let command = command_from_cmdtype((*query_desc).operation);
             firewall::inspect_query(firewall::QueryOrigin::Executor, &query, &ctx, command);
         }
+    } else {
+        pgrx::warning!("🪝 DEBUG: query_desc is NULL, skipping");
     }
 
     if let Some(prev) = PREV_EXECUTOR_START {
@@ -72,7 +79,9 @@ unsafe extern "C-unwind" fn process_utility_hook(
     dest: *mut pg_sys::DestReceiver,
     qc: *mut pg_sys::QueryCompletion,
 ) {
+    pgrx::log!("sql_firewall: process_utility_hook called");
     if let Some(query) = cstr_to_string(query_string) {
+        pgrx::log!("sql_firewall: utility hook query: {}", query);
         let ctx = ExecutionContext::collect();
         // Extract real command from utility statement instead of hard-coded "OTHER"
         let command = if !pstmt.is_null() {

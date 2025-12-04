@@ -45,6 +45,11 @@ pub enum QueryOrigin {
 }
 
 pub fn inspect_query(_origin: QueryOrigin, query: &str, ctx: &ExecutionContext, command: &str) {
+    // KILL SWITCH: Bypass all firewall processing if disabled (emergency override)
+    if !guc::firewall_enabled() {
+        return;
+    }
+
     if query.trim().is_empty() {
         return;
     }
@@ -273,25 +278,19 @@ fn is_superuser() -> bool {
 }
 
 fn is_firewall_internal_query(query: &str) -> bool {
-    // CRITICAL: More precise check to prevent recursive loops
-    // Check for actual table access patterns, not just string presence
-    let lower = query.to_ascii_lowercase();
-
-    // Skip if it's accessing firewall tables
-    let has_table_keyword = lower.contains("from ")
-        || lower.contains("into ")
-        || lower.contains("update ")
-        || lower.contains("join ");
-
-    if !has_table_keyword {
-        return false;
-    }
-
-    // Check for specific firewall table names
-    lower.contains("sql_firewall_activity_log")
-        || lower.contains("sql_firewall_command_approvals")
-        || lower.contains("sql_firewall_query_fingerprints")
-        || lower.contains("sql_firewall_regex_rules")
+    // CRITICAL: Prevent recursive loops by bypassing ALL firewall-related queries
+    // Case-insensitive check to catch all variants
+    let q_upper = query.to_uppercase();
+    
+    // Bypass ANY query that mentions firewall tables or internal functions
+    let is_internal = q_upper.contains("SQL_FIREWALL_COMMAND_APPROVALS") 
+        || q_upper.contains("SQL_FIREWALL_QUERY_FINGERPRINTS")
+        || q_upper.contains("SQL_FIREWALL_ACTIVITY_LOG")
+        || q_upper.contains("SQL_FIREWALL_REGEX_RULES")
+        || q_upper.contains("SQL_FIREWALL_BLOCKED_QUERIES")
+        || q_upper.contains("SQL_FIREWALL_INTERNAL_");  // Catches all internal function calls
+    
+    is_internal
 }
 
 #[allow(dead_code)]

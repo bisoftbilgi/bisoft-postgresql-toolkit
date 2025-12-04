@@ -11,7 +11,7 @@ use crate::{
     fingerprints,
     guc::{self, FirewallMode},
     rate_state,
-    sql::{bool_arg, int4_arg, name_arg, spi_select_one, spi_update, text_arg},
+    sql::{int4_arg, name_arg, spi_select_one, spi_update, text_arg},
 };
 
 pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) -> Option<String> {
@@ -215,48 +215,58 @@ pub fn approval_requirement(
         }
     };
 
-    let approval = Spi::connect(|client| {
-        match spi_select_one::<bool>(
-            client,
-            "SELECT is_approved FROM public.sql_firewall_command_approvals \
-             WHERE role_name = $1 AND command_type = $2",
-            &[name_arg(role), text_arg(command)],
-        ) {
-            Ok(result) => result,
-            Err(err) => {
-                if err.to_string().contains("does not exist")
-                    || err.to_string().contains("mevcut değil")
-                {
-                    return None;
+    // PERFORMANCE: Check approval cache first (avoid SPI call)
+    let role_oid = ctx.role_oid.unwrap_or(pg_sys::InvalidOid);
+    let approval = if let Some(cached) = crate::approval_cache::get_approval(role_oid, command) {
+        Some(cached)
+    } else {
+        // Cache miss - query database
+        let db_result = Spi::connect(|client| {
+            match spi_select_one::<bool>(
+                client,
+                "SELECT is_approved FROM public.sql_firewall_command_approvals \
+                 WHERE role_name = $1 AND command_type = $2",
+                &[name_arg(role), text_arg(command)],
+            ) {
+                Ok(result) => result,
+                Err(err) => {
+                    if err.to_string().contains("does not exist")
+                        || err.to_string().contains("mevcut değil")
+                    {
+                        return None;
+                    }
+                    pgrx::warning!("sql_firewall: approval lookup failed: {err}");
+                    None
                 }
-                pgrx::warning!("sql_firewall: approval lookup failed: {err}");
-                None
             }
+        });
+        
+        // Update cache with result
+        if let Some(approved) = db_result {
+            crate::approval_cache::set_approval(role_oid, command, approved);
         }
-    });
+        
+        db_result
+    };
 
     let record_approval = |is_approved: bool| {
-        // CRITICAL: Record approval request FIRST, before any potential rollback
-        // Use separate autonomous-like transaction via INSERT
-        let _ = Spi::run("SAVEPOINT approval_record");
-
-        let insert_result = Spi::connect_mut(|client| {
-            let args = [name_arg(role), text_arg(command), bool_arg(is_approved)];
-            spi_update(
-                client,
-                "SELECT public.sql_firewall_internal_upsert_approval($1, $2, $3)",
-                &args,
-            )
-        });
-
-        // Commit the approval record even if main transaction fails
-        if insert_result.is_ok() {
-            let _ = Spi::run("RELEASE SAVEPOINT approval_record");
-        } else {
-            let _ = Spi::run("ROLLBACK TO SAVEPOINT approval_record");
+        // UNIFIED ASYNC: Enqueue approval to worker (no SAVEPOINT needed)
+        let db_name = ctx.database.as_deref().unwrap_or("unknown");
+        let enqueued = crate::pending_approvals::enqueue_approval(
+            role,
+            command,
+            db_name,
+            is_approved,
+        );
+        
+        if !enqueued {
+            pgrx::warning!(
+                "sql_firewall: Failed to enqueue approval (ring buffer full): role={}, command={}",
+                role, command
+            );
         }
 
-        // Also log to activity log
+        // Activity log (keep sync for now - low priority optimization)
         let action_desc = if is_approved {
             "AUTO-APPROVED"
         } else {
@@ -276,8 +286,7 @@ pub fn approval_requirement(
                 role,
                 command
             );
-
-            // PostgreSQL LOG (also survives abort)
+            
             pgrx::log!(
                 "sql_firewall_rs: APPROVAL_NEEDED role='{}' command='{}' database='{}'",
                 role,
@@ -285,7 +294,6 @@ pub fn approval_requirement(
                 ctx.database.as_deref().unwrap_or("unknown")
             );
 
-            // If syslog alerts enabled, use that too
             if guc::syslog_alerts_enabled() {
                 use crate::alerts;
                 alerts::emit_block_alert(ctx, command, "PENDING APPROVAL - awaiting admin action");
@@ -294,12 +302,29 @@ pub fn approval_requirement(
     };
 
     let decision = match approval {
-        Some(true) => Decision::Allow {
-            action: Cow::Borrowed("ALLOWED"),
-            reason: Some("Approved command type".to_string()),
-            skip_fingerprint_check: true,  // Command approved at command-type level, skip fingerprint
-        },
+        Some(true) => {
+            // In Learn mode, always track fingerprints even if command is approved
+            let skip_fp = mode != FirewallMode::Learn;
+            Decision::Allow {
+                action: Cow::Borrowed("ALLOWED"),
+                reason: Some("Approved command type".to_string()),
+                skip_fingerprint_check: skip_fp,  // Learn mode: false (track), Others: true (skip)
+            }
+        }
         Some(false) => match mode {
+            FirewallMode::Learn => {
+                // LEARN MODE: Even for pending approvals, allow the query (learn mode never blocks)
+                pgrx::warning!(
+                    "sql_firewall: Learn mode - allowing command with pending approval: role='{}' command='{}'",
+                    role,
+                    command
+                );
+                Decision::Allow {
+                    action: Cow::Borrowed("ALLOWED (LEARN MODE - PENDING)"),
+                    reason: Some("Command type approval pending but allowed in learn mode".to_string()),
+                    skip_fingerprint_check: false,  // Still track fingerprints
+                }
+            }
             FirewallMode::Permissive => {
                 pgrx::warning!(
                     "sql_firewall: role '{}' command '{}' allowed in permissive mode (pending approval)",
@@ -312,14 +337,6 @@ pub fn approval_requirement(
                     skip_fingerprint_check: false,  // Still check fingerprints in permissive mode
                 }
             }
-            FirewallMode::Learn => Decision::Block {
-                action: Cow::Borrowed("BLOCKED (LEARN MODE - PENDING)"),
-                reason: Some("Command type approval pending - admin must approve".to_string()),
-                error: format!(
-                    "sql_firewall: BLOCKED - Approval for command '{}' is pending for role '{}' (Learn mode)",
-                    command, role
-                ),
-            },
             _ => Decision::Block {
                 action: Cow::Borrowed("BLOCKED"),
                 reason: Some("Command type approval pending".to_string()),
@@ -331,23 +348,29 @@ pub fn approval_requirement(
         },
         None => match mode {
             FirewallMode::Learn => {
-                // Enqueue to shared memory - background worker will persist it
+                // LEARN MODE: Auto-approve and persist via background worker
                 // Include database name so worker knows where to write
                 let db_name = ctx.database.as_deref().unwrap_or("unknown");
-                crate::pending_approvals::enqueue(role, command, db_name);
+                let enqueued = crate::pending_approvals::enqueue_approval(role, command, db_name, true);
                 
-                pgrx::debug1!(
-                    "sql_firewall: Learn mode - queued approval for role={}, command={}, db={}",
-                    role, command, db_name
-                );
+                if !enqueued {
+                    pgrx::warning!(
+                        "sql_firewall: Learn mode - failed to enqueue approval (ring buffer full) for role={}, command={}, db={}",
+                        role, command, db_name
+                    );
+                } else {
+                    pgrx::debug1!(
+                        "sql_firewall: Learn mode - auto-approved & queued for persistence: role={}, command={}, db={}",
+                        role, command, db_name
+                    );
+                }
                 
-                Decision::Block {
-                    action: Cow::Borrowed("BLOCKED (LEARN MODE - QUEUED)"),
-                    reason: Some("Command type approval queued for admin review".to_string()),
-                    error: format!(
-                        "sql_firewall: BLOCKED - Command '{}' for role '{}' queued for admin approval (Learn mode)",
-                        command, role
-                    ),
+                log_activity(ctx, command, "ALLOWED (LEARN MODE - AUTO)", Some("New command auto-approved in learn mode"), query);
+                
+                Decision::Allow {
+                    action: Cow::Borrowed("ALLOWED (LEARN MODE - AUTO)"),
+                    reason: Some("Command type auto-approved in learn mode".to_string()),
+                    skip_fingerprint_check: false,  // Still track fingerprints in learn mode
                 }
             }
             FirewallMode::Permissive => {
@@ -473,42 +496,28 @@ pub fn log_activity(
 fn log_blocked_query(ctx: &ExecutionContext, command: &str, reason: Option<&str>, query: &str) {
     let role = ctx.role.as_deref().unwrap_or("unknown");
     let database = ctx.database.as_deref().unwrap_or("unknown");
+    let app_name = ctx.application_name.as_deref();
+    let client_addr = ctx.client_addr.as_deref();
     
     pgrx::log!("sql_firewall: log_blocked_query called - role={}, command={}, reason={:?}", role, command, reason);
     
-    // The SQL function sql_firewall_internal_log_blocked_query uses dblink
-    // to perform an autonomous transaction that survives rollback
-    Spi::connect_mut(|client| {
-        let reason_arg = reason
-            .map(text_arg)
-            .unwrap_or_else(|| DatumWithOid::null_oid(pg_sys::TEXTOID));
-        let app_arg = ctx
-            .application_name
-            .as_deref()
-            .map(text_arg)
-            .unwrap_or_else(|| DatumWithOid::null_oid(pg_sys::TEXTOID));
-        let client_arg = ctx
-            .client_addr
-            .as_deref()
-            .map(text_arg)
-            .unwrap_or_else(|| DatumWithOid::null_oid(pg_sys::TEXTOID));
-        let args = [
-            name_arg(role),
-            name_arg(database),
-            text_arg(query),
-            app_arg,
-            client_arg,
-            text_arg(command),
-            reason_arg,
-        ];
-        if let Err(err) = spi_update(
-            client,
-            "SELECT public.sql_firewall_internal_log_blocked_query($1, $2, $3, $4, $5, $6, $7)",
-            &args,
-        ) {
-            pgrx::warning!("sql_firewall: failed to log blocked query: {err}");
-        }
-    });
+    // ✅ CORRECT: Enqueue to ring buffer (survives transaction rollback)
+    // Worker will process this in separate transaction and persist to database
+    let enqueued = crate::pending_approvals::enqueue_blocked_query(
+        role,
+        database,
+        query,
+        app_name,
+        client_addr,
+        command,
+        reason,
+    );
+
+    if !enqueued {
+        pgrx::warning!("sql_firewall: failed to enqueue blocked query event (ring buffer full)");
+    } else {
+        pgrx::log!("sql_firewall: blocked query enqueued to ring buffer");
+    }
 }
 
 fn in_transaction() -> bool {

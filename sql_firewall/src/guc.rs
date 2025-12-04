@@ -16,6 +16,9 @@ pub enum FirewallMode {
 
 pub static FIREWALL_MODE: GucSetting<FirewallMode> =
     GucSetting::<FirewallMode>::new(FirewallMode::Learn);
+pub static FIREWALL_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
+// NOTE: ring_buffer_size removed - using fixed capacity (1024) in pending_approvals.rs
+pub static RETENTION_DAYS: GucSetting<i32> = GucSetting::<i32>::new(30);
 pub static ENABLE_KEYWORD_SCAN: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static ENABLE_REGEX_SCAN: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static ENABLE_QUIET_HOURS: GucSetting<bool> = GucSetting::<bool>::new(false);
@@ -48,8 +51,7 @@ pub static ALERT_CHANNEL: GucSetting<Option<CString>> = GucSetting::<Option<CStr
 pub static SYSLOG_ALERTS: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub static ALERT_ONLY_ON_BLOCK: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static ACTIVITY_LOG_RETENTION_DAYS: GucSetting<i32> = GucSetting::<i32>::new(30);
-pub static APPROVAL_WORKER_DATABASE: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
+pub static APPROVAL_WORKER_DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 pub static ACTIVITY_LOG_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 pub static ACTIVITY_LOG_PRUNE_INTERVAL: GucSetting<i32> = GucSetting::<i32>::new(300);
 pub static ENABLE_ACTIVITY_LOGGING: GucSetting<bool> = GucSetting::<bool>::new(true);
@@ -58,8 +60,31 @@ pub fn register() {
     GucRegistry::define_enum_guc(
         cstr(b"sql_firewall.mode\0"),
         cstr(b"Sets the firewall operation mode.\0"),
-        cstr(b"Determines how incoming SQL statements are evaluated.\0"),
+        cstr(b"Learn: Allow all + auto-approve (training), Permissive: Allow + warn + fingerprint check, Enforce: Block unapproved + log for admin review.\0"),
         &FIREWALL_MODE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        cstr(b"sql_firewall.enabled\0"),
+        cstr(b"Enable/disable SQL firewall globally (kill switch).\0"),
+        cstr(b"When disabled, all hook processing is bypassed for emergency situations.\0"),
+        &FIREWALL_ENABLED,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    // NOTE: ring_buffer_size GUC removed - using fixed capacity (1024) for Phase 1
+    // Will be made configurable in Phase 2 with proper shared memory reallocation
+
+    GucRegistry::define_int_guc(
+        cstr(b"sql_firewall.retention_days\0"),
+        cstr(b"Number of days to retain audit logs.\0"),
+        cstr(b"Logs older than this will be pruned by background worker. 0 = no retention limit.\0"),
+        &RETENTION_DAYS,
+        0,
+        3650,
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -385,6 +410,16 @@ pub fn mode() -> FirewallMode {
     FIREWALL_MODE.get()
 }
 
+pub fn firewall_enabled() -> bool {
+    FIREWALL_ENABLED.get()
+}
+
+// NOTE: ring_buffer_size() removed - using RING_CAPACITY constant in pending_approvals.rs
+
+pub fn retention_days() -> i32 {
+    RETENTION_DAYS.get()
+}
+
 pub fn keyword_scan_enabled() -> bool {
     ENABLE_KEYWORD_SCAN.get()
 }
@@ -541,13 +576,6 @@ pub fn activity_log_retention_days() -> i32 {
     ACTIVITY_LOG_RETENTION_DAYS.get()
 }
 
-pub fn approval_worker_database() -> String {
-    match APPROVAL_WORKER_DATABASE.get() {
-        Some(db) => db.to_string_lossy().to_string(),
-        None => "postgres".to_string(),
-    }
-}
-
 pub fn activity_log_max_rows() -> i64 {
     ACTIVITY_LOG_MAX_ROWS.get() as i64
 }
@@ -648,4 +676,11 @@ fn parse_csv(raw: &CStr) -> Vec<String> {
         .filter(|token| !token.is_empty())
         .map(|token| token.to_string())
         .collect()
+}
+
+pub fn approval_worker_database() -> String {
+    match APPROVAL_WORKER_DATABASE.get() {
+        Some(db) => db.to_string_lossy().to_string(),
+        None => "postgres".to_string(),
+    }
 }

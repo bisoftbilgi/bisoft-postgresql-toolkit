@@ -31,20 +31,23 @@ CREATE INDEX IF NOT EXISTS idx_sqlfw_activity_action
 -- This prevents users from tampering with firewall logs and configuration
 
 -- Dedicated table for blocked queries - separate from activity log for security analysis
+-- ENHANCED: Now with 2KB query buffer, truncation flag, and richer metadata
 CREATE TABLE IF NOT EXISTS public.sql_firewall_blocked_queries (
     block_id         SERIAL PRIMARY KEY,
     blocked_at       TIMESTAMPTZ DEFAULT now() NOT NULL,
     role_name        NAME,
     database_name    NAME,
-    query_text       TEXT,
+    query_text       TEXT,               -- Up to 2KB query text (enforced by ring buffer)
+    query_truncated  BOOLEAN DEFAULT false, -- True if query was larger than 2KB
     application_name TEXT,
-    client_ip        TEXT,
+    client_addr      TEXT,               -- Renamed from client_ip for consistency
     command_type     TEXT,
-    block_reason     TEXT
+    reason           TEXT                -- Renamed from block_reason for consistency with activity log
 );
 
 COMMENT ON TABLE  public.sql_firewall_blocked_queries IS 'Dedicated log for blocked queries - useful for security analysis and auditing.';
-COMMENT ON COLUMN public.sql_firewall_blocked_queries.block_reason IS 'Reason why the query was blocked: No approval, regex match, rate limit, etc.';
+COMMENT ON COLUMN public.sql_firewall_blocked_queries.query_truncated IS 'True if query was truncated at 2KB limit during capture.';
+COMMENT ON COLUMN public.sql_firewall_blocked_queries.reason IS 'Reason why the query was blocked: No approval, regex match, rate limit, etc.';
 
 ALTER TABLE public.sql_firewall_blocked_queries SET LOGGED;
 
@@ -56,17 +59,20 @@ CREATE INDEX IF NOT EXISTS idx_sqlfw_blocked_command_time
 -- SECURITY: No direct grants to PUBLIC - all access through SECURITY DEFINER functions
 -- This prevents users from tampering with security audit logs
 
+-- ENHANCED: is_approved column tracks whether approval was granted or pending
 CREATE TABLE IF NOT EXISTS public.sql_firewall_command_approvals (
     id           SERIAL PRIMARY KEY,
     role_name    NAME        NOT NULL,
     command_type TEXT        NOT NULL,
-    is_approved  BOOLEAN     NOT NULL DEFAULT false,
+    is_approved  BOOLEAN     NOT NULL DEFAULT false,  -- TRUE = approved, FALSE = pending admin review
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),  -- Track when approval status last changed
     UNIQUE (role_name, command_type)
 );
 
 COMMENT ON TABLE  public.sql_firewall_command_approvals IS 'Approval status of command types per role.';
-COMMENT ON COLUMN public.sql_firewall_command_approvals.is_approved IS 'If true, this role is allowed to execute the command type.';
+COMMENT ON COLUMN public.sql_firewall_command_approvals.is_approved IS 'If true, this role is allowed to execute the command type. If false, approval is pending admin review.';
+COMMENT ON COLUMN public.sql_firewall_command_approvals.updated_at IS 'Timestamp when approval status was last changed (useful for auditing approval grants).';
 
 -- SECURITY: No direct grants to PUBLIC - all access through SECURITY DEFINER functions
 -- This prevents users from approving their own commands
@@ -132,21 +138,48 @@ CREATE TABLE IF NOT EXISTS public.sql_firewall_query_fingerprints (
     sample_query     TEXT        NOT NULL,
     hit_count        INTEGER     NOT NULL DEFAULT 1,
     is_approved      BOOLEAN     NOT NULL DEFAULT false,
-    last_seen        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (fingerprint, role_name, command_type)
 );
 
 COMMENT ON TABLE  public.sql_firewall_query_fingerprints IS 'Normalized query fingerprints tracked per role.';
 COMMENT ON COLUMN public.sql_firewall_query_fingerprints.hit_count IS 'Number of times this fingerprint has been observed.';
 COMMENT ON COLUMN public.sql_firewall_query_fingerprints.is_approved IS 'If true, queries matching this fingerprint are allowed.';
+COMMENT ON COLUMN public.sql_firewall_query_fingerprints.first_seen_at IS 'Timestamp when this fingerprint was first recorded.';
+COMMENT ON COLUMN public.sql_firewall_query_fingerprints.last_seen_at IS 'Timestamp when this fingerprint was last observed.';
 
 CREATE INDEX IF NOT EXISTS idx_sqlfw_fingerprint_role
     ON public.sql_firewall_query_fingerprints(role_name, fingerprint);
 CREATE INDEX IF NOT EXISTS idx_sqlfw_fingerprint_last_seen
-    ON public.sql_firewall_query_fingerprints(last_seen);
+    ON public.sql_firewall_query_fingerprints(last_seen_at);
 
 -- SECURITY: No direct grants to PUBLIC - all access through SECURITY DEFINER functions
 -- This prevents users from tampering with learned fingerprints
+
+-- NEW: Fingerprint hits table for background worker event processing
+CREATE TABLE IF NOT EXISTS public.sql_firewall_fingerprint_hits (
+    fingerprint      TEXT PRIMARY KEY,
+    normalized_query TEXT        NOT NULL,
+    role_name        NAME,
+    command_type     TEXT,
+    sample_query     TEXT,
+    hit_count        BIGINT      NOT NULL DEFAULT 1,
+    is_approved      BOOLEAN     NOT NULL DEFAULT false,
+    first_hit_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_hit_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE  public.sql_firewall_fingerprint_hits IS 'Fingerprint hit tracking populated by background worker from ring buffer events.';
+COMMENT ON COLUMN public.sql_firewall_fingerprint_hits.hit_count IS 'Number of times this fingerprint has been observed (incremented by ON CONFLICT).';
+COMMENT ON COLUMN public.sql_firewall_fingerprint_hits.is_approved IS 'If true, queries matching this fingerprint are allowed.';
+
+CREATE INDEX IF NOT EXISTS idx_sqlfw_fphits_approved
+    ON public.sql_firewall_fingerprint_hits(is_approved, hit_count DESC);
+CREATE INDEX IF NOT EXISTS idx_sqlfw_fphits_last_hit
+    ON public.sql_firewall_fingerprint_hits(last_hit_at DESC);
+
+-- SECURITY: No direct grants to PUBLIC - all access through SECURITY DEFINER functions
 
 -- ============================================================================
 -- SECURITY DEFINER Functions for Controlled Admin Access
@@ -338,8 +371,8 @@ BEGIN
     -- Use dblink to perform autonomous transaction that survives rollback
     -- This ensures blocked queries are logged even when the main transaction aborts
     BEGIN
-        -- Connect to current database using dblink
-        v_conn := 'dbname=' || current_database();
+        -- Connect to current database using dblink (safely quote database name)
+        v_conn := 'dbname=' || quote_ident(current_database());
         PERFORM dblink_connect('firewall_log_conn', v_conn);
         
         -- Execute INSERT in autonomous transaction
@@ -424,3 +457,147 @@ GRANT EXECUTE ON FUNCTION public.sql_firewall_internal_log_activity(NAME, NAME, 
 GRANT EXECUTE ON FUNCTION public.sql_firewall_internal_log_blocked_query(NAME, NAME, TEXT, TEXT, TEXT, TEXT, TEXT) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION public.sql_firewall_internal_upsert_fingerprint(TEXT, TEXT, NAME, TEXT, TEXT, BOOLEAN) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION public.sql_firewall_internal_upsert_approval(NAME, TEXT, BOOLEAN) TO PUBLIC;
+
+-- ========================================
+-- LOG CLEANUP FUNCTIONS
+-- ========================================
+
+-- Clean activity log entries older than specified interval
+CREATE OR REPLACE FUNCTION public.sql_firewall_cleanup_activity_log(
+    p_retention_interval INTERVAL DEFAULT '30 days'
+)
+RETURNS TABLE(deleted_count BIGINT) AS $$
+DECLARE
+    v_deleted_count BIGINT;
+BEGIN
+    -- Only superusers can cleanup logs
+    IF NOT (SELECT usesuper FROM pg_user WHERE usename = session_user) THEN
+        RAISE EXCEPTION 'Only superusers can cleanup firewall logs';
+    END IF;
+    
+    DELETE FROM public.sql_firewall_activity_log
+    WHERE log_time < (now() - p_retention_interval);
+    
+    GET DIAGNOSTICS v_deleted_count = ROW_COUNT;
+    
+    RETURN QUERY SELECT v_deleted_count;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+COMMENT ON FUNCTION public.sql_firewall_cleanup_activity_log(INTERVAL) IS 
+'Delete activity log entries older than specified interval. Default: 30 days. Superuser only.';
+
+-- Clean blocked queries log entries older than specified interval
+CREATE OR REPLACE FUNCTION public.sql_firewall_cleanup_blocked_queries(
+    p_retention_interval INTERVAL DEFAULT '90 days'
+)
+RETURNS TABLE(deleted_count BIGINT) AS $$
+DECLARE
+    v_deleted_count BIGINT;
+BEGIN
+    -- Only superusers can cleanup logs
+    IF NOT (SELECT usesuper FROM pg_user WHERE usename = session_user) THEN
+        RAISE EXCEPTION 'Only superusers can cleanup firewall logs';
+    END IF;
+    
+    DELETE FROM public.sql_firewall_blocked_queries
+    WHERE blocked_at < (now() - p_retention_interval);
+    
+    GET DIAGNOSTICS v_deleted_count = ROW_COUNT;
+    
+    RETURN QUERY SELECT v_deleted_count;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+COMMENT ON FUNCTION public.sql_firewall_cleanup_blocked_queries(INTERVAL) IS 
+'Delete blocked query log entries older than specified interval. Default: 90 days (longer retention for security analysis). Superuser only.';
+
+-- Cleanup both logs in one transaction
+CREATE OR REPLACE FUNCTION public.sql_firewall_cleanup_all_logs(
+    p_activity_retention INTERVAL DEFAULT '30 days',
+    p_blocked_retention INTERVAL DEFAULT '90 days'
+)
+RETURNS TABLE(
+    activity_deleted BIGINT,
+    blocked_deleted BIGINT,
+    total_deleted BIGINT
+) AS $$
+DECLARE
+    v_activity_count BIGINT;
+    v_blocked_count BIGINT;
+BEGIN
+    -- Only superusers can cleanup logs
+    IF NOT (SELECT usesuper FROM pg_user WHERE usename = session_user) THEN
+        RAISE EXCEPTION 'Only superusers can cleanup firewall logs';
+    END IF;
+    
+    -- Cleanup activity log
+    DELETE FROM public.sql_firewall_activity_log
+    WHERE log_time < (now() - p_activity_retention);
+    GET DIAGNOSTICS v_activity_count = ROW_COUNT;
+    
+    -- Cleanup blocked queries log
+    DELETE FROM public.sql_firewall_blocked_queries
+    WHERE blocked_at < (now() - p_blocked_retention);
+    GET DIAGNOSTICS v_blocked_count = ROW_COUNT;
+    
+    RETURN QUERY SELECT 
+        v_activity_count,
+        v_blocked_count,
+        v_activity_count + v_blocked_count;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+COMMENT ON FUNCTION public.sql_firewall_cleanup_all_logs(INTERVAL, INTERVAL) IS 
+'Cleanup both activity and blocked query logs in one transaction. Defaults: activity=30 days, blocked=90 days. Superuser only.';
+
+-- Truncate all logs (emergency cleanup)
+CREATE OR REPLACE FUNCTION public.sql_firewall_truncate_logs()
+RETURNS TABLE(status TEXT) AS $$
+BEGIN
+    -- Only superusers can truncate logs
+    IF NOT (SELECT usesuper FROM pg_user WHERE usename = session_user) THEN
+        RAISE EXCEPTION 'Only superusers can truncate firewall logs';
+    END IF;
+    
+    TRUNCATE TABLE public.sql_firewall_activity_log;
+    TRUNCATE TABLE public.sql_firewall_blocked_queries;
+    
+    RETURN QUERY SELECT 'All firewall logs truncated successfully'::TEXT;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+COMMENT ON FUNCTION public.sql_firewall_truncate_logs() IS 
+'Emergency function to truncate ALL firewall logs. Use with caution! Superuser only.';
+
+-- ========================================
+-- SECURITY: REVOKE DIRECT TABLE ACCESS
+-- ========================================
+-- All interaction with firewall tables must go through SECURITY DEFINER functions
+-- This prevents users from tampering with firewall configuration and logs
+
+-- Revoke all privileges on firewall tables from PUBLIC
+REVOKE ALL ON TABLE public.sql_firewall_activity_log FROM PUBLIC;
+REVOKE ALL ON TABLE public.sql_firewall_blocked_queries FROM PUBLIC;
+REVOKE ALL ON TABLE public.sql_firewall_command_approvals FROM PUBLIC;
+REVOKE ALL ON TABLE public.sql_firewall_query_fingerprints FROM PUBLIC;
+REVOKE ALL ON TABLE public.sql_firewall_regex_rules FROM PUBLIC;
+REVOKE ALL ON TABLE public.sql_firewall_cleanup_config FROM PUBLIC;
+
+-- Revoke sequence access
+REVOKE ALL ON SEQUENCE public.sql_firewall_activity_log_log_id_seq FROM PUBLIC;
+REVOKE ALL ON SEQUENCE public.sql_firewall_blocked_queries_block_id_seq FROM PUBLIC;
+REVOKE ALL ON SEQUENCE public.sql_firewall_command_approvals_id_seq FROM PUBLIC;
+REVOKE ALL ON SEQUENCE public.sql_firewall_query_fingerprints_fingerprint_id_seq FROM PUBLIC;
+REVOKE ALL ON SEQUENCE public.sql_firewall_regex_rules_id_seq FROM PUBLIC;
+
+-- Grant SELECT on read-only views for monitoring (users can view their own data)
+GRANT SELECT ON TABLE public.sql_firewall_activity_log TO PUBLIC;
+GRANT SELECT ON TABLE public.sql_firewall_blocked_queries TO PUBLIC;
+GRANT SELECT ON TABLE public.sql_firewall_query_fingerprints TO PUBLIC;
+
+-- Grant SELECT on config tables for firewall internal queries (read-only for users)
+GRANT SELECT ON TABLE public.sql_firewall_command_approvals TO PUBLIC;
+GRANT SELECT ON TABLE public.sql_firewall_regex_rules TO PUBLIC;
+
+-- Configuration changes still require SECURITY DEFINER functions (no INSERT/UPDATE/DELETE)
