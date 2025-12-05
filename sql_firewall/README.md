@@ -244,21 +244,6 @@ Enterprise-grade benchmark suite available in `benchmarks/enterprise_benchmark.s
 - Read-heavy workloads benefit - 6.3% faster with firewall enabled (prepared statement + select-only)
 - Security blocking - 0% block rate when superuser bypass enabled (default), requires `sql_firewall.allow_superuser_auth_bypass = false` for testing
 
-**Running Benchmarks:**
-
-```bash
-cd sql_firewall
-./benchmarks/enterprise_benchmark.sh
-```
-
-Results are saved in timestamped directories with:
-- Individual test logs (pgbench outputs)
-- CSV files for security tests
-- JSONL machine-readable results
-- Markdown summary report
-- CPU/memory profiling data
-
----
 ## 8. Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -276,4 +261,3 @@ Results are saved in timestamped directories with:
 | Blocked queries not logged | Worker queue disabled or ring buffer full. | Ensure the approval worker is running (`SELECT sql_firewall_approval_worker_status();`) and check logs for "ring buffer full" warnings. Blocking always enqueues events even if the user transaction aborts. |
 | Regex exemptions not working | Incorrect `allowed_roles` logic. | Fixed: `allowed_roles` array now properly exempts specified users from blocking. |
 
-If problems persist, capture PostgreSQL logs plus `run_comprehensive_tests.sh` output when filing an issue.

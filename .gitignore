@@ -2,5 +2,6 @@
 
 # Benchmark results and scripts
 sql_firewall/benchmarks/
+sql_firewall/tests/
 benchmark_results_*/
 *.log
