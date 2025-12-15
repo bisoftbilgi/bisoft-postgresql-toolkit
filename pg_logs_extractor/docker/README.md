@@ -43,11 +43,11 @@ docker compose up --build -d
 ```
 To view logs:
 ```bash
-docker logs -f logstash
+docker logs -f pg_logs_extractor
 ```
 To enter the container:
 ```bash
-docker exec -it logstash bash
+docker exec -it pg_logs_extractor bash
 ```
 ---
 ## 4. Verify That Logs Are Being Parsed
