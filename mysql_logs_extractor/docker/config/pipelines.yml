@@ -1,0 +1,5 @@
+- pipeline.id: mysql_general
+  path.config: "/usr/share/logstash/pipeline/mysql_logs.conf"
+
+- pipeline.id: mysql_slow
+  path.config: "/usr/share/logstash/pipeline/mysql_slowquery.conf"
