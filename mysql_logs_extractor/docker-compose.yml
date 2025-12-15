@@ -1,0 +1,33 @@
+services:
+  logstash:
+    build: .
+    image: mysql_logs_extractor
+    container_name: mysql_logs_extractor
+
+    environment:
+      - CLUSTER_NAME=""
+      - SERVER_NAME=""
+      - SERVER_IP=""
+      
+      - PG_HOST=
+      - PG_PORT=
+      - PG_DB_NAME=
+      - PG_USER=
+      - PG_PASSWORD=
+      
+    volumes:
+      - /var/log/mysql/general-query.log:/var/log/mysql/general-query.log:ro
+      - /var/log/mysql/slow-query.log:/var/log/mysql/slow-query.log:ro
+      - ./pipeline:/usr/share/logstash/pipeline:ro
+      - ./config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+
+      - ./sincedb:/usr/share/logstash/sincedb
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1g    
+        reservations:
+          cpus: '0.25'
+          memory: 256m  
+    restart: unless-stopped
