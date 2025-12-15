@@ -1,7 +1,8 @@
 services:
   logstash:
     build: ./docker
-    container_name: logstash
+    image: pg_logs_extractor
+    container_name: pg_logs_extactor
     environment:
       PG_HOST: 
       PG_PORT: 
