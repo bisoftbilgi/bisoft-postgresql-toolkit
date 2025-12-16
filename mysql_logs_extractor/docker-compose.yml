@@ -3,18 +3,8 @@ services:
     build: .
     image: mysql_logs_extractor
     container_name: mysql_logs_extractor
-
-    environment:
-      - CLUSTER_NAME=""
-      - SERVER_NAME=""
-      - SERVER_IP=""
-      
-      - PG_HOST=
-      - PG_PORT=
-      - PG_DB_NAME=
-      - PG_USER=
-      - PG_PASSWORD=
-      
+    env_file:
+      - .env
     volumes:
       - /var/log/mysql/general-query.log:/var/log/mysql/general-query.log:ro
       - /var/log/mysql/slow-query.log:/var/log/mysql/slow-query.log:ro
