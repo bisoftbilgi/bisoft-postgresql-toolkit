@@ -101,7 +101,7 @@ nano .env
 ## MySQL Source Configuration
 ---
 
-Enable file-based logging on the MySQL server. Edit your MySQL config (examples: /etc/my.cnf, /etc/mysql/my.cnf, /etc/mysql/mysql.conf.d/mysqld.cnf) and add:
+Enable file-based logging on the MySQL server. Edit your MySQL config (examples: /etc/my.cnf.d, /etc/mysql/my.cnf, /etc/mysql/mysql.conf.d/mysqld.cnf) and add:
 
 ```bash   
 [mysqld]
