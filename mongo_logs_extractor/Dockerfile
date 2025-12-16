@@ -9,3 +9,4 @@ RUN apt-get update && \
     /usr/share/logstash/bin/logstash-plugin install logstash-filter-throttle && \
     mkdir -p /usr/share/logstash/logstash-core/lib/jars/ && \
     wget -q https://jdbc.postgresql.org/download/postgresql-42.7.8.jar -O /usr/share/logstash/logstash-core/lib/jars/postgresql-42.7.8.jar
+USER logstash
