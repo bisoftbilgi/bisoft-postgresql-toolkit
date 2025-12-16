@@ -10,9 +10,9 @@ MongoDB Log Extractor (Connection & Audit Logs)
 - [4. Repository Structure](#4-repository-structure)
 - [5. Environment Configuration (.env)](#5-environment-configuration-env)
   - [Important Notes](#important-notes)
-- [6. Docker Configuration](#6-docker-configuration)
-  - [6.1 Dockerfile](#61-dockerfile)
-  - [6.2 docker-compose.yml](#62-docker-composeyml)
+- [6. Prerequisities (Host + PostgreSQL)](#6-prerequisities-host--postgresql)
+  - [6.1 MongoDB-Side Configuration](#61-mongodb-side-configuration)
+  - [6.2 Required Docker Volume Mapping](#62-required-docker-volume-mapping)
 - [7. PostgreSQL Schema](#7-postgresql-schema)
   - [7.1 Connection Logs Table](#71-connection-logs-table)
   - [7.2 Audit Logs Table](#72-audit-logs-table)
@@ -149,46 +149,93 @@ PG_PASSWORD=
     *   First non-loopback IPv4 address
         
 
-## 6\. Docker Configuration
-------------------------
+## 6\. Prerequisities (Host + PostgreSQL)
+-------------------------------------
 
-### 6.1 Dockerfile
+Before running this project, make sure the host machine and PostgreSQL destination are ready.
 
-The Dockerfile is based on the official Elastic Logstash image.
+### Host Requirements
 
-Key points:
+*   Docker Engine (recommended v20+)
+    
+*   Docker Compose v2 (docker compose)
+    
+*   Access to MongoDB log file on the host (read permissions)
+    
+### PostgreSQL Requirements
 
-*   Runs Logstash 8.19.7
+*   PostgreSQL must be reachable using PG\_HOST:PG\_PORT
     
-*   Installs PostgreSQL client tools
+*   PG\_USER must have permission to:
     
-*   Installs logstash-output-jdbc
+    *   CREATE TABLE (first setup) **or** tables must be created manually beforehand
+        
+    *   INSERT into mongo\_connection\_logs and mongo\_audit\_logs
+        
+### 6.1 MongoDB-Side Configuration
+------------------------------
+
+This project reads **mongod.log** and parses each line as JSON (codec => json).Because of that, MongoDB must be configured to:
+
+1.  Write logs to a file (mongod.log)
     
-*   Downloads PostgreSQL JDBC driver
+2.  Produce operational/audit-like events (via profiling / slow query style logs)
     
-*   Drops privileges back to the logstash user
+Open /etc/mongod.conf and add this settings.
+
+```bash
+systemLog:
+    destination: file
+    logAppend: true
+    path: /var/log/mongodb/mongod.log
+operationProfiling:
+    mode: all
+    slowOpThresholdMs: 100
+    slowOpSampleRate: 1.0
+```
+Important notes:
+
+*   The pipeline assumes **JSON log format** (because codec => json is used).
+    
+*   Many MongoDB installations already produce JSON logs by default.
+    
+*   If your logs are plain-text (non-JSON), the pipeline will not parse them correctly.
+
+*   mode: all ensures operations are visible (more complete audit trail)
+    
+*   slowOpThresholdMs controls what is considered "slow"
+    
+*   slowOpSampleRate controls sampling ratio (1.0 = capture all)
     
 
-No pipeline logic is baked into the image.
+After updating mongod.conf, restart MongoDB:
 
-### 6.2 docker-compose.yml
+```bash
+sudo systemctl restart mongod
+```
 
-The container is started using Docker Compose.
+### 6.2 Required Docker Volume Mapping
+----------------------------------
 
-Key characteristics:
+The container must mount the host mongod.log file as read-only.
 
-*   Single service
-    
-*   CPU and memory limits applied
-    
-*   Host logs mounted read-only
-    
-*   sincedb persisted on the host
-    
-*   .env file loaded automatically
-    
+Example:
 
-Resource limits are intentionally conservative to support **3–4 GB RAM servers**.
+```yml
+volumes:
+    - /var/log/mongodb/mongod.log:/var/log/mongodb/mongod.log:ro
+    - ./pipeline:/usr/share/logstash/pipeline:ro
+    - ./config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+    - ./sincedb:/usr/share/logstash/sincedb
+```
+
+Notes:
+
+*   mongod.log must exist on the host before container start
+    
+*   The container only needs read access (:ro)
+    
+*   sincedb/ must be writable for Logstash to track file offsets
 
 ## 7\. PostgreSQL Schema
 ---------------------
