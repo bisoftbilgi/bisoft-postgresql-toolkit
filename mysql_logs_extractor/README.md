@@ -87,8 +87,8 @@ Parsed events are stored in **PostgreSQL** so you can query history, build dashb
 Clone repository
 
 ```bash 
-git clone ""
-cd ""
+git clone https://github.com/bisoftbilgi/bisoft-postgresql-toolkit.git
+cd bisoft-postgresql-toolkit/mysql_logs_extractor
 ``` 
 
 Create .env
