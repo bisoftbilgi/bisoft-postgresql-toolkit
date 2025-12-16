@@ -62,7 +62,7 @@ Parsed events are stored in **PostgreSQL** so you can query history, build dashb
 │   ├── mysql_general.conf   # General/Audit log processing logic
 │   └── mysql_slow.conf      # Slow query log processing logic
 ├── sincedb/                 # Persistence storage for Logstash file cursor
-├── .env                     # Environment variables (GitIgnored)
+├── .env                     # Environment variables
 ├── docker-compose.yml       # Docker deployment
 └── README.md
 ```
@@ -90,13 +90,6 @@ Clone repository
 git clone https://github.com/bisoftbilgi/bisoft-postgresql-toolkit.git
 cd bisoft-postgresql-toolkit/mysql_logs_extractor
 ``` 
-
-Create .env
-
-```bash
-cp .env.example .env
-nano .env
-```
 
 ## MySQL Source Configuration
 ---
@@ -202,7 +195,9 @@ CREATE TABLE IF NOT EXISTS mysql_slowquery_logs (
 ---
 
 Create .env in the project root.
-
+```bash
+vi .env
+```
 Example:
 
 ```YAML   
