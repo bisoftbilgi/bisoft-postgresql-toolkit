@@ -1,0 +1,28 @@
+services:
+  mongo_logs_extractor:
+    build: .
+    image: mongo_logs_extractor
+    container_name: mongo_logs_extractor
+    env_file:
+      - .env
+    volumes:
+      - ./pipeline/:/usr/share/logstash/pipeline/
+      - /var/log/mongodb/:/var/log/mongodb/:ro
+    environment:
+      - LS_JAVA_OPTS=-Xms256m -Xmx512m
+      - LOGSTASH_SETTING_XPACK_MONITORING_ENABLED=false
+      - LOGSTASH_SETTING_XPACK_MANAGEMENT_ENABLED=false
+
+    networks:
+      - lognet
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 768m    
+        reservations:
+          cpus: '0.25'
+          memory: 256m
+networks:
+  lognet:
+    driver: bridge
