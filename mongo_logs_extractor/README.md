@@ -82,9 +82,9 @@ The system is designed to be:
     
 *   Docker Compose v2 (docker compose)
     
-*   MongoDB 6.0+ (recommended: 8.x)
+*   MongoDB 6.0+
 
-*   PostgreSQL 12+ (recommended: 14+)
+*   PostgreSQL 14+
     
 ## 3\. Features
 ------------
@@ -228,6 +228,15 @@ sudo systemctl restart mongod
 
 ## 8\. Environment Configuration (.env)
 ------------------------------------
+## Quick Start (Docker Compose)
+---
+
+Clone repository
+
+```bash 
+git clone https://github.com/bisoftbilgi/bisoft-postgresql-toolkit.git
+cd bisoft-postgresql-toolkit/mongo_logs_extractor
+```
 
 Create a .env file in the project root:
 
