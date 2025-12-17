@@ -227,10 +227,6 @@ sudo systemctl restart mongod
 ```
 
 ## 8\. Environment Configuration (.env)
-------------------------------------
-## Quick Start (Docker Compose)
----
-
 Clone repository
 
 ```bash 
