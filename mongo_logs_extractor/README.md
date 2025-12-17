@@ -1,53 +1,117 @@
 MongoDB Log Extractor (Connection & Audit Logs)
 ===============================================
-## Table of Contents
 
-- [1. Project Overview](#1-project-overview)
-- [2. What This Project Collects](#2-what-this-project-collects)
-  - [2.1 Connection Events](#21-connection-events)
-  - [2.2 Audit / Operational Events](#22-audit--operational-events)
-- [3. Architecture Overview](#3-architecture-overview)
-- [4. Repository Structure](#4-repository-structure)
-- [5. Environment Configuration (.env)](#5-environment-configuration-env)
-  - [Important Notes](#important-notes)
-- [6. Prerequisities (Host + PostgreSQL)](#6-prerequisities-host--postgresql)
-  - [6.1 MongoDB-Side Configuration](#61-mongodb-side-configuration)
-  - [6.2 Required Docker Volume Mapping](#62-required-docker-volume-mapping)
-- [7. PostgreSQL Schema](#7-postgresql-schema)
-  - [7.1 Connection Logs Table](#71-connection-logs-table)
-  - [7.2 Audit Logs Table](#72-audit-logs-table)
-- [8. Noise Reduction Strategy](#8-noise-reduction-strategy)
-- [9. sincedb Handling](#9-sincedb-handling)
-- [10. GitHub Safety Recommendations](#10-github-safety-recommendations)
-- [11. Resource Optimization Notes](#11-resource-optimization-notes)
-- [12. Intended Use Cases](#12-intended-use-cases)
-- [13. Final Notes](#13-final-notes)
+Table of Contents
+-----------------
 
+*   [1\. Project Overview](#1-project-overview)
+
+*   [2\. Prerequisites](#2-prerequisites)
+    
+*   [3\. Features](#3-features)
+    
+*   [4\. What This Project Collects](4-what-this-project-collects)
+    
+    *   [4.1 Connection Events](#41-connection-events)
+        
+    *   [4.2 Audit / Operational Events](#42-audit--operational-events)
+        
+*   [5\. Architecture Overview](#5-architecture-overview)
+    
+*   [6\. Repository Structure](#6-repository-structure)
+        
+*   [7\. MongoDB Configuration](#7-mongodb-configuration)
+    
+    *   [7.1 Enable JSON Logging](#71-enable-json-logging)
+        
+    *   [7.2 Enable Operational / Slow Query Logs](#72-enable-operational--slow-query-logs)
+        
+*   [8\. Environment Configuration (.env)](#8-environment-configuration-env)
+    
+*   [9\. Docker Compose Configuration](#9-docker-compose-configuration)
+    
+*   [10\. PostgreSQL Schema](#10-postgresql-schema)
+    
+    *   [10.1 Connection Logs Table](#101-connection-logs-table)
+        
+    *   [10.2 Audit Logs Table](#102-audit-logs-table)
+        
+*   [11\. Run & Monitor](#11-run--monitor)
+    
+*   [12\. Verification (SQL Checks)](#12-verification-sql-checks)
+    
+*   [13\. Resource Optimization Notes](#13-resource-optimization-notes)
+    
+*   [14\. Security Notes](#14-security-notes)
+    
+*   [15\. Intended Use Cases](#15-intended-use-cases)
+    
 
 ## 1\. Project Overview
 --------------------
 
-This project is a **Logstash-based MongoDB log extraction and monitoring pipeline**.Its purpose is to collect **MongoDB connection and audit-level operational logs** from mongod.log and persist them into **PostgreSQL** for long-term storage, monitoring, and analysis.
+This project is a **Logstash-based MongoDB log extraction and monitoring pipeline**.
+
+Its purpose is to collect **MongoDB connection-level and audit-style operational logs** from mongod.log and persist them into **PostgreSQL** for:
+
+*   Long-term storage
+    
+*   Security monitoring
+    
+*   Operational visibility
+    
+*   Performance analysis
+    
 
 The system is designed to be:
 
-*   Lightweight (suitable for low-memory servers)
+*   Lightweight (suitable for ~3–4 GB RAM servers)
     
-*   Containerized (Docker & Docker Compose)
+*   Fully containerized (Docker & Docker Compose)
     
 *   Portable (environment-variable driven)
     
 *   Monitoring-oriented (normalized PostgreSQL schema)
     
+## 2\. Prerequisites
+-----------------
 
-## 2\. What This Project Collects
+*   Linux-based host (Rocky Linux tested)
+    
+*   Docker Engine (v20+ recommended)
+    
+*   Docker Compose v2 (docker compose)
+    
+*   MongoDB 6.0+ (recommended: 8.x)
+
+*   PostgreSQL 12+ (recommended: 14+)
+    
+## 3\. Features
+------------
+
+*   MongoDB connection event logging
+    
+*   MongoDB audit / operational command capture
+    
+*   PostgreSQL-backed persistent storage
+    
+*   Noise-reduced, monitoring-friendly data model
+    
+*   Dockerized single-container architecture
+    
+*   sincedb-based offset tracking
+    
+*   Safe for production use on low-resource machines
+    
+
+## 4\. What This Project Collects
 ------------------------------
 
-### 2.1 Connection Events
+### 4.1 Connection Events
 
 From mongod.log, the following connection-related events are parsed and stored:
 
-*   Successful authentications
+*   Successful authentication attempts
     
 *   Failed authentication attempts
     
@@ -64,70 +128,112 @@ These logs are useful for:
     
 *   Connection churn analysis
     
+*   Brute-force detection
+    
 
-### 2.2 Audit / Operational Events
+### 4.2 Audit / Operational Events
 
-MongoDB does not expose full SQL-style auditing like PostgreSQL, but many **DML / DDL / DQL / DCL–equivalent operations** are visible via:
+MongoDB does not expose SQL-style auditing like PostgreSQL, however many **DML / DDL / DQL / DCL–equivalent operations** are visible through:
 
 *   Slow query logs
     
 *   Command execution logs
     
-*   Internal system operations
+*   Internal command execution records
     
 
 From these logs, the pipeline extracts:
 
-*   Executed commands
+*   Executed command
     
 *   Target database and object
     
 *   Operation duration
     
-*   Client application
+*   Client application name
     
 *   Session identifiers (when available)
     
 
-## 3\. Architecture Overview
+## 5\. Architecture Overview
 -------------------------
 
 High-level flow:
 
-MongoDB (mongod.log)→ Logstash (File Input + JSON Codec)→ Logstash Filters (Normalize & Classify)→ PostgreSQL
+```
+MongoDB (mongod.log)
+          ↓
+Logstash (file input + JSON codec)
+          ↓
+Normalization & classification filters
+          ↓
+PostgreSQL (connection & audit tables)
+```
 
 All components run inside a **single Logstash container**.
 
-## 4\. Repository Structure
+## 6\. Repository Structure
 ------------------------
 
-```plain
+```
 mongo_logs_extractor/
-  │
   ├── Dockerfile
   ├── docker-compose.yml
   ├── pipeline/
   │   └── mongo.conf
-  ├── config/
-  │   └── pipelines.yml
   ├── sincedb/
   │   └── .gitignore
-  ├── .env.example
-  └── README
+  └── README.md
 ```
 
-## 5\. Environment Configuration (.env)
-------------------------------------
+## 7\. MongoDB Configuration
+-------------------------
 
-The system is fully driven by environment variables.
+### 7.1 Enable JSON Logging
+
+Edit /etc/mongod.conf:
+
+```bash
+systemLog:
+    destination: file
+    logAppend: true
+    path: /var/log/mongodb/mongod.log
+```
+
+MongoDB typically logs in JSON format by default on modern versions.
+
+### 7.2 Enable Operational / Slow Query Logs
+
+```bash
+operationProfiling:
+    mode: all
+    slowOpThresholdMs: 100
+    slowOpSampleRate: 1.0
+```
+
+Explanation:
+
+*   mode: all exposes operational activity
+    
+*   slowOpThresholdMs defines what is considered slow
+    
+*   slowOpSampleRate: 1.0 ensures full capture
+    
+
+Restart MongoDB:
+
+```bash
+sudo systemctl restart mongod
+```
+
+## 8\. Environment Configuration (.env)
+------------------------------------
 
 Create a .env file in the project root:
 
-```bash
+```env
 # --- Host Metadata ---
 CLUSTER_NAME=
-# SERVER_NAME and SERVER_IP can be left empty
-# They will be auto-detected at runtime
 SERVER_NAME=
 SERVER_IP=
 # --- PostgreSQL Destination ---
@@ -138,88 +244,21 @@ PG_USER=
 PG_PASSWORD=
 ```
 
-### Important Notes
+Notes:
 
-*   SERVER\_NAME and SERVER\_IP are optional.
+*   SERVER\_NAME and SERVER\_IP are optional
     
 *   If left empty, Logstash auto-detects:
     
-    *   Hostname via system call
+    *   Hostname
         
     *   First non-loopback IPv4 address
         
 
-## 6\. Prerequisities (Host + PostgreSQL)
--------------------------------------
+## 9\. Docker Compose Configuration
+--------------------------------
 
-Before running this project, make sure the host machine and PostgreSQL destination are ready.
-
-### Host Requirements
-
-*   Docker Engine (recommended v20+)
-    
-*   Docker Compose v2 (docker compose)
-    
-*   Access to MongoDB log file on the host (read permissions)
-    
-### PostgreSQL Requirements
-
-*   PostgreSQL must be reachable using PG\_HOST:PG\_PORT
-    
-*   PG\_USER must have permission to:
-    
-    *   CREATE TABLE (first setup) **or** tables must be created manually beforehand
-        
-    *   INSERT into mongo\_connection\_logs and mongo\_audit\_logs
-        
-### 6.1 MongoDB-Side Configuration
-------------------------------
-
-This project reads **mongod.log** and parses each line as JSON (codec => json).Because of that, MongoDB must be configured to:
-
-1.  Write logs to a file (mongod.log)
-    
-2.  Produce operational/audit-like events (via profiling / slow query style logs)
-    
-Open /etc/mongod.conf and add this settings.
-
-```bash
-systemLog:
-    destination: file
-    logAppend: true
-    path: /var/log/mongodb/mongod.log
-operationProfiling:
-    mode: all
-    slowOpThresholdMs: 100
-    slowOpSampleRate: 1.0
-```
-Important notes:
-
-*   The pipeline assumes **JSON log format** (because codec => json is used).
-    
-*   Many MongoDB installations already produce JSON logs by default.
-    
-*   If your logs are plain-text (non-JSON), the pipeline will not parse them correctly.
-
-*   mode: all ensures operations are visible (more complete audit trail)
-    
-*   slowOpThresholdMs controls what is considered "slow"
-    
-*   slowOpSampleRate controls sampling ratio (1.0 = capture all)
-    
-
-After updating mongod.conf, restart MongoDB:
-
-```bash
-sudo systemctl restart mongod
-```
-
-### 6.2 Required Docker Volume Mapping
-----------------------------------
-
-The container must mount the host mongod.log file as read-only.
-
-Example:
+The container mounts MongoDB logs and pipeline configuration:
 
 ```yml
 volumes:
@@ -229,18 +268,10 @@ volumes:
     - ./sincedb:/usr/share/logstash/sincedb
 ```
 
-Notes:
+## 10\. PostgreSQL Schema
+----------------------
 
-*   mongod.log must exist on the host before container start
-    
-*   The container only needs read access (:ro)
-    
-*   sincedb/ must be writable for Logstash to track file offsets
-
-## 7\. PostgreSQL Schema
----------------------
-
-### 7.1 Connection Logs Table
+### 10.1 Connection Logs Table
 
 ```SQL
 CREATE TABLE IF NOT EXISTS mongo_connection_logs (
@@ -272,9 +303,8 @@ CREATE INDEX IF NOT EXISTS idx_mongo_conn_clientip_time
   ON mongo_connection_logs (client_ip, log_time DESC);
 
 ```
-    
 
-### 7.2 Audit Logs Table
+### 10.2 Audit Logs Table
 
 ```sql
 CREATE TABLE IF NOT EXISTS mongo_audit_logs (
@@ -313,120 +343,57 @@ CREATE INDEX IF NOT EXISTS idx_mongo_audit_clientip_time
 
 CREATE INDEX IF NOT EXISTS idx_mongo_audit_duration_time
   ON mongo_audit_logs (duration_ms, log_time DESC);
-```    
-
-The schema is intentionally **PostgreSQL-friendly** and aligns with typical monitoring dashboards.
-
-## 8\. Noise Reduction Strategy
-----------------------------
-
-MongoDB produces a significant amount of **internal and background traffic**, such as:
-
-*   hello commands
-    
-*   Session housekeeping
-    
-*   Replication and config database activity
-    
-
-This project:
-
-*   Filters non-essential events
-    
-*   Groups commands logically
-    
-*   Preserves full statement\_text for forensic use
-    
-*   Avoids excessive debug output
-    
-
-As a result, logs remain **actionable instead of noisy**.
-
-## 9\. sincedb Handling
---------------------
-
-The sincedb directory is mounted from the host:
-
-```bash
-./sincedb → /usr/share/logstash/sincedb
 ```
 
-Important rules:
+## 11\. Run & Monitor
+------------------
 
-*   The directory must exist before starting the container
-    
-*   It should be writable by Docker
-    
-*   It must **not** be committed to Git
-    
-
-Recommended .gitignore entry:
-
-```bash
-sincedb/
+```   
+docker compose up -d --build
+docker logs -f mongo_logs_extractor
 ```
 
-## 10\. GitHub Safety Recommendations
-----------------------------------
+## 12\. Verification (SQL Checks)
+------------------------------
 
-Never commit real credentials.
-
-Required .gitignore entries:
-
-```bash
-.env
-sincedb/
+```   
+SELECT * FROM mongo_connection_logs ORDER BY log_time DESC LIMIT 10;
+SELECT * FROM mongo_audit_logs ORDER BY duration_ms DESC LIMIT 10;
 ```
 
-Recommended:
-
-*   Commit .env.example
-    
-*   Let users create their own .env
-    
-
-## 11\. Resource Optimization Notes
+## 13\. Resource Optimization Notes
 --------------------------------
 
-For low-memory systems:
-
-*   Remove stdout { rubydebug } in production
+*   Disable stdout rubydebug in production
     
-*   Keep flush\_size low (already optimized)
+*   Keep flush\_size low
     
-*   Avoid parallel pipelines unless necessary
+*   Avoid parallel pipelines
     
-*   Prefer one Logstash instance per host
+*   One Logstash instance per host recommended
     
 
-The current configuration is tested on **~3.5 GB RAM systems**.
+Tested on ~3.5 GB RAM systems.
 
-## 12\. Intended Use Cases
+## 14\. Security Notes
+-------------------
+
+*   Never commit .env
+    
+*   Logs mounted read-only
+    
+*   PostgreSQL credentials scoped to INSERT only
+    
+
+## 15\. Intended Use Cases
 -----------------------
 
 *   MongoDB security monitoring
     
 *   Audit trail persistence
     
-*   Performance analysis
+*   Performance diagnostics
     
 *   Centralized logging
     
-*   SIEM / monitoring integrations
-    
-
-## 13\. Final Notes
-----------------
-
-This project is designed to be:
-
-*   Predictable
-    
-*   Auditable
-    
-*   Easy to migrate
-    
-*   Git-friendly
-    
-
-Pipeline logic is explicit, readable, and intentionally not over-abstracted.
+*   SIEM integrations
