@@ -272,7 +272,23 @@ volumes:
     - ./config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
     - ./sincedb:/usr/share/logstash/sincedb
 ```
+### Log File Permissions (Required)
 
+Even if the MongoDB log file is mounted into the Logstash container as read-only (:ro), Logstash cannot read the file unless it is readable on the host filesystem.
+
+For this reason, the MongoDB log file must be world-readable (at least others read).
+
+Run the following command on the host:
+
+```bash
+sudo chmod 644 /var/log/mongodb/mongod.log
+```
+
+This ensures:
+
+MongoDB can continue writing to the log file
+
+Logstash can safely read the file from inside the container
 ## 10\. PostgreSQL Schema
 ----------------------
 
