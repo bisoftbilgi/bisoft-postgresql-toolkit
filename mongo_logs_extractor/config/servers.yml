@@ -1,0 +1,9 @@
+# server_id (folder name) -> metadata (JSON string)
+# Folder layout example:
+#   /logs/mongo-01/mongod.log
+#   /logs/mongo-02/mongod.log
+#   /logs/mongo-03/mongod.log
+
+mongo-01: '{"cluster_name":"mongocluster","server_name":"mongo-01","server_ip":"10.10.10.11"}'
+mongo-02: '{"cluster_name":"mongocluster","server_name":"mongo-02","server_ip":"10.10.10.12"}'
+mongo-03: '{"cluster_name":"mongocluster","server_name":"mongo-03","server_ip":"10.10.10.13"}'
