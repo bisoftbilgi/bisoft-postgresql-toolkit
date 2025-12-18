@@ -1,0 +1,10 @@
+# MySQL nodes (folder name -> metadata)
+# Keep only what you need; uncomment additional nodes as required.
+# Folder layout example:
+#   /logs/mysql-01/general-query.log
+#   /logs/mysql-01/slow-query.log
+
+mysql-01: '{"cluster_name":"mysqlcluster","server_name":"mysql-01","server_ip":"10.20.10.11"}'
+# Uncomment if you have more nodes
+#mysql-02: '{"cluster_name":"mysqlcluster","server_name":"mysql-02","server_ip":"10.20.10.12"}'
+#mysql-03: '{"cluster_name":"mysqlcluster","server_name":"mysql-03","server_ip":"10.20.10.13"}'
