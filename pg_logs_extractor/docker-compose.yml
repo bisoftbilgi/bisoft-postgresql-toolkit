@@ -1,0 +1,18 @@
+services:
+  logstash:
+    build: .
+    image: pg_logs_extractor
+    container_name: pg_logs_extractor
+    env_file:
+      - .env
+    volumes:
+      # Host log directory is configurable via .env
+      - ${HOST_PG_LOG_DIR}:/logs:ro
+
+      - ./pipeline:/usr/share/logstash/pipeline:ro
+      - ./sincedb:/usr/share/logstash/sincedb
+      - ./config/servers.yml:/usr/share/logstash/extra/servers.yml:ro
+    ports:
+      - "5044:5044"
+      - "9600:9600"
+    restart: unless-stopped
