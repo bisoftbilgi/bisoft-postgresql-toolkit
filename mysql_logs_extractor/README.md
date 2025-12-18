@@ -201,16 +201,19 @@ vi .env
 Example:
 
 ```YAML   
-# SOURCE SERVER METADATA (Tags for your logs)
-CLUSTER_NAME=Production-Cluster
-SERVER_NAME=Primary-Node
-SERVER_IP=192.168.1.100
-# POSTGRESQL DESTINATION CONFIG
+# PostgreSQL Destination Config
 PG_HOST=192.168.1.100
 PG_PORT=5432
 PG_DB_NAME=audit_db
 PG_USER=postgres
 PG_PASSWORD=mysecretpassword
+
+# Host path where MySQL logs live (edit for your system)
+HOST_MYSQL_LOG_DIR=/var/log/mysql
+
+# Container globs (pipelines use these)
+MYSQL_GENERAL_LOG_PATH=/logs/*/general-query.log
+MYSQL_SLOW_LOG_PATH=/logs/*/slow-query.log
 ```
 
 ## Docker Compose Configuration
@@ -230,17 +233,16 @@ Example volume mapping section:
 ```YAML   
 services:
     mysql_logs_extractor:
-      volumes:
-        - /path/to/host/mysql/general-query.log:/var/log/mysql/general-query.log:ro
-        - /path/to/host/mysql/slow-query.log:/var/log/mysql/slow-query.log:ro
-        - ./pipeline:/usr/share/logstash/pipeline:ro
-        - ./config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
-        - ./sincedb:/usr/share/logstash/sincedb
       env_file:
         - .env
-```
+      volumes:
+        - ${HOST_MYSQL_LOG_DIR}:/logs:ro
+        - ./pipeline:/usr/share/logstash/pipeline:ro
+        - ./config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+        - ./config/servers.yml:/usr/share/logstash/extra/servers.yml:ro
+        - ./sincedb:/usr/share/logstash/sincedb
 
-> Adjust /path/to/host/mysql/... to your actual MySQL log locations.
+```
 
 ## Run & Monitor
 ---
