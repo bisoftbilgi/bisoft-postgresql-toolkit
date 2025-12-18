@@ -190,7 +190,62 @@ CREATE TABLE IF NOT EXISTS mysql_slowquery_logs (
     application_name VARCHAR(100)
 );
 ```
+## servers.yml Mapping (Host Metadata Enrichment)
 
+This project enriches each event with:
+
+- `cluster_name`
+- `server_name`
+- `server_ip`
+
+### Format
+
+- **Key**: `server_id` (folder name under `/logs`, e.g. `mysql-01`)
+- **Value**: JSON string
+
+```yaml
+mysql-01: '{"cluster_name":"sim-mysql","server_name":"mysql-01","server_ip":"10.20.10.11"}'
+
+# Uncomment / duplicate as needed
+# mysql-02: '{"cluster_name":"sim-mysql","server_name":"mysql-02","server_ip":"10.20.10.12"}'
+# mysql-03: '{"cluster_name":"sim-mysql","server_name":"mysql-03","server_ip":"10.20.10.13"}'
+```
+Folder layout examples
+Folder-based (recommended)
+Host logs:
+
+```text
+${HOST_MYSQL_LOG_DIR}/
+├─ mysql-01/
+│  ├─ general-query.log
+│  └─ slow-query.log
+└─ mysql-02/
+   ├─ general-query.log
+   └─ slow-query.log
+```
+Env globs:
+
+```dotenv
+MYSQL_GENERAL_LOG_PATH=/logs/*/general-query.log
+MYSQL_SLOW_LOG_PATH=/logs/*/slow-query.log
+```
+Single-source (no subfolders)
+If you only have:
+
+```text
+/var/log/mysql/general-query.log
+/var/log/mysql/slow-query.log
+```
+Mount it under a named folder inside the container (example: mysql) and use that name in servers.yml:
+
+```yaml
+mysql: '{"cluster_name":"mysqlcluster","server_name":"mysql","server_ip":"10.20.10.11"}'
+```
+```dotenv
+MYSQL_GENERAL_LOG_PATH=/logs/mysql/general-query.log
+MYSQL_SLOW_LOG_PATH=/logs/mysql/slow-query.log
+## Environment Variables (.env)
+```
 ## Environment Variables (.env)
 ---
 
