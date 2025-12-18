@@ -181,6 +181,8 @@ mongo_logs_extractor/
   ├── docker-compose.yml
   ├── pipeline/
   │   └── mongo.conf
+  ├── config/
+  │   └── servers.yml
   ├── sincedb/
   │   └── .gitignore
   └── README.md
@@ -237,28 +239,19 @@ cd bisoft-postgresql-toolkit/mongo_logs_extractor
 Create a .env file in the project root:
 
 ```env
-# --- Host Metadata ---
-CLUSTER_NAME=
-SERVER_NAME=
-SERVER_IP=
 # --- PostgreSQL Destination ---
 PG_HOST=
 PG_PORT=
 PG_DB_NAME=
 PG_USER=
 PG_PASSWORD=
+
+# Host path where MongoDB logs live (edit for your system)
+HOST_MONGO_LOG_DIR=/srv/mongo-logs
+
+# Container path glob read by Logstash
+MONGO_LOG_PATH=/logs/*/mongod.log
 ```
-
-Notes:
-
-*   SERVER\_NAME and SERVER\_IP are optional
-    
-*   If left empty, Logstash auto-detects:
-    
-    *   Hostname
-        
-    *   First non-loopback IPv4 address
-        
 
 ## 9\. Docker Compose Configuration
 --------------------------------
@@ -267,28 +260,12 @@ The container mounts MongoDB logs and pipeline configuration:
 
 ```yml
 volumes:
-    - /var/log/mongodb/mongod.log:/var/log/mongodb/mongod.log:ro
+    - ${HOST_MONGO_LOG_DIR}:/logs:ro 
     - ./pipeline:/usr/share/logstash/pipeline:ro
     - ./config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
-    - ./sincedb:/usr/share/logstash/sincedb
-```
-### Log File Permissions (Required)
 
-Even if the MongoDB log file is mounted into the Logstash container as read-only (:ro), Logstash cannot read the file unless it is readable on the host filesystem.
-
-For this reason, the MongoDB log file must be world-readable (at least others read).
-
-Run the following command on the host:
-
-```bash
-sudo chmod 644 /var/log/mongodb/mongod.log
 ```
 
-This ensures:
-
-MongoDB can continue writing to the log file
-
-Logstash can safely read the file from inside the container
 ## 10\. PostgreSQL Schema
 ----------------------
 
