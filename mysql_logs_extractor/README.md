@@ -17,6 +17,7 @@ A production-ready pipeline that ingests **MySQL General Query Logs (Audit)** an
 - [Prerequisites](#prerequisites)
 - [MySQL Source Configuration](#mysql-source-configuration)
 - [PostgreSQL Destination Setup (Tables)](#postgresql-destination-setup-tables)
+- [servers.yml Mapping (Host Metadata Enrichment)](#serversyml-mapping-host-metadata-enrichment)
 - [Environment Variables (.env)](#environment-variables-env)
 - [Docker Compose Configuration](#docker-compose-configuration)
 - [Run & Monitor](#run--monitor)
@@ -247,8 +248,6 @@ MYSQL_SLOW_LOG_PATH=/logs/mysql/slow-query.log
 ## Environment Variables (.env)
 ```
 ## Environment Variables (.env)
----
-
 Create .env in the project root.
 ```bash
 vi .env
