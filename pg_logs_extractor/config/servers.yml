@@ -1,0 +1,12 @@
+# PostgreSQL nodes (folder name -> metadata)
+# server_id is derived from the folder name:
+#   /logs/<server_id>/postgresql-*.log
+#
+# Add as many nodes as you need. Example pattern:
+# pg-01: '{"cluster_name":"prod-pg","server_name":"pg-01","server_ip":"10.0.10.11"}'
+
+pg-01: '{"cluster_name":"prod-pg","server_name":"pg-01","server_ip":"10.0.10.11"}'
+
+# Uncomment / duplicate as needed
+# pg-02: '{"cluster_name":"prod-pg","server_name":"pg-02","server_ip":"10.0.10.12"}'
+# pg-03: '{"cluster_name":"prod-pg","server_name":"pg-03","server_ip":"10.0.10.13"}'
