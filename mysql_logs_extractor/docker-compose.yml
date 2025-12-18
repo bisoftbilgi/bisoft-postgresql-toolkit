@@ -4,14 +4,13 @@ services:
     image: mysql_logs_extractor
     container_name: mysql_logs_extractor
     env_file:
-      - .env
+        - .env
     volumes:
-      - /var/log/mysql/general-query.log:/var/log/mysql/general-query.log:ro
-      - /var/log/mysql/slow-query.log:/var/log/mysql/slow-query.log:ro
-      - ./pipeline:/usr/share/logstash/pipeline:ro
-      - ./config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
-
-      - ./sincedb:/usr/share/logstash/sincedb
+        - ${HOST_MYSQL_LOG_DIR}:/logs:ro
+        - ./pipeline:/usr/share/logstash/pipeline:ro
+        - ./config/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+        - ./config/servers.yml:/usr/share/logstash/extra/servers.yml:ro
+        - ./sincedb:/usr/share/logstash/sincedb
     deploy:
       resources:
         limits:
