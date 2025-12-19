@@ -27,24 +27,26 @@ Table of Contents
     *   [7.2 Enable Operational / Slow Query Logs](#72-enable-operational--slow-query-logs)
         
 *   [8\. Environment Configuration (.env)](#8-environment-configuration-env)
+
+*   [9\. servers.yml Mapping (Host Metadata Enrichment)](#9-serversyml-mapping-host-metadata-enrichment)
     
-*   [9\. Docker Compose Configuration](#9-docker-compose-configuration)
+*   [10\. Docker Compose Configuration](#10-docker-compose-configuration)
     
-*   [10\. PostgreSQL Schema](#10-postgresql-schema)
+*   [11\. PostgreSQL Schema](#11-postgresql-schema)
     
-    *   [10.1 Connection Logs Table](#101-connection-logs-table)
+    *   [11.1 Connection Logs Table](#111-connection-logs-table)
         
-    *   [10.2 Audit Logs Table](#102-audit-logs-table)
+    *   [11.2 Audit Logs Table](#112-audit-logs-table)
         
-*   [11\. Run & Monitor](#11-run--monitor)
+*   [12\. Run & Monitor](#12-run--monitor)
     
-*   [12\. Verification (SQL Checks)](#12-verification-sql-checks)
+*   [13\. Verification (SQL Checks)](#13-verification-sql-checks)
     
-*   [13\. Resource Optimization Notes](#13-resource-optimization-notes)
+*   [14\. Resource Optimization Notes](#14-resource-optimization-notes)
     
-*   [14\. Security Notes](#14-security-notes)
+*   [15\. Security Notes](#15-security-notes)
     
-*   [15\. Intended Use Cases](#15-intended-use-cases)
+*   [16\. Intended Use Cases](#16-intended-use-cases)
     
 
 ## 1\. Project Overview
@@ -252,8 +254,15 @@ HOST_MONGO_LOG_DIR=/srv/mongo-logs
 # Container path glob read by Logstash
 MONGO_LOG_PATH=/logs/*/mongod.log
 ```
+## 9\. servers.yml Mapping (Host Metadata Enrichment)
 
-## 9\. Docker Compose Configuration
+This project enriches each event with `cluster_name`, `server_name`, and `server_ip`.
+
+1) Create `config/servers.yml`  
+2) Add one entry per source using a `server_id` key (the folder name under `/logs`)  
+3) The pipeline will extract `server_id` from the log file path and apply the mapped metadata
+
+## 10\. Docker Compose Configuration
 --------------------------------
 
 The container mounts MongoDB logs and pipeline configuration:
@@ -266,10 +275,10 @@ volumes:
 
 ```
 
-## 10\. PostgreSQL Schema
+## 11\. PostgreSQL Schema
 ----------------------
 
-### 10.1 Connection Logs Table
+### 11.1 Connection Logs Table
 
 ```SQL
 CREATE TABLE IF NOT EXISTS mongo_connection_logs (
@@ -302,7 +311,7 @@ CREATE INDEX IF NOT EXISTS idx_mongo_conn_clientip_time
 
 ```
 
-### 10.2 Audit Logs Table
+### 11.2 Audit Logs Table
 
 ```sql
 CREATE TABLE IF NOT EXISTS mongo_audit_logs (
@@ -343,7 +352,7 @@ CREATE INDEX IF NOT EXISTS idx_mongo_audit_duration_time
   ON mongo_audit_logs (duration_ms, log_time DESC);
 ```
 
-## 11\. Run & Monitor
+## 12\. Run & Monitor
 ------------------
 
 ```   
@@ -351,7 +360,7 @@ docker compose up -d --build
 docker logs -f mongo_logs_extractor
 ```
 
-## 12\. Verification (SQL Checks)
+## 13\. Verification (SQL Checks)
 ------------------------------
 
 ```   
@@ -359,7 +368,7 @@ SELECT * FROM mongo_connection_logs ORDER BY log_time DESC LIMIT 10;
 SELECT * FROM mongo_audit_logs ORDER BY duration_ms DESC LIMIT 10;
 ```
 
-## 13\. Resource Optimization Notes
+## 14\. Resource Optimization Notes
 --------------------------------
 
 *   Disable stdout rubydebug in production
@@ -373,7 +382,7 @@ SELECT * FROM mongo_audit_logs ORDER BY duration_ms DESC LIMIT 10;
 
 Tested on ~3.5 GB RAM systems.
 
-## 14\. Security Notes
+## 15\. Security Notes
 -------------------
 
 *   Never commit .env
@@ -383,7 +392,7 @@ Tested on ~3.5 GB RAM systems.
 *   PostgreSQL credentials scoped to INSERT only
     
 
-## 15\. Intended Use Cases
+## 16\. Intended Use Cases
 -----------------------
 
 *   MongoDB security monitoring
