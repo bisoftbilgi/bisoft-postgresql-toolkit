@@ -245,7 +245,7 @@ HOST_PG_LOG_DIR=/srv/pg-logs
 
 # Logstash file input paths (JSON array)
 # Multi-source (folder-based):
-PG_LOG_PATHS=["/logs/*/postgresql-*.log"]
+PG_LOG_PATHS=/logs/*/postgresql-*.log
 
 # Single-source example (mounted under /logs/postgresql):
 # PG_LOG_PATHS=["/logs/postgresql/postgresql-*.log"]
