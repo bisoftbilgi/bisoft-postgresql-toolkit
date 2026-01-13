@@ -146,7 +146,7 @@ No additional APIs are required; everything routes through standard PostgreSQL c
 
 | Symptom | Check / Fix |
 |---------|-------------|
-| Extension fails to load | Ensure `.so` copied into server libdir and `shared_preload_libraries` contains `password_profile_pure`. |
+| Extension fails to load | Ensure `.so` copied into server libdir and `shared_preload_libraries` contains `password_profile`. |
 | Background worker missing | `SELECT * FROM pg_stat_activity WHERE backend_type LIKE 'password_profile%';` and confirm shared_preload_libraries + restart. |
 | Auth events unprocessed | Inspect `dropped` counter in auth ring; if constantly rising, increase ring size and rebuild. |
 | Lock cache misses | `get_lock_cache_stats()` – if utilisation near 100%, bump `LOCK_CACHE_SIZE` constant and recompile. |
