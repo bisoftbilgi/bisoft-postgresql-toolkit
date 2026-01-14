@@ -663,35 +663,111 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
         );
     }
 
+    // Get user-specific or global GUC values
+    // Read from pg_user.useconfig array to get user-level overrides
+    let user_args = [text_arg(username)];
+    
+    let min_length = Spi::get_one_with_args::<i32>(
+        "SELECT COALESCE(
+            (SELECT split_part(config, '=', 2)::int
+             FROM pg_user, unnest(useconfig) AS config
+             WHERE usename = $1 
+               AND config LIKE 'password_profile.min_length=%'
+             LIMIT 1),
+            current_setting('password_profile.min_length', false)::int
+        )",
+        &user_args
+    )?.unwrap_or(PASSWORD_MIN_LENGTH.get());
+
+    let require_uppercase = Spi::get_one_with_args::<bool>(
+        "SELECT COALESCE(
+            (SELECT split_part(config, '=', 2)::bool
+             FROM pg_user, unnest(useconfig) AS config
+             WHERE usename = $1 
+               AND config LIKE 'password_profile.require_uppercase=%'
+             LIMIT 1),
+            current_setting('password_profile.require_uppercase', false)::bool
+        )",
+        &user_args
+    )?.unwrap_or(REQUIRE_UPPERCASE.get());
+
+    let require_lowercase = Spi::get_one_with_args::<bool>(
+        "SELECT COALESCE(
+            (SELECT split_part(config, '=', 2)::bool
+             FROM pg_user, unnest(useconfig) AS config
+             WHERE usename = $1 
+               AND config LIKE 'password_profile.require_lowercase=%'
+             LIMIT 1),
+            current_setting('password_profile.require_lowercase', false)::bool
+        )",
+        &user_args
+    )?.unwrap_or(REQUIRE_LOWERCASE.get());
+
+    let require_digit = Spi::get_one_with_args::<bool>(
+        "SELECT COALESCE(
+            (SELECT split_part(config, '=', 2)::bool
+             FROM pg_user, unnest(useconfig) AS config
+             WHERE usename = $1 
+               AND config LIKE 'password_profile.require_digit=%'
+             LIMIT 1),
+            current_setting('password_profile.require_digit', false)::bool
+        )",
+        &user_args
+    )?.unwrap_or(REQUIRE_DIGIT.get());
+
+    let require_special = Spi::get_one_with_args::<bool>(
+        "SELECT COALESCE(
+            (SELECT split_part(config, '=', 2)::bool
+             FROM pg_user, unnest(useconfig) AS config
+             WHERE usename = $1 
+               AND config LIKE 'password_profile.require_special=%'
+             LIMIT 1),
+            current_setting('password_profile.require_special', false)::bool
+        )",
+        &user_args
+    )?.unwrap_or(REQUIRE_SPECIAL.get());
+
+    let prevent_username = Spi::get_one_with_args::<bool>(
+        "SELECT COALESCE(
+            (SELECT split_part(config, '=', 2)::bool
+             FROM pg_user, unnest(useconfig) AS config
+             WHERE usename = $1 
+               AND config LIKE 'password_profile.prevent_username=%'
+             LIMIT 1),
+            current_setting('password_profile.prevent_username', false)::bool
+        )",
+        &user_args
+    )?.unwrap_or(PREVENT_USERNAME.get());
+
     // 1. Length check
-    if password.len() < PASSWORD_MIN_LENGTH.get() as usize {
+    if password.len() < min_length as usize {
         add_timing_jitter(); // Prevent timing attacks
         return Err("Password too short".into());
     }
 
     // 2. Complexity checks
-    if REQUIRE_UPPERCASE.get() && !password.chars().any(|c| c.is_uppercase()) {
+    if require_uppercase && !password.chars().any(|c| c.is_uppercase()) {
         add_timing_jitter();
         return Err("Password must contain at least one uppercase letter".into());
     }
 
-    if REQUIRE_LOWERCASE.get() && !password.chars().any(|c| c.is_lowercase()) {
+    if require_lowercase && !password.chars().any(|c| c.is_lowercase()) {
         add_timing_jitter();
         return Err("Password must contain at least one lowercase letter".into());
     }
 
-    if REQUIRE_DIGIT.get() && !password.chars().any(|c| c.is_ascii_digit()) {
+    if require_digit && !password.chars().any(|c| c.is_ascii_digit()) {
         add_timing_jitter();
         return Err("Password must contain at least one digit".into());
     }
 
-    if REQUIRE_SPECIAL.get() && !password.chars().any(|c| !c.is_alphanumeric()) {
+    if require_special && !password.chars().any(|c| !c.is_alphanumeric()) {
         add_timing_jitter();
         return Err("Password must contain at least one special character".into());
     }
 
     // 3. Username prevention
-    if PREVENT_USERNAME.get() && !username.is_empty() {
+    if prevent_username && !username.is_empty() {
         let pwd_lower = password.to_lowercase();
         let user_lower = username.to_lowercase();
         if pwd_lower.contains(&user_lower) {
@@ -881,99 +957,82 @@ fn record_failed_login(username: &str) -> Result<String, Box<dyn std::error::Err
         return Ok("Skipped - no database context".to_string());
     }
 
-    let (is_superuser, bypass_check, _lockout_min, max_fails) = Spi::connect_mut(
-        |client| -> pgrx::spi::Result<(bool, bool, i32, i32)> {
-            let username_arg = [text_arg(username)];
+    // Use Spi directly without connect_mut (already in SPI context when called from bg worker)
+    let username_arg = [text_arg(username)];
 
-            let is_super = spi_select_one::<bool>(
-                client,
-                "SELECT COALESCE((SELECT usesuper FROM pg_user WHERE usename = $1), false)",
-                &username_arg,
-            )?
-            .unwrap_or(false);
-            if is_super {
-                return Ok((true, false, 0, 0));
-            }
-
-            let bypass = spi_select_one::<bool>(
-                client,
-                "SELECT COALESCE(
-                    (SELECT (unnest(useconfig) LIKE 'password_profile.bypass_password_profile=true')
-                     FROM pg_user WHERE usename = $1
-                     LIMIT 1),
-                    false
-                )",
-                &username_arg,
-            )?
-            .unwrap_or(false);
-            if bypass {
-                return Ok((false, true, 0, 0));
-            }
-
-            let lockout = spi_select_one::<i32>(
-                client,
-                "SELECT COALESCE(
-                    (
-                        SELECT substring(cfg FROM 'password_profile\\.lockout_minutes=([0-9]+)')::int
-                        FROM unnest((SELECT useconfig FROM pg_user WHERE usename = $1)) AS cfg
-                        WHERE cfg LIKE 'password_profile.lockout_minutes=%'
-                    ),
-                    $2
-                )",
-                &[text_arg(username), int4_arg(LOCKOUT_MINUTES.get())],
-            )?
-            .unwrap_or(LOCKOUT_MINUTES.get());
-
-            let max_fails_val = spi_select_one::<i32>(
-                client,
-                "SELECT COALESCE(
-                    (
-                        SELECT substring(cfg FROM 'password_profile\\.failed_login_max=([0-9]+)')::int
-                        FROM unnest((SELECT useconfig FROM pg_user WHERE usename = $1)) AS cfg
-                        WHERE cfg LIKE 'password_profile.failed_login_max=%'
-                    ),
-                    $2
-                )",
-                &[text_arg(username), int4_arg(FAILED_LOGIN_MAX.get())],
-            )?
-            .unwrap_or(FAILED_LOGIN_MAX.get());
-
-            spi_update(
-                client,
-                "UPDATE password_profile.login_attempts 
-                 SET fail_count = 0, lockout_until = NULL
-                 WHERE username = $1 AND lockout_until IS NOT NULL AND lockout_until <= now()",
-                &username_arg,
-            )?;
-
-            spi_update(
-                client,
-                "INSERT INTO password_profile.login_attempts (username, fail_count, last_fail, lockout_until)
-                 VALUES ($1, 1, now(), NULL)
-                 ON CONFLICT (username) DO UPDATE SET
-                     fail_count = password_profile.login_attempts.fail_count + 1,
-                     last_fail = now(),
-                     lockout_until = CASE
-                         WHEN password_profile.login_attempts.fail_count + 1 >= $2
-                         THEN now() + ($3 || ' minutes')::interval
-                         ELSE NULL
-                     END",
-                &[text_arg(username), int4_arg(max_fails_val), int4_arg(lockout)],
-            )?;
-
-            Ok((false, false, lockout, max_fails_val))
-        },
-    )?;
-
-    if is_superuser {
+    let is_super = Spi::get_one_with_args::<bool>(
+        "SELECT COALESCE((SELECT usesuper FROM pg_user WHERE usename = $1), false)",
+        &username_arg,
+    )?
+    .unwrap_or(false);
+    
+    if is_super {
         return Ok("Superuser bypassed".to_string());
     }
 
-    if bypass_check {
+    let bypass = Spi::get_one_with_args::<bool>(
+        "SELECT COALESCE(
+            (SELECT (unnest(useconfig) LIKE 'password_profile.bypass_password_profile=true')
+             FROM pg_user WHERE usename = $1
+             LIMIT 1),
+            false
+        )",
+        &username_arg,
+    )?
+    .unwrap_or(false);
+    
+    if bypass {
         return Ok("Bypassed failed login tracking".to_string());
     }
 
-    lock_cache::sync(username, max_fails)?;
+    let lockout = Spi::get_one_with_args::<i32>(
+        "SELECT COALESCE(
+            (
+                SELECT substring(cfg FROM 'password_profile\\.lockout_minutes=([0-9]+)')::int
+                FROM unnest((SELECT useconfig FROM pg_user WHERE usename = $1)) AS cfg
+                WHERE cfg LIKE 'password_profile.lockout_minutes=%'
+            ),
+            $2
+        )",
+        &[text_arg(username), int4_arg(LOCKOUT_MINUTES.get())],
+    )?
+    .unwrap_or(LOCKOUT_MINUTES.get());
+
+    let max_fails_val = Spi::get_one_with_args::<i32>(
+        "SELECT COALESCE(
+            (
+                SELECT substring(cfg FROM 'password_profile\\.failed_login_max=([0-9]+)')::int
+                FROM unnest((SELECT useconfig FROM pg_user WHERE usename = $1)) AS cfg
+                WHERE cfg LIKE 'password_profile.failed_login_max=%'
+            ),
+            $2
+        )",
+        &[text_arg(username), int4_arg(FAILED_LOGIN_MAX.get())],
+    )?
+    .unwrap_or(FAILED_LOGIN_MAX.get());
+
+    Spi::run_with_args(
+        "UPDATE password_profile.login_attempts 
+         SET fail_count = 0, lockout_until = NULL
+         WHERE username = $1 AND lockout_until IS NOT NULL AND lockout_until <= now()",
+        &username_arg,
+    )?;
+
+    Spi::run_with_args(
+        "INSERT INTO password_profile.login_attempts (username, fail_count, last_fail, lockout_until)
+         VALUES ($1, 1, now(), NULL)
+         ON CONFLICT (username) DO UPDATE SET
+             fail_count = password_profile.login_attempts.fail_count + 1,
+             last_fail = now(),
+             lockout_until = CASE
+                 WHEN password_profile.login_attempts.fail_count + 1 >= $2
+                 THEN now() + ($3 || ' minutes')::interval
+                 ELSE NULL
+             END",
+        &[text_arg(username), int4_arg(max_fails_val), int4_arg(lockout)],
+    )?;
+
+    lock_cache::sync(username, max_fails_val)?;
     Ok("Failed login recorded".to_string())
 }
 #[pg_extern]

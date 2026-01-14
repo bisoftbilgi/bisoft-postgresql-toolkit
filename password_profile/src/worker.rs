@@ -13,6 +13,7 @@ pub unsafe extern "C" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
 
     // Force SIGTERM to default handler (terminate process) to ensure clean shutdown
     unsafe {
+        #[cfg(any(feature = "pg16", feature = "pg17"))]
         pg_sys::pqsignal(pg_sys::SIGTERM as i32, None);
         pg_sys::BackgroundWorkerUnblockSignals();
     }
