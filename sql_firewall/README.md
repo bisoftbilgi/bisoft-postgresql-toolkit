@@ -1,6 +1,6 @@
 # SQL Firewall for PostgreSQL
 
-A production-ready SQL firewall extension for PostgreSQL 16 (compatible with 14-15). Written in Rust using pgrx, it evaluates every SQL command before execution and enforces security policies including command approvals, regex pattern blocking, rate limiting, fingerprint learning, and activity logging—all without external dependencies.
+A production-ready SQL firewall extension for PostgreSQL 16-18. Written in Rust using pgrx, it evaluates every SQL command before execution and enforces security policies including command approvals, regex pattern blocking, rate limiting, fingerprint learning, and activity logging—all without external dependencies.
 
 ---
 ## 1. Architecture
@@ -62,7 +62,7 @@ All policy decisions happen synchronously inside the backend with panic-safe gua
 
 | Component | Version / Notes |
 |-----------|-----------------|
-| PostgreSQL | 16.x (server binaries + dev headers). Other majors supported if built with matching `pg_config`. |
+| PostgreSQL | 16.x, 17.x, 18.x (server binaries + dev headers). Other majors supported if built with matching `pg_config`. |
 | Rust | Stable 1.72+ recommended. |
 | `cargo-pgrx` | 0.16.x (tested with 0.16.1). |
 | Build deps | clang/llvm, make, gcc, libpq-dev, `postgresql16-devel` (distro-specific names). |
@@ -83,9 +83,9 @@ cd sql_firewall_rs
 cargo pgrx build --release --pg-config /usr/pgsql-16/bin/pg_config
 
 # 3) Deploy artifacts
-sudo cp target/release/libsql_firewall_rs.so /usr/pgsql-16/lib/
-sudo cp sql_firewall_rs.control /usr/pgsql-16/share/extension/
-sudo cp sql/sql_firewall_rs--*.sql /usr/pgsql-16/share/extension/
+sudo cp target/release/sql_firewall_rs-pg16/usr/pgsql-16/lib/sql_firewall_rs.so /usr/pgsql-16/lib/
+sudo cp target/release/sql_firewall_rs-pg16/usr/pgsql-16/share/extension/sql_firewall_rs.control /usr/pgsql-16/share/extension/
+sudo cp target/release/sql_firewall_rs-pg16/usr/pgsql-16/share/extension/sql_firewall_rs--*.sql /usr/pgsql-16/share/extension/
 
 # 4) Enable and create
 sudo sed -i "s/^shared_preload_libraries.*/shared_preload_libraries = 'sql_firewall_rs'/" /var/lib/pgsql/16/data/postgresql.conf
@@ -248,7 +248,7 @@ Enterprise-grade benchmark suite available in `benchmarks/enterprise_benchmark.s
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| `FATAL: could not access file "sql_firewall_rs"` | `.so` missing from PostgreSQL lib dir or typo in `shared_preload_libraries`. | Copy `libsql_firewall_rs.so` into the server lib path and set `shared_preload_libraries = 'sql_firewall_rs'`, then restart PostgreSQL. |
+| `FATAL: could not access file "sql_firewall_rs"` | `.so` missing from PostgreSQL lib dir or typo in `shared_preload_libraries`. | Copy `sql_firewall_rs.so` into the server lib path and set `shared_preload_libraries = 'sql_firewall_rs'`, then restart PostgreSQL. |
 | `DefineSavepoint` or `record_pending` FATAL error | Attempting SPI during transaction abort. | Fixed in current version. Removed problematic SPI calls, now uses 3-layer logging (WARNING + LOG + syslog). |
 | Quiet hours logging causes recursion | Using SPI logging inside quiet hours. | Keep `sql_firewall.quiet_hours_log = on`; it uses elog-only logging and avoids SPI entirely. |
 | Approval rows never appear | SPI insert failing or wrong column names. | Confirm `sql_firewall_command_approvals` schema is installed and that inserts use `(role_name, command_type, is_approved)`. |

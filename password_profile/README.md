@@ -1,7 +1,7 @@
 # Password Profile
 
 Enterprise‑grade password policy and authentication hardening for PostgreSQL.  
-Built with Rust + pgrx (v0.16.1). Tested primarily on PostgreSQL 16 and compatible with 14–15.
+Built with Rust + pgrx (v0.16.1). Tested on PostgreSQL 16-18.
 
 ## 1. Why This Extension?
 
@@ -27,8 +27,7 @@ The extension is transparent to applications. Regular logins go through PostgreS
 
 ## 3. Requirements
 
-- PostgreSQL 16 (preferred), 15 or 14.
-- Server compiled with development headers (`postgresqlXX-devel`).
+- PostgreSQL 16, 17, or 18 (with development headers: `postgresqlXX-devel`).
 - Rust toolchain ≥ 1.70 with `cargo-pgrx 0.16.1`.
 - Ability to add the extension to `shared_preload_libraries`.
 

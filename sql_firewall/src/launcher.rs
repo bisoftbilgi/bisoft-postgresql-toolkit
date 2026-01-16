@@ -111,7 +111,7 @@ pub extern "C-unwind" fn firewall_launcher_main(_arg: pg_sys::Datum) {
                     // Worker needs shared memory and database connection
                     worker.bgw_flags = pg_sys::BGWORKER_SHMEM_ACCESS as i32 
                         | pg_sys::BGWORKER_BACKEND_DATABASE_CONNECTION as i32;
-                    worker.bgw_start_time = pg_sys::BgWorkerStartTime_BgWorkerStart_RecoveryFinished;
+                    worker.bgw_start_time = pg_sys::BgWorkerStartTime::BgWorkerStart_RecoveryFinished;
                     worker.bgw_restart_time = 10; // Restart after 10 seconds if crashes
                     
                     // Set library and function
@@ -164,8 +164,14 @@ pub extern "C-unwind" fn firewall_launcher_main(_arg: pg_sys::Datum) {
             }
         }
         
-        // Wait 10 seconds before next scan
-        BackgroundWorker::wait_latch(Some(Duration::from_secs(10)));
+        // Wait 1 second before next scan (shorter for faster shutdown)
+        BackgroundWorker::wait_latch(Some(Duration::from_secs(1)));
+        
+        // Check for shutdown signal immediately after wait
+        if BackgroundWorker::sigterm_received() {
+            pgrx::log!("sql_firewall: launcher received SIGTERM, shutting down");
+            break;
+        }
     }
     
     pgrx::log!("sql_firewall: launcher stopped");
