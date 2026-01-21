@@ -36,6 +36,9 @@ pub unsafe extern "C" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
 
             processed = true;
             
+            // CRITICAL: NO catch_unwind - conflicts with PostgreSQL signal handling!
+            // BackgroundWorker::transaction already handles errors via Result.
+            // pgrx's pg_guard on the worker entry point converts panics to PostgreSQL errors.
             if let Some(username) = auth_event::username_from_bytes(&event.username) {
                 let result = BackgroundWorker::transaction(|| {
                     if event.is_failure {
@@ -48,6 +51,7 @@ pub unsafe extern "C" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
 
                 if let Err(e) = result {
                     pgrx::warning!("password_profile: worker transaction failed: {:?}", e);
+                    // Continue processing other events - don't crash worker
                 }
             }
         }

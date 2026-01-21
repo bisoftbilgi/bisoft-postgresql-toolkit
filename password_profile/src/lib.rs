@@ -192,6 +192,7 @@ fn encode_username(username: &str) -> [u8; LOCK_USERNAME_BYTES] {
 }
 
 /// Check database for lockout status when cache miss occurs
+/// CRITICAL: Must not panic - called from authentication hook context
 fn check_lockout_from_db(username: &str) -> Option<i64> {
     use pgrx::spi::Spi;
     
@@ -201,6 +202,8 @@ fn check_lockout_from_db(username: &str) -> Option<i64> {
         return None;
     }
     
+    // CRITICAL: NO catch_unwind - it conflicts with PostgreSQL signal handling!
+    // Instead, use proper Result handling. SPI errors are already caught by pgrx.
     let result = Spi::connect(|client| -> pgrx::spi::Result<Option<i64>> {
         let args = [text_arg(username)];
         let table = client.select(
@@ -219,10 +222,17 @@ fn check_lockout_from_db(username: &str) -> Option<i64> {
     
     match result {
         Ok(Some(secs)) if secs > 0 => Some(secs),
-        _ => None,
+        Ok(_) => None,
+        Err(e) => {
+            // SPI error during query - log warning but don't crash
+            // This is safe because pgrx already converted PostgreSQL error to Rust Result
+            pgrx::warning!("password_profile: DB lockout check failed: {:?}", e);
+            None
+        }
     }
 }
 
+#[pg_guard]
 unsafe extern "C" fn client_auth_hook(port: *mut pg_sys::Port, status: c_int) {
     let username_ptr = password_profile_port_username(port);
     if !username_ptr.is_null() {
@@ -236,10 +246,17 @@ unsafe extern "C" fn client_auth_hook(port: *mut pg_sys::Port, status: c_int) {
                     // SECURITY: Do not log usernames
                     add_timing_jitter();
 
-                    static FALLBACK_USERNAME: &[u8] = b"locked_user\0";
-                    let c_username = CString::new(username_str).unwrap_or_else(|_| unsafe {
-                        CStr::from_bytes_with_nul_unchecked(FALLBACK_USERNAME).to_owned()
-                    });
+                    // CRITICAL: Create C string without panic possibility
+                    // Filter out null bytes instead of panicking
+                    let safe_username = username_str.replace('\0', "");
+                    let c_username = match CString::new(safe_username) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            // Should never happen after filtering, but be defensive
+                            static FALLBACK: &[u8] = b"locked_user\0";
+                            unsafe { CStr::from_bytes_with_nul_unchecked(FALLBACK).to_owned() }
+                        }
+                    };
                     unsafe {
                         password_profile_raise_lockout_error(c_username.as_ptr(), seconds as c_int);
                     }

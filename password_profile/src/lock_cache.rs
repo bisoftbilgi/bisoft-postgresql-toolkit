@@ -181,6 +181,8 @@ pub(crate) unsafe fn remaining_seconds(username: &str) -> Option<i64> {
         return None;
     }
 
+    // CRITICAL: NO catch_unwind - conflicts with PostgreSQL signal handling!
+    // Spinlock operations are panic-safe via RAII guard
     let encoded = encode_username(username);
     let cache = &mut *LOCK_CACHE;
     let now = pg_sys::GetCurrentTimestamp();
