@@ -7,8 +7,11 @@ fn main() {
 fn compile_port_shim() {
     println!("cargo:rerun-if-changed=src/port_shim.c");
 
-    let pg_config_path =
-        env::var("PGRX_PG_CONFIG_PATH").expect("PGRX_PG_CONFIG_PATH is not set by cargo-pgrx");
+    // Try PGRX_PG_CONFIG_PATH first, then PG_CONFIG, then default pg_config
+    let pg_config_path = env::var("PGRX_PG_CONFIG_PATH")
+        .or_else(|_| env::var("PG_CONFIG"))
+        .unwrap_or_else(|_| "pg_config".to_string());
+    
     let includedir_server = run_pg_config(&pg_config_path, "--includedir-server");
     let includedir = run_pg_config(&pg_config_path, "--includedir");
 

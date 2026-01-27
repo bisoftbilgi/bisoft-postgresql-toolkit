@@ -62,7 +62,7 @@ pub unsafe fn init() {
     }
     let mut found = false;
     let ptr = pg_sys::ShmemInitStruct(
-        b"sql_firewall_rate_state\0".as_ptr() as *const i8,
+        b"sql_firewall_rate_state\0".as_ptr() as *const u8,
         shared_memory_bytes(),
         &mut found as *mut bool,
     ) as *mut RateState;

@@ -28,7 +28,7 @@ pub fn client_addr(port: *mut pg_sys::Port) -> Option<String> {
         return None;
     }
     let mut buffer = vec![0i8; NI_MAXHOST as usize];
-    let ok = unsafe { sqlfw_port_client_addr(port, buffer.as_mut_ptr(), buffer.len()) };
+    let ok = unsafe { sqlfw_port_client_addr(port, buffer.as_mut_ptr() as *mut c_char, buffer.len()) };
     if ok {
         cstr_to_string(buffer.as_ptr() as *const c_char)
     } else {

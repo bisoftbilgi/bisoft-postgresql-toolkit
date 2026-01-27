@@ -55,7 +55,7 @@ pub unsafe fn init() {
 
     let mut found = false;
     let cache_ptr = pg_sys::ShmemInitStruct(
-        b"sql_firewall_fingerprint_cache\0".as_ptr() as *const i8,
+        b"sql_firewall_fingerprint_cache\0".as_ptr() as *const u8,
         shared_memory_bytes(),
         &mut found as *mut bool,
     ) as *mut FingerprintCache;

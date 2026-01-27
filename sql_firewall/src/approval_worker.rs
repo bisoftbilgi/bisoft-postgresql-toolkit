@@ -32,7 +32,7 @@ pub enum WorkerStatus {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn approval_worker_main(_arg: pg_sys::Datum) {
+pub unsafe extern "C-unwind" fn approval_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     WORKER_PID.store(pg_sys::MyProcPid, Ordering::SeqCst);
     set_status(WorkerStatus::Starting);
@@ -68,6 +68,7 @@ pub unsafe extern "C" fn approval_worker_main(_arg: pg_sys::Datum) {
     
     // Force SIGTERM to default handler (terminate process) to ensure clean shutdown
     unsafe {
+        #[cfg(any(feature = "pg16", feature = "pg17"))]
         pg_sys::pqsignal(pg_sys::SIGTERM as i32, None);
         pg_sys::BackgroundWorkerUnblockSignals();
     }

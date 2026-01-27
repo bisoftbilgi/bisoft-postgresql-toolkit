@@ -378,7 +378,7 @@ BEGIN
         -- Execute INSERT in autonomous transaction
         PERFORM dblink_exec('firewall_log_conn',
             format('INSERT INTO public.sql_firewall_blocked_queries 
-                (role_name, database_name, query_text, application_name, client_ip, command_type, block_reason) 
+                (role_name, database_name, query_text, application_name, client_addr, command_type, reason) 
                 VALUES (%L, %L, %L, %L, %L, %L, %L)',
                 p_role_name, p_database_name, p_query_text, p_application_name,
                 p_client_ip, p_command_type, p_block_reason
@@ -398,7 +398,7 @@ BEGIN
         -- Fallback: regular insert (will rollback with transaction)
         INSERT INTO public.sql_firewall_blocked_queries (
             role_name, database_name, query_text, application_name,
-            client_ip, command_type, block_reason
+            client_addr, command_type, reason
         ) VALUES (
             p_role_name, p_database_name, p_query_text, p_application_name,
             p_client_ip, p_command_type, p_block_reason
@@ -419,14 +419,14 @@ CREATE OR REPLACE FUNCTION public.sql_firewall_internal_upsert_fingerprint(
 BEGIN
     INSERT INTO public.sql_firewall_query_fingerprints (
         fingerprint, normalized_query, role_name, command_type,
-        sample_query, hit_count, is_approved, last_seen
+        sample_query, hit_count, is_approved, last_seen_at
     ) VALUES (
         p_fingerprint, p_normalized_query, p_role_name, p_command_type,
         p_sample_query, 1, p_is_approved, now()
     )
     ON CONFLICT (fingerprint, role_name, command_type) DO UPDATE
     SET hit_count = sql_firewall_query_fingerprints.hit_count + 1,
-        last_seen = now();
+        last_seen_at = now();
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
@@ -582,13 +582,12 @@ REVOKE ALL ON TABLE public.sql_firewall_blocked_queries FROM PUBLIC;
 REVOKE ALL ON TABLE public.sql_firewall_command_approvals FROM PUBLIC;
 REVOKE ALL ON TABLE public.sql_firewall_query_fingerprints FROM PUBLIC;
 REVOKE ALL ON TABLE public.sql_firewall_regex_rules FROM PUBLIC;
-REVOKE ALL ON TABLE public.sql_firewall_cleanup_config FROM PUBLIC;
 
 -- Revoke sequence access
 REVOKE ALL ON SEQUENCE public.sql_firewall_activity_log_log_id_seq FROM PUBLIC;
 REVOKE ALL ON SEQUENCE public.sql_firewall_blocked_queries_block_id_seq FROM PUBLIC;
 REVOKE ALL ON SEQUENCE public.sql_firewall_command_approvals_id_seq FROM PUBLIC;
-REVOKE ALL ON SEQUENCE public.sql_firewall_query_fingerprints_fingerprint_id_seq FROM PUBLIC;
+REVOKE ALL ON SEQUENCE public.sql_firewall_query_fingerprints_id_seq FROM PUBLIC;
 REVOKE ALL ON SEQUENCE public.sql_firewall_regex_rules_id_seq FROM PUBLIC;
 
 -- Grant SELECT on read-only views for monitoring (users can view their own data)
