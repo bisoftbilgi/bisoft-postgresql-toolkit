@@ -416,6 +416,7 @@ pub fn firewall_enabled() -> bool {
 
 // NOTE: ring_buffer_size() removed - using RING_CAPACITY constant in pending_approvals.rs
 
+#[allow(dead_code)]
 pub fn retention_days() -> i32 {
     RETENTION_DAYS.get()
 }
@@ -547,6 +548,7 @@ pub fn fingerprint_learning_enabled() -> bool {
     ENABLE_FINGERPRINT_LEARNING.get()
 }
 
+#[allow(dead_code)]
 pub fn fingerprint_learn_threshold() -> i32 {
     FINGERPRINT_LEARN_THRESHOLD.get()
 }
@@ -678,6 +680,7 @@ fn parse_csv(raw: &CStr) -> Vec<String> {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn approval_worker_database() -> String {
     match APPROVAL_WORKER_DATABASE.get() {
         Some(db) => db.to_string_lossy().to_string(),
