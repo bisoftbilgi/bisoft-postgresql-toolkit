@@ -3,7 +3,6 @@ use pgrx::bgworkers::*;
 use pgrx::pg_sys;
 use std::collections::HashSet;
 use std::time::Duration;
-use std::ffi::CString;
 
 /// Firewall Launcher - Supervisor Worker
 /// Monitors pg_database and spawns per-database workers
@@ -100,13 +99,11 @@ pub extern "C-unwind" fn firewall_launcher_main(_arg: pg_sys::Datum) {
                     let mut worker: pg_sys::BackgroundWorker = std::mem::zeroed();
                     
                     // Set worker name
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            worker_name_cstr.as_ptr() as *const u8,
-                            worker.bgw_name.as_mut_ptr() as *mut u8,
-                            std::cmp::min(worker_name.len(), pg_sys::BGW_MAXLEN as usize - 1),
-                        );
-                    }
+                    std::ptr::copy_nonoverlapping(
+                        worker_name_cstr.as_ptr() as *const u8,
+                        worker.bgw_name.as_mut_ptr() as *mut u8,
+                        std::cmp::min(worker_name.len(), pg_sys::BGW_MAXLEN as usize - 1),
+                    );
                     
                     // Worker needs shared memory and database connection
                     worker.bgw_flags = pg_sys::BGWORKER_SHMEM_ACCESS as i32 
@@ -115,34 +112,30 @@ pub extern "C-unwind" fn firewall_launcher_main(_arg: pg_sys::Datum) {
                     worker.bgw_restart_time = 10; // Restart after 10 seconds if crashes
                     
                     // Set library and function
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            library_cstr.as_ptr() as *const u8,
-                            worker.bgw_library_name.as_mut_ptr() as *mut u8,
-                            std::cmp::min("sql_firewall_rs".len(), pg_sys::BGW_MAXLEN as usize - 1),
-                        );
-                        
-                        std::ptr::copy_nonoverlapping(
-                            function_cstr.as_ptr() as *const u8,
-                            worker.bgw_function_name.as_mut_ptr() as *mut u8,
-                            std::cmp::min("approval_worker_main".len(), pg_sys::BGW_MAXLEN as usize - 1),
-                        );
-                    }
+                    std::ptr::copy_nonoverlapping(
+                        library_cstr.as_ptr() as *const u8,
+                        worker.bgw_library_name.as_mut_ptr() as *mut u8,
+                        std::cmp::min("sql_firewall_rs".len(), pg_sys::BGW_MAXLEN as usize - 1),
+                    );
+                    
+                    std::ptr::copy_nonoverlapping(
+                        function_cstr.as_ptr() as *const u8,
+                        worker.bgw_function_name.as_mut_ptr() as *mut u8,
+                        std::cmp::min("approval_worker_main".len(), pg_sys::BGW_MAXLEN as usize - 1),
+                    );
                     
                     // CRITICAL: Pass database OID via bgw_extra (string-based, safe)
                     let oid_string = u32::from(oid).to_string();
                     let oid_bytes = oid_string.as_bytes();
                     let copy_len = std::cmp::min(oid_bytes.len(), 127); // Leave room for null terminator
                     
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            oid_bytes.as_ptr(),
-                            worker.bgw_extra.as_mut_ptr() as *mut u8,
-                            copy_len,
-                        );
-                        // Null terminate
-                        worker.bgw_extra[copy_len] = 0;
-                    }
+                    std::ptr::copy_nonoverlapping(
+                        oid_bytes.as_ptr(),
+                        worker.bgw_extra.as_mut_ptr() as *mut u8,
+                        copy_len,
+                    );
+                    // Null terminate
+                    worker.bgw_extra[copy_len] = 0;
                     
                     worker.bgw_main_arg = pg_sys::Datum::from(0_usize); // Not used
                     worker.bgw_notify_pid = pg_sys::MyProcPid;
