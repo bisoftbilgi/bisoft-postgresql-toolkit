@@ -582,7 +582,6 @@ REVOKE ALL ON TABLE public.sql_firewall_blocked_queries FROM PUBLIC;
 REVOKE ALL ON TABLE public.sql_firewall_command_approvals FROM PUBLIC;
 REVOKE ALL ON TABLE public.sql_firewall_query_fingerprints FROM PUBLIC;
 REVOKE ALL ON TABLE public.sql_firewall_regex_rules FROM PUBLIC;
-REVOKE ALL ON TABLE public.sql_firewall_cleanup_config FROM PUBLIC;
 
 -- Revoke sequence access
 REVOKE ALL ON SEQUENCE public.sql_firewall_activity_log_log_id_seq FROM PUBLIC;
