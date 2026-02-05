@@ -7,11 +7,10 @@ use pgrx::prelude::*;
 use std::time::Duration;
 
 #[no_mangle]
-pub unsafe extern "C" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
+pub unsafe extern "C-unwind" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
 
-    // Force SIGTERM to default handler (terminate process) to ensure clean shutdown
     unsafe {
         #[cfg(any(feature = "pg16", feature = "pg17"))]
         pg_sys::pqsignal(pg_sys::SIGTERM as i32, None);
@@ -36,9 +35,6 @@ pub unsafe extern "C" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
 
             processed = true;
             
-            // CRITICAL: NO catch_unwind - conflicts with PostgreSQL signal handling!
-            // BackgroundWorker::transaction already handles errors via Result.
-            // pgrx's pg_guard on the worker entry point converts panics to PostgreSQL errors.
             if let Some(username) = auth_event::username_from_bytes(&event.username) {
                 let result = BackgroundWorker::transaction(|| {
                     if event.is_failure {
@@ -51,13 +47,11 @@ pub unsafe extern "C" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
 
                 if let Err(e) = result {
                     pgrx::warning!("password_profile: worker transaction failed: {:?}", e);
-                    // Continue processing other events - don't crash worker
                 }
             }
         }
 
         if !processed {
-            // Use wait_latch instead of thread::sleep for proper signal handling
             BackgroundWorker::wait_latch(Some(Duration::from_millis(25)));
             check_for_interrupts!();
         }
