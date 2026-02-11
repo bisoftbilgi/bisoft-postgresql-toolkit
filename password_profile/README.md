@@ -27,42 +27,139 @@ The extension is transparent to applications. Regular logins go through PostgreS
 
 ## 3. Requirements
 
-- PostgreSQL 16, 17, or 18 (with development headers: `postgresqlXX-devel`).
-- Rust toolchain ≥ 1.70 with `cargo-pgrx 0.16.1`.
-- Ability to add the extension to `shared_preload_libraries`.
+### PostgreSQL
+
+**Supported versions:**
+- PostgreSQL 16, 17, or 18
+
+**Required packages:**
+- `postgresqlXX`
+- `postgresqlXX-server`
+- `postgresqlXX-devel`
+
+*The `-devel` package is mandatory for extension compilation.*
+
+---
+
+### Rust Toolchain
+
+- Rust ≥ 1.70
+- `cargo-pgrx 0.16.1`
+
+Install if needed:
+
+```bash
+cargo install --locked cargo-pgrx --version 0.16.1
+```
+
+---
+
+### PostgreSQL Configuration Capability
+
+You must be able to modify:
+- `shared_preload_libraries`
+
+and restart PostgreSQL.
+
+---
+
+### System Dependencies (Build-Time)
+
+For RHEL / Rocky / AlmaLinux systems:
+
+```bash
+sudo dnf config-manager --set-enabled crb
+
+sudo dnf install -y \
+    openssl-devel \
+    krb5-devel \
+    pkgconf-pkg-config
+```
+
+These libraries are required by:
+- Rust `openssl-sys`
+- PostgreSQL server headers
+- Authentication/GSSAPI includes
+
+---
+
+### Environment Setup
+
+Ensure `pg_config` is discoverable by build tooling:
+
+```bash
+export PG_CONFIG=/usr/pgsql-XX/bin/pg_config
+```
+
+*Alternatively pass it explicitly to `cargo pgrx`.*
+
+---
 
 ## 4. Build & Install
 
+### Initialise pgrx
+
 ```bash
-# Install cargo-pgrx if needed
-cargo install --locked cargo-pgrx --version 0.16.1
-
-# Initialise pgrx for your pg_config
 cargo pgrx init --pg16 /usr/pgsql-16/bin/pg_config
+```
 
-# Package the extension
+*Run once per PostgreSQL version.*
+
+### Build Extension Package
+
+```bash
 cargo pgrx package --pg-config /usr/pgsql-16/bin/pg_config
+```
 
-# Copy artifacts into PostgreSQL
+### Install Artifacts into PostgreSQL
+
+This installs:
+- Shared library (`.so`)
+- Extension control file
+- SQL migration scripts
+
+```bash
 sudo cp -r target/release/password_profile-pg16/usr/pgsql-16/* /usr/pgsql-16/
+```
 
-# Copy blacklist file to PGDATA directory
+### Install Password Blacklist
+
+```bash
 sudo cp blacklist.txt /var/lib/pgsql/16/data/password_profile_blacklist.txt
 sudo chown postgres:postgres /var/lib/pgsql/16/data/password_profile_blacklist.txt
+```
+
+### Enable Extension Preload
+
+```bash
+echo "shared_preload_libraries = 'password_profile'" \
+| sudo tee -a /var/lib/pgsql/16/data/postgresql.conf
 
 # Enable in postgresql.conf
 echo \"shared_preload_libraries = 'password_profile_pure'\" | sudo tee -a /var/lib/pgsql/16/data/postgresql.conf
 sudo systemctl restart postgresql-16
+```
 
 # Create in each database where you need it
 psql -d mydb -c \"CREATE EXTENSION password_profile_pure;\"
 psql -d mydb -c \"SELECT init_login_attempts_table();\"
 
-# Load common password blacklist (10,000+ entries)
-psql -d mydb -c \"SELECT load_blacklist_from_file(NULL);\"
+### Load Common Password Blacklist
+
+```bash
+psql -d mydb -c "SELECT load_blacklist_from_file(NULL);"
 ```
 
-Repeat for pg15/pg14 by pointing `cargo pgrx package` to the corresponding `pg_config`.
+### Multi-Version Build
+
+To build for additional PostgreSQL versions:
+
+```bash
+cargo pgrx package --pg-config /usr/pgsql-15/bin/pg_config
+cargo pgrx package --pg-config /usr/pgsql-14/bin/pg_config
+```
+
+---
 
 ## 5. Configuration (GUCs)
 

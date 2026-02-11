@@ -160,6 +160,7 @@ pub fn set_approval(role_oid: pg_sys::Oid, command: &str, is_approved: bool) {
 }
 
 /// Invalidate all cache entries (call when approvals change)
+#[allow(dead_code)]
 pub fn invalidate_all() {
     unsafe {
         if CACHE.is_null() {

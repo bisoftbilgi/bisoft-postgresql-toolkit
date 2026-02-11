@@ -189,6 +189,7 @@ fn encode_string(s: &str, buffer: &mut [u8]) {
 }
 
 /// Emit rate-limited drop warning (max 1 per minute)
+#[allow(dead_code)]
 unsafe fn emit_drop_warning_if_needed() {
     let ring = &*EVENT_RING;
     let now = pg_sys::GetCurrentTimestamp() / 1_000_000; // Convert to seconds
@@ -464,6 +465,7 @@ pub(crate) fn string_from_bytes(bytes: &[u8]) -> Option<String> {
 }
 
 /// Get ring buffer statistics for monitoring
+#[allow(dead_code)]
 pub(crate) fn get_stats() -> (u64, usize, u64) {
     unsafe {
         if EVENT_RING.is_null() {

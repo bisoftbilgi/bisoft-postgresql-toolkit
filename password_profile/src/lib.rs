@@ -27,20 +27,11 @@ const LOCK_USERNAME_BYTES: usize = 64;
 const MICROS_PER_SEC: i64 = 1_000_000;
 const AUTH_EVENT_RING_SIZE: usize = 1024;
 
-/// Shared memory blacklist cache using sorted hash array for O(log n) lookup
-/// Memory: ~80KB shared vs ~80MB (1000 processes × 80KB each) with Mutex<HashSet>
-///
-/// CRITICAL: Uses fixed SipHash keys (k0, k1) stored in shared memory to ensure
-/// consistent hashing across all processes. Without fixed keys, each process
-/// would hash passwords differently, breaking lookups entirely.
-/// RAII guard for PostgreSQL SpinLock - automatically releases lock on drop (panic-safe)
 struct SpinLockGuard {
     lock_ptr: *mut pg_sys::slock_t,
 }
 
 impl SpinLockGuard {
-    /// Acquires SpinLock and returns RAII guard
-    /// SAFETY: Caller must ensure lock_ptr is valid for entire lifetime
     unsafe fn new(lock_ptr: *mut pg_sys::slock_t) -> Self {
         pg_sys::SpinLockAcquire(lock_ptr);
         Self { lock_ptr }
@@ -49,18 +40,15 @@ impl SpinLockGuard {
 
 impl Drop for SpinLockGuard {
     fn drop(&mut self) {
-        // CRITICAL: Always release lock even if panic occurs
         unsafe { pg_sys::SpinLockRelease(self.lock_ptr) }
     }
 }
 
-// Hook registration - ensures hooks are registered exactly once
 static CLIENT_AUTH_HOOK_INIT: Once = Once::new();
 
-type ClientAuthHookRaw = unsafe extern "C" fn(port: *mut pg_sys::Port, status: c_int);
+type ClientAuthHookRaw = unsafe extern "C-unwind" fn(port: *mut pg_sys::Port, status: c_int);
 static mut PREV_CLIENT_AUTH_HOOK: Option<ClientAuthHookRaw> = None;
 
-// Password complexity GUCs
 static PASSWORD_MIN_LENGTH: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(8);
 static REQUIRE_UPPERCASE: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(false);
 static REQUIRE_LOWERCASE: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(false);
@@ -68,32 +56,19 @@ static REQUIRE_DIGIT: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(fal
 static REQUIRE_SPECIAL: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(false);
 static PREVENT_USERNAME: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
 
-// Password history GUCs
 static PASSWORD_HISTORY_COUNT: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(5);
 static PASSWORD_REUSE_DAYS: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(90);
 
-// Password expiration GUCs
 static PASSWORD_EXPIRY_DAYS: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(90);
 static PASSWORD_GRACE_LOGINS: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(3);
 
-// Failed login GUCs
 static FAILED_LOGIN_MAX: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(3);
 static LOCKOUT_MINUTES: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(2);
 
-// bcrypt hashing cost (4-31, default 10)
-// Higher = more secure but slower. Adjust based on hardware and security requirements.
-// Cost 10 = ~70ms, Cost 12 = ~300ms, Cost 8 = ~20ms
 static BCRYPT_COST: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(10);
 
-// Bypass parameter for special users (superusers, service accounts)
 static BYPASS_PASSWORD_PROFILE: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(false);
 
-// ====================================================================================
-// PostgreSQL Hook Integration
-// ====================================================================================
-
-/// Register the check_password_hook to automatically validate passwords
-/// This hook is called whenever a user password is set via CREATE USER, ALTER USER, or \password
 unsafe fn register_password_check_hook() {
     static mut PREV_CHECK_PASSWORD_HOOK: pg_sys::check_password_hook_type = None;
 
@@ -105,7 +80,6 @@ unsafe fn register_password_check_hook() {
         validuntil_time: pg_sys::Datum,
         validuntil_null: bool,
     ) {
-        // Convert C strings to Rust
         let username_str = if username.is_null() {
             "unknown"
         } else {
@@ -118,9 +92,6 @@ unsafe fn register_password_check_hook() {
             CStr::from_ptr(shadow_pass).to_str().unwrap_or("")
         };
 
-        // CRITICAL SECURITY: Check for hash-like input BEFORE password_type check
-        // PostgreSQL auto-detects "md5..." as PASSWORD_TYPE_MD5, bypassing our PLAINTEXT check
-        // We must reject hash-formatted strings even if PostgreSQL thinks they're already hashed
         if !password_str.is_empty() && is_hash_like(password_str) {
             pgrx::error!(
                 "Security violation: Password looks like a precomputed hash. \
@@ -128,25 +99,20 @@ unsafe fn register_password_check_hook() {
             );
         }
 
-        // Only validate plaintext passwords (PASSWORD_TYPE_PLAINTEXT)
-        // Skip already hashed passwords (PASSWORD_TYPE_MD5, PASSWORD_TYPE_SCRAM_SHA_256)
         if password_type == pg_sys::PasswordType::PASSWORD_TYPE_PLAINTEXT
             && !password_str.is_empty()
         {
-            // Call our validation function
             match check_password(username_str, password_str) {
                 Ok(_) => {
                     structured_log::log_password_validated(username_str);
                 }
                 Err(e) => {
-                    // Password validation failed - log and report error
                     structured_log::log_password_rejected(username_str, &e.to_string());
                     pgrx::error!("Password validation failed: {}", e);
                 }
             }
         }
 
-        // Call the previous hook if it exists
         if let Some(prev_hook) = PREV_CHECK_PASSWORD_HOOK {
             pg_guard_ffi_boundary(|| {
                 prev_hook(
@@ -160,16 +126,11 @@ unsafe fn register_password_check_hook() {
         }
     }
 
-    // Save previous hook and install ours
     PREV_CHECK_PASSWORD_HOOK = pg_sys::check_password_hook;
     pg_sys::check_password_hook = Some(password_check_hook);
 }
 
-// ====================================================================================
-// Client Authentication Hook Integration
-// ====================================================================================
-
-extern "C" {
+extern "C-unwind" {
     fn password_profile_port_username(port: *mut pg_sys::Port) -> *const std::os::raw::c_char;
     fn password_profile_register_client_auth_hook(
         hook: Option<ClientAuthHookRaw>,
@@ -191,19 +152,14 @@ fn encode_username(username: &str) -> [u8; LOCK_USERNAME_BYTES] {
     buf
 }
 
-/// Check database for lockout status when cache miss occurs
-/// CRITICAL: Must not panic - called from authentication hook context
 fn check_lockout_from_db(username: &str) -> Option<i64> {
     use pgrx::spi::Spi;
     
-    // Check if we can connect to database
     let my_db_id = unsafe { std::ptr::addr_of!(pg_sys::MyDatabaseId).read() };
     if my_db_id == pg_sys::InvalidOid {
         return None;
     }
     
-    // CRITICAL: NO catch_unwind - it conflicts with PostgreSQL signal handling!
-    // Instead, use proper Result handling. SPI errors are already caught by pgrx.
     let result = Spi::connect(|client| -> pgrx::spi::Result<Option<i64>> {
         let args = [text_arg(username)];
         let table = client.select(
@@ -224,8 +180,6 @@ fn check_lockout_from_db(username: &str) -> Option<i64> {
         Ok(Some(secs)) if secs > 0 => Some(secs),
         Ok(_) => None,
         Err(e) => {
-            // SPI error during query - log warning but don't crash
-            // This is safe because pgrx already converted PostgreSQL error to Rust Result
             pgrx::warning!("password_profile: DB lockout check failed: {:?}", e);
             None
         }
@@ -233,26 +187,21 @@ fn check_lockout_from_db(username: &str) -> Option<i64> {
 }
 
 #[pg_guard]
-unsafe extern "C" fn client_auth_hook(port: *mut pg_sys::Port, status: c_int) {
+unsafe extern "C-unwind" fn client_auth_hook(port: *mut pg_sys::Port, status: c_int) {
     let username_ptr = password_profile_port_username(port);
     if !username_ptr.is_null() {
         if let Ok(username_str) = CStr::from_ptr(username_ptr).to_str() {
-            // First check cache, if not found then check database
             let remaining_secs = unsafe { lock_cache::remaining_seconds(username_str) }
                 .or_else(|| check_lockout_from_db(username_str));
             
             if let Some(seconds) = remaining_secs {
                 if seconds > 0 {
-                    // SECURITY: Do not log usernames
                     add_timing_jitter();
 
-                    // CRITICAL: Create C string without panic possibility
-                    // Filter out null bytes instead of panicking
                     let safe_username = username_str.replace('\0', "");
                     let c_username = match CString::new(safe_username) {
                         Ok(s) => s,
                         Err(_) => {
-                            // Should never happen after filtering, but be defensive
                             static FALLBACK: &[u8] = b"locked_user\0";
                             unsafe { CStr::from_bytes_with_nul_unchecked(FALLBACK).to_owned() }
                         }
@@ -260,8 +209,6 @@ unsafe extern "C" fn client_auth_hook(port: *mut pg_sys::Port, status: c_int) {
                     unsafe {
                         password_profile_raise_lockout_error(c_username.as_ptr(), seconds as c_int);
                     }
-                    // User is locked - don't process this as a successful login
-                    // Call previous hook and return early
                     if let Some(prev_hook) = PREV_CLIENT_AUTH_HOOK {
                         pg_guard_ffi_boundary(|| prev_hook(port, status));
                     }
@@ -277,24 +224,19 @@ unsafe extern "C" fn client_auth_hook(port: *mut pg_sys::Port, status: c_int) {
                     sqlstate == PgSqlErrorCode::ERRCODE_INVALID_PASSWORD as u32;
 
                 if is_invalid_password {
-                    // Check if user exists in pg_authid before tracking
                     let user_exists = password_profile_user_exists(username_ptr);
 
                     if user_exists == 1 {
                         auth_event::enqueue(username_str, true);
-                        // SECURITY: Do not log usernames
                     } else if user_exists == 0 {
-                        // Non-existent user - do not track fake usernames
                     } else {
                         pgrx::warning!(
                             "password_profile: failed to verify user existence during auth failure"
                         );
                     }
                 } else {
-                    // Non-password failures (pg_hba reject, SSL, etc.) shouldn't affect lockouts
                 }
             } else {
-                // Success - clear failure count
                 auth_event::enqueue(username_str, false);
                 // SECURITY: Do not log usernames
             }
@@ -312,18 +254,15 @@ fn register_client_auth_hook() {
         unsafe {
             PREV_CLIENT_AUTH_HOOK =
                 password_profile_register_client_auth_hook(Some(client_auth_hook));
-            // Note: lock_cache::init() is called from shmem_startup_hook, not here
         }
         pgrx::log!("ClientAuthentication_hook registered");
     });
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn _PG_init() {
-    // CRITICAL: Verify that _PG_init is being called during library load
+pub unsafe extern "C-unwind" fn _PG_init() {
     pgrx::warning!("password_profile_pure: _PG_init called - extension loading");
 
-    // Register shmem_request_hook to request shared memory space
     static mut PREV_SHMEM_REQUEST_HOOK: Option<unsafe extern "C-unwind" fn()> = None;
 
     unsafe extern "C-unwind" fn shmem_request_hook_impl() {
@@ -338,7 +277,6 @@ pub unsafe extern "C" fn _PG_init() {
     PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
     pg_sys::shmem_request_hook = Some(shmem_request_hook_impl);
 
-    // Register shmem_startup_hook to initialize the cache
     static mut PREV_SHMEM_STARTUP_HOOK: Option<unsafe extern "C-unwind" fn()> = None;
 
     unsafe extern "C-unwind" fn shmem_startup_hook_impl() {
@@ -346,14 +284,13 @@ pub unsafe extern "C" fn _PG_init() {
             prev();
         }
         lock_cache::init();
-        blacklist::init(); // Initialize blacklist in shared memory
-        auth_event::init(); // Initialize auth event queue
+        blacklist::init();
+        auth_event::init();
     }
 
     PREV_SHMEM_STARTUP_HOOK = pg_sys::shmem_startup_hook;
     pg_sys::shmem_startup_hook = Some(shmem_startup_hook_impl);
 
-    // Password complexity
     pgrx::GucRegistry::define_int_guc(
         c"password_profile.min_length",
         c"Minimum password length",
@@ -410,7 +347,6 @@ pub unsafe extern "C" fn _PG_init() {
         pgrx::GucFlags::default(),
     );
 
-    // Password history
     pgrx::GucRegistry::define_int_guc(
         c"password_profile.password_history_count",
         c"Number of previous passwords to check (0=disabled)",
@@ -433,7 +369,6 @@ pub unsafe extern "C" fn _PG_init() {
         pgrx::GucFlags::default(),
     );
 
-    // Password expiration
     pgrx::GucRegistry::define_int_guc(
         c"password_profile.password_expiry_days",
         c"Days before password expires (0=disabled)",
@@ -456,7 +391,6 @@ pub unsafe extern "C" fn _PG_init() {
         pgrx::GucFlags::default(),
     );
 
-    // Failed login lockout
     pgrx::GucRegistry::define_int_guc(
         c"password_profile.failed_login_max",
         c"Maximum failed login attempts",
@@ -490,7 +424,6 @@ pub unsafe extern "C" fn _PG_init() {
         pgrx::GucFlags::default(),
     );
 
-    // Bypass parameter for exempting users from password profile checks
     pgrx::GucRegistry::define_bool_guc(
         c"password_profile.bypass_password_profile",
         c"Bypass all password profile checks for this user",
@@ -500,63 +433,32 @@ pub unsafe extern "C" fn _PG_init() {
         pgrx::GucFlags::default(),
     );
 
-    // Background worker: consume auth events from shared memory
     BackgroundWorkerBuilder::new("password_profile_auth_event_consumer")
         .set_function("auth_event_consumer_main")
-        .set_library("password_profile") // MUST match Cargo.toml [package] name AND .so filename
+        .set_library("password_profile")
         .set_argument(None::<i32>.into_datum())
         .set_restart_time(Some(Duration::from_secs(1)))
         .enable_spi_access()
         .load();
     pgrx::info!("password_profile: auth event consumer background worker registered");
 
-    // Register check_password_hook
     pgrx::log!("password_profile: Registering hooks...");
     unsafe {
         register_password_check_hook();
         pgrx::log!("password_profile: Password check hook registered");
     }
     register_client_auth_hook();
-    // Note: log_hook removed - using SQLSTATE check in client_auth_hook instead
-
-    // CRITICAL FIX: CANNOT call SPI functions (Spi::run) during _PG_init!
-    // _PG_init runs in the postmaster process during shared library load,
-    // and SPI is not available/initialized at this phase. Calling SPI here
-    // causes FATAL errors: "SPI_connect() can only be called from a normal backend"
-    // or crashes the entire PostgreSQL server.
-    //
-    // Table creation has been moved to sql/password_profile--0.0.0.sql
-    // which is automatically executed during CREATE EXTENSION.
-    // Removed init_login_attempts_table() call from here.
 
     pgrx::log!("password_profile initialized with all features");
 }
 
-// Timing attack prevention: Add small random delay on auth failures
-// This prevents attackers from measuring timing differences to gain info
-#[inline(never)] // Prevent optimization from removing this
+#[inline(never)]
 fn add_timing_jitter() {
     let mut rng = rand::thread_rng();
-    // Random delay between 10-50ms to mask timing variations
     let delay_ms = rng.gen_range(10..50);
-    // SECURITY: Do NOT log timing delay - prevents information leakage
     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
 }
 
-/// SECURITY: Detect if a password string looks like a precomputed hash
-/// This prevents attackers from bypassing validation by entering hash strings directly
-///
-/// Detects:
-/// 1. PostgreSQL MD5: md5 + 32 hex chars (e.g., md5c4ca4238a0b923820dcc509a6f75849b)
-/// 2. bcrypt: $2a$, $2b$, $2x$, $2y$ formats (typically 60 chars)
-/// 3. argon2: $argon2i$, $argon2id$, $argon2d$ formats
-/// 4. SCRAM-SHA-256: SCRAM-SHA-256$ prefix
-/// 5. PBKDF2: $pbkdf2-sha256$ and similar
-/// 6. Raw MD5: exactly 32 hex chars (OPTIONAL - may cause false positives)
-/// 7. SHA-1: exactly 40 hex chars (OPTIONAL)
-/// 8. SHA-256: exactly 64 hex chars (OPTIONAL)
-/// 9. SHA-512: exactly 128 hex chars (OPTIONAL)
-/// 10. Generic hash pattern: long strings with $ delimiters
 fn is_hash_like(password: &str) -> bool {
     if password.is_empty() {
         return false;
@@ -565,8 +467,6 @@ fn is_hash_like(password: &str) -> bool {
     let len = password.len();
     let lower = password.to_lowercase();
 
-    // 1. PostgreSQL MD5 format: "md5" + 32 hex = 35 chars total
-    // Example: md5c4ca4238a0b923820dcc509a6f75849b
     if len == 35 && lower.starts_with("md5") {
         let hex_part = &password[3..];
         if hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -574,22 +474,15 @@ fn is_hash_like(password: &str) -> bool {
         }
     }
 
-    // 2. bcrypt formats: $2a$, $2b$, $2x$, $2y$
-    // Typical format: $2b$12$R9h/cIPz0gi.URNNX3kh2OPST9/PgBkqquzi.Ss7KIUgO2t0jWMUW
-    // Length usually ~60 chars, but can be shorter in some implementations
-    // Format: $2[abxy]$<cost>$<salt+hash>
     if (lower.starts_with("$2a$")
         || lower.starts_with("$2b$")
         || lower.starts_with("$2x$")
         || lower.starts_with("$2y$"))
         && len >= 20
-    // Minimum reasonable bcrypt length (relaxed from 59)
     {
         return true;
     }
 
-    // 3. argon2 formats: $argon2i$, $argon2id$, $argon2d$
-    // Example: $argon2id$v=19$m=65536,t=2,p=1$...
     if lower.starts_with("$argon2i$")
         || lower.starts_with("$argon2id$")
         || lower.starts_with("$argon2d$")
@@ -599,39 +492,21 @@ fn is_hash_like(password: &str) -> bool {
 
     // 4. SCRAM-SHA-256 format
     // Example: SCRAM-SHA-256$4096:salt$hash:proof
-    if lower.starts_with("scram-sha-256$") || lower.starts_with("scram-sha-1$") {
-        return true;
     }
 
     // 5. PBKDF2 formats
     // Example: $pbkdf2-sha256$29000$...
-    if lower.starts_with("$pbkdf2") {
-        return true;
     }
 
     // 6. Django/Werkzeug formats
     // Example: pbkdf2:sha256:... or sha1$salt$hash
     if lower.starts_with("pbkdf2:") || lower.starts_with("sha1$") || lower.starts_with("sha256$") {
         return true;
-    }
-
     // 7. Raw MD5: exactly 32 hex chars (OPTIONAL - may reject valid hex passwords)
     // Disabled by default to avoid false positives
     // Uncomment if you want to strictly reject all 32-char hex strings
     // if len == 32 && password.chars().all(|c| c.is_ascii_hexdigit()) {
-    //     return true;
-    // }
-
-    // 8. Common hash lengths (OPTIONAL - commented out to avoid false positives)
-    // SHA-1: 40 hex, SHA-256: 64 hex, SHA-512: 128 hex
-    // These might be legitimate passwords, so we're conservative here
-    if (len == 40 || len == 64 || len == 128) && password.chars().all(|c| c.is_ascii_hexdigit()) {
-        // Only reject if it looks TOO much like a hash (all lowercase/uppercase hex)
-        // Real passwords with these lengths are unlikely to be pure hex
-        return true;
-    }
-
-    // 9. Generic hash pattern: starts with $, has multiple $ delimiters, and is long
+    if (len == 40 || len == 64 || len == 128) && password.chars().all(|c| c.is_ascii_hexdigit()) {, and is long
     // This catches many other hash formats we might have missed
     if password.starts_with('$') && len > 50 && password.matches('$').count() >= 3 {
         return true;
@@ -647,13 +522,10 @@ fn is_hash_like(password: &str) -> bool {
     false
 }
 
-#[pg_extern]
-fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std::error::Error>> {
-    // Check if user has bypass enabled (per-user setting)
+#[pg// Check if user has bypass enabled (per-user setting)
     let bypass_args = [text_arg(username)];
     let bypass_enabled = Spi::get_one_with_args::<bool>(
         "SELECT COALESCE(
-            (SELECT (unnest(useconfig) LIKE 'password_profile.bypass_password_profile=true')
              FROM pg_user WHERE usename = $1
              LIMIT 1),
             false
@@ -663,16 +535,11 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
     .unwrap_or(false);
 
     if bypass_enabled {
-        // SECURITY: Do not log usernames
         return Ok("Password accepted (bypassed)".to_string());
     }
 
-    // SECURITY LAYER 1: Defense-in-depth - reject hash-formatted input
-    // This is a second layer of protection (first is in the hook)
-    // Prevents attackers from bypassing validation by entering precomputed hashes
     if is_hash_like(password) {
         add_timing_jitter();
-        // SECURITY: Do not log usernames or password details
         return Err(
             "Security violation: Password looks like a precomputed hash. \
              Plain text passwords cannot be in hash format (bcrypt, MD5, SCRAM, etc.)"
@@ -680,8 +547,6 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
         );
     }
 
-    // Get user-specific or global GUC values
-    // Read from pg_user.useconfig array to get user-level overrides
     let user_args = [text_arg(username)];
     
     let min_length = Spi::get_one_with_args::<i32>(
@@ -756,13 +621,11 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
         &user_args
     )?.unwrap_or(PREVENT_USERNAME.get());
 
-    // 1. Length check
     if password.len() < min_length as usize {
-        add_timing_jitter(); // Prevent timing attacks
+        add_timing_jitter();
         return Err("Password too short".into());
     }
 
-    // 2. Complexity checks
     if require_uppercase && !password.chars().any(|c| c.is_uppercase()) {
         add_timing_jitter();
         return Err("Password must contain at least one uppercase letter".into());
@@ -783,7 +646,6 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
         return Err("Password must contain at least one special character".into());
     }
 
-    // 3. Username prevention
     if prevent_username && !username.is_empty() {
         let pwd_lower = password.to_lowercase();
         let user_lower = username.to_lowercase();
@@ -793,13 +655,11 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
         }
     }
 
-    // 4. Blacklist check
     if blacklist::contains(password) {
         add_timing_jitter();
         return Err("Password is in blacklist (too common)".into());
     }
 
-    // 5. Password history check (if enabled)
     if PASSWORD_HISTORY_COUNT.get() > 0 {
         let history_count = PASSWORD_HISTORY_COUNT.get();
 
@@ -817,7 +677,6 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
 
         if let Some(hashes) = Spi::get_one_with_args::<Vec<String>>(HISTORY_QUERY, &args)? {
             for stored_hash in hashes {
-                // Try bcrypt verification (new format)
                 if verify(password, &stored_hash).unwrap_or(false) {
                     add_timing_jitter();
                     return Err(format!(
@@ -827,7 +686,6 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
                     .into());
                 }
 
-                // Legacy: also check MD5 for backward compatibility (32 hex chars = MD5)
                 if stored_hash.len() == 32 && stored_hash.chars().all(|c| c.is_ascii_hexdigit()) {
                     let pwd_hash_md5 = format!("{:x}", md5::compute(password.as_bytes()));
                     if stored_hash == pwd_hash_md5 {
@@ -843,7 +701,6 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
         }
     }
 
-    // 6. Time-based reuse check
     if PASSWORD_REUSE_DAYS.get() > 0 {
         let reuse_days = PASSWORD_REUSE_DAYS.get();
 
@@ -877,7 +734,6 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
         }
     }
 
-    // 7. Custom validation hook (if function exists) - silently skip if not exists
     const HOOK_EXISTS_QUERY: &str = "
         SELECT EXISTS(
             SELECT 1 FROM pg_proc p
@@ -899,9 +755,7 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
         }
     }
 
-    // 8. Auto-record password change to history (if enabled)
     if PASSWORD_HISTORY_COUNT.get() > 0 {
-        // Hash password with bcrypt (cost from GUC parameter)
         let cost = BCRYPT_COST.get().clamp(4, 31) as u32;
         if let Ok(pwd_hash) = hash(password, cost) {
             // Insert into history (ignore errors to not block password change)
