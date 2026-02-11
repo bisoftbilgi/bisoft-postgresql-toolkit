@@ -504,22 +504,37 @@ fn is_hash_like(password: &str) -> bool {
     // Disabled by default to avoid false positives
     // Uncomment if you want to strictly reject all 32-char hex strings
     // if len == 32 && password.chars().all(|c| c.is_ascii_hexdigit()) {
-    if (len == 40 || len == 64 || len == 128) && password.chars().all(|c| c.is_ascii_hexdigit()) { , and is long
-        // This catches many other hash formats we might have missed
-        if password.starts_with('$') && len > 50 && password.matches('$').count() >= 3 {
-            return true;
-        }
-
-        // 10. crypt(3) formats: $1$ (MD5), $5$ (SHA-256), $6$ (SHA-512)
-        if (lower.starts_with("$1$") || lower.starts_with("$5$") || lower.starts_with("$6$"))
-            && len > 20
-        {
-            return true;
-        }
-
-        false
+    //     return true;
+    // }
+    
+    // 8. Common hash lengths (OPTIONAL - commented out to avoid false positives)
+    // SHA-1: 40 hex, SHA-256: 64 hex, SHA-512: 128 hex
+    // These might be legitimate passwords, so we're conservative here
+    if (len == 40 || len == 64 || len == 128) && password.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Only reject if it looks TOO much like a hash (all lowercase/uppercase hex)
+        // Real passwords with these lengths are unlikely to be pure hex
+        return true;
     }
 
+    // 9. Generic hash pattern: starts with $, has multiple $ delimiters, and is long
+    // This catches many other hash formats we might have missed
+    if password.starts_with('$') && len > 50 && password.matches('$').count() >= 3 {
+        return true;
+    }
+
+    // 10. crypt(3) formats: $1$ (MD5), $5$ (SHA-256), $6$ (SHA-512)
+    if (lower.starts_with("$1$") || lower.starts_with("$5$") || lower.starts_with("$6$"))
+        && len > 20
+    {
+        return true;
+    }
+
+    false
+}
+
+
+#[pg_extern]
+fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std::error::Error>> {
     // Check if user has bypass enabled (per-user setting)
     let bypass_args = [text_arg(username)];
     let bypass_enabled = Spi::get_one_with_args::<bool>(
