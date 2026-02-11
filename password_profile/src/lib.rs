@@ -492,37 +492,35 @@ fn is_hash_like(password: &str) -> bool {
 
     // 4. SCRAM-SHA-256 format
     // Example: SCRAM-SHA-256$4096:salt$hash:proof
-    }
 
     // 5. PBKDF2 formats
     // Example: $pbkdf2-sha256$29000$...
-    }
 
     // 6. Django/Werkzeug formats
     // Example: pbkdf2:sha256:... or sha1$salt$hash
-    if lower.starts_with("pbkdf2:") || lower.starts_with("sha1$") || lower.starts_with("sha256$") {
+    if lower.starts_with("pbkdf2:") || lower.starts_with("sha1$") || lower.starts_with("sha256$") 
         return true;
     // 7. Raw MD5: exactly 32 hex chars (OPTIONAL - may reject valid hex passwords)
     // Disabled by default to avoid false positives
     // Uncomment if you want to strictly reject all 32-char hex strings
     // if len == 32 && password.chars().all(|c| c.is_ascii_hexdigit()) {
     if (len == 40 || len == 64 || len == 128) && password.chars().all(|c| c.is_ascii_hexdigit()) {, and is long
-    // This catches many other hash formats we might have missed
-    if password.starts_with('$') && len > 50 && password.matches('$').count() >= 3 {
-        return true;
+        // This catches many other hash formats we might have missed
+        if password.starts_with('$') && len > 50 && password.matches('$').count() >= 3 {
+            return true;
+        }
+
+        // 10. crypt(3) formats: $1$ (MD5), $5$ (SHA-256), $6$ (SHA-512)
+        if (lower.starts_with("$1$") || lower.starts_with("$5$") || lower.starts_with("$6$"))
+            && len > 20
+        {
+            return true;
+        }
+
+        false
     }
 
-    // 10. crypt(3) formats: $1$ (MD5), $5$ (SHA-256), $6$ (SHA-512)
-    if (lower.starts_with("$1$") || lower.starts_with("$5$") || lower.starts_with("$6$"))
-        && len > 20
-    {
-        return true;
-    }
-
-    false
-}
-
-#[pg// Check if user has bypass enabled (per-user setting)
+    // Check if user has bypass enabled (per-user setting)
     let bypass_args = [text_arg(username)];
     let bypass_enabled = Spi::get_one_with_args::<bool>(
         "SELECT COALESCE(
