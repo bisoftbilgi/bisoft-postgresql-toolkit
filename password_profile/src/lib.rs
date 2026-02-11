@@ -499,12 +499,12 @@ fn is_hash_like(password: &str) -> bool {
     // 6. Django/Werkzeug formats
     // Example: pbkdf2:sha256:... or sha1$salt$hash
     if lower.starts_with("pbkdf2:") || lower.starts_with("sha1$") || lower.starts_with("sha256$") 
-        return true;
+        { return true; }
     // 7. Raw MD5: exactly 32 hex chars (OPTIONAL - may reject valid hex passwords)
     // Disabled by default to avoid false positives
     // Uncomment if you want to strictly reject all 32-char hex strings
     // if len == 32 && password.chars().all(|c| c.is_ascii_hexdigit()) {
-    if (len == 40 || len == 64 || len == 128) && password.chars().all(|c| c.is_ascii_hexdigit()) {, and is long
+    if (len == 40 || len == 64 || len == 128) && password.chars().all(|c| c.is_ascii_hexdigit()) { , and is long
         // This catches many other hash formats we might have missed
         if password.starts_with('$') && len > 50 && password.matches('$').count() >= 3 {
             return true;
