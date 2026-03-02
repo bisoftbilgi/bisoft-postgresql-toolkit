@@ -16,7 +16,7 @@ mod lock_cache;
 mod sql;
 mod structured_log;
 mod worker;
-use crate::sql::{int4_arg, spi_select_one, spi_update, text_arg};
+use crate::sql::{int4_arg, text_arg};
 pub use worker::auth_event_consumer_main;
 
 ::pgrx::pg_module_magic!();
@@ -27,6 +27,19 @@ const LOCK_USERNAME_BYTES: usize = 64;
 const MICROS_PER_SEC: i64 = 1_000_000;
 const AUTH_EVENT_RING_SIZE: usize = 1024;
 
+/// RAII guard that acquires a PostgreSQL spinlock on construction and releases
+/// it on drop.
+///
+/// # Safety / longjmp hazard
+/// PostgreSQL's `ereport(ERROR)` and `pgrx::error!()` perform a C `longjmp`
+/// which **skips Rust destructors**.  If a `pgrx::error!()` / `pgrx::warning!()`
+/// (or any function that may internally longjmp) is called while a
+/// `SpinLockGuard` is live, the spinlock will **never be released**, causing a
+/// deadlock.
+///
+/// Rule: keep all pgrx macro calls (log!, warning!, error!) **outside** the
+/// scope that holds a SpinLockGuard.  Never call SPI or pgrx functions while
+/// the guard is held.
 struct SpinLockGuard {
     lock_ptr: *mut pg_sys::slock_t,
 }
@@ -154,25 +167,31 @@ fn encode_username(username: &str) -> [u8; LOCK_USERNAME_BYTES] {
 
 fn check_lockout_from_db(username: &str) -> Option<i64> {
     use pgrx::spi::Spi;
-    
+
     let my_db_id = unsafe { std::ptr::addr_of!(pg_sys::MyDatabaseId).read() };
     if my_db_id == pg_sys::InvalidOid {
         return None;
     }
-    
+
+    // Read the per-user or global failed_login_max so the DB fallback matches
+    // the same threshold used when recording failures.  We fall back to the
+    // global GUC; per-user overrides are best-effort here since we may not have
+    // an SPI context deep enough to query pg_user safely.
+    let max_fails = FAILED_LOGIN_MAX.get();
+
     let result = Spi::connect(|client| -> pgrx::spi::Result<Option<i64>> {
-        let args = [text_arg(username)];
+        let args = [text_arg(username), crate::sql::int4_arg(max_fails)];
         let table = client.select(
             "SELECT GREATEST(
                 COALESCE(ROUND(EXTRACT(EPOCH FROM (lockout_until - now())))::bigint, 0),
                 0
              ) as remaining_seconds
              FROM password_profile.login_attempts
-             WHERE username = $1 AND fail_count >= 3",
+             WHERE username = $1 AND fail_count >= $2",
             Some(1),
             &args,
         )?;
-        
+
         Ok(table.first().get_one::<i64>()?)
     });
     
@@ -207,11 +226,15 @@ unsafe extern "C-unwind" fn client_auth_hook(port: *mut pg_sys::Port, status: c_
                         }
                     };
                     unsafe {
-                        password_profile_raise_lockout_error(c_username.as_ptr(), seconds as c_int);
+                        // FATAL-level ereport: PostgreSQL calls proc_exit() after sending
+                        // the error to the client. Nothing below this point executes.
+                        password_profile_raise_lockout_error(
+                            c_username.as_ptr(),
+                            seconds.min(i32::MAX as i64) as c_int,
+                        );
                     }
-                    if let Some(prev_hook) = PREV_CLIENT_AUTH_HOOK {
-                        pg_guard_ffi_boundary(|| prev_hook(port, status));
-                    }
+                    // unreachable: FATAL ereport above terminates the backend process.
+                    #[allow(unreachable_code)]
                     return;
                 }
             }
@@ -490,24 +513,27 @@ fn is_hash_like(password: &str) -> bool {
         return true;
     }
 
-    // 4. SCRAM-SHA-256 format
-    // Example: SCRAM-SHA-256$4096:salt$hash:proof
+    // 4. SCRAM-SHA-256 format: SCRAM-SHA-256$4096:salt$hash:proof
+    if lower.starts_with("scram-sha-256$") {
+        return true;
     }
 
-    // 5. PBKDF2 formats
-    // Example: $pbkdf2-sha256$29000$...
+    // 5. PBKDF2 formats: $pbkdf2-sha256$29000$...
+    if lower.starts_with("$pbkdf2-") {
+        return true;
     }
 
-    // 6. Django/Werkzeug formats
-    // Example: pbkdf2:sha256:... or sha1$salt$hash
+    // 6. Django/Werkzeug formats: pbkdf2:sha256:... or sha1$salt$hash
     if lower.starts_with("pbkdf2:") || lower.starts_with("sha1$") || lower.starts_with("sha256$") {
         return true;
-    // 7. Raw MD5: exactly 32 hex chars (OPTIONAL - may reject valid hex passwords)
-    // Disabled by default to avoid false positives
-    // Uncomment if you want to strictly reject all 32-char hex strings
-    // if len == 32 && password.chars().all(|c| c.is_ascii_hexdigit()) {
-    if (len == 40 || len == 64 || len == 128) && password.chars().all(|c| c.is_ascii_hexdigit()) {, and is long
-    // This catches many other hash formats we might have missed
+    }
+
+    // 7. SHA hex digests: SHA-1 (40 chars), SHA-256 (64 chars), SHA-512 (128 chars)
+    if (len == 40 || len == 64 || len == 128) && password.chars().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
+
+    // 9. Generic $ delimited hash: starts with $, long, has >= 3 $ separators
     if password.starts_with('$') && len > 50 && password.matches('$').count() >= 3 {
         return true;
     }
@@ -522,12 +548,18 @@ fn is_hash_like(password: &str) -> bool {
     false
 }
 
-#[pg// Check if user has bypass enabled (per-user setting)
+#[pg_extern]
+fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // Check if user has bypass enabled (per-user setting)
     let bypass_args = [text_arg(username)];
     let bypass_enabled = Spi::get_one_with_args::<bool>(
         "SELECT COALESCE(
-             FROM pg_user WHERE usename = $1
-             LIMIT 1),
+            (SELECT EXISTS(
+                SELECT 1
+                FROM pg_user, unnest(useconfig) AS cfg
+                WHERE usename = $1
+                  AND cfg = 'password_profile.bypass_password_profile=true'
+            )),
             false
         )",
         &bypass_args,
@@ -843,9 +875,12 @@ fn record_failed_login(username: &str) -> Result<String, Box<dyn std::error::Err
 
     let bypass = Spi::get_one_with_args::<bool>(
         "SELECT COALESCE(
-            (SELECT (unnest(useconfig) LIKE 'password_profile.bypass_password_profile=true')
-             FROM pg_user WHERE usename = $1
-             LIMIT 1),
+            (SELECT EXISTS(
+                SELECT 1
+                FROM pg_user, unnest(useconfig) AS cfg
+                WHERE usename = $1
+                  AND cfg = 'password_profile.bypass_password_profile=true'
+            )),
             false
         )",
         &username_arg,

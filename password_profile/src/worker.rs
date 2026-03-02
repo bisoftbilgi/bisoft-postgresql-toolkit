@@ -3,7 +3,6 @@ use crate::clear_login_attempts_internal;
 use crate::record_failed_login;
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
-use pgrx::prelude::*;
 use std::time::Duration;
 
 #[no_mangle]
@@ -25,13 +24,25 @@ pub unsafe extern "C-unwind" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
             break;
         }
 
+        // SIGHUP aldıysak (pg_reload_conf() veya kill -HUP) GUC'ları yeniden yükle.
+        // Bu sayede failed_login_max gibi ayarlar restart gerektirmeden geçer.
+        if BackgroundWorker::sighup_received() {
+            unsafe {
+                pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
+            }
+            pgrx::log!("password_profile: auth event consumer reloaded config (SIGHUP)");
+        }
+
         let mut processed = false;
         while let Some(event) = auth_event::dequeue() {
             if BackgroundWorker::sigterm_received() {
                 pgrx::log!("password_profile: auth event consumer shutting down (during processing)");
                 break;
             }
-            check_for_interrupts!();
+            // NOTE: check_for_interrupts!() must NOT be called here (outside a transaction /
+            // catch_unwind boundary). If CHECK_FOR_INTERRUPTS() fires an ereport(ERROR) it
+            // converts to a Rust panic with no catcher, causing _URC_END_OF_STACK (error 5)
+            // and SIGABRT. Interrupt checking happens naturally inside BackgroundWorker::transaction().
 
             processed = true;
             
@@ -53,7 +64,9 @@ pub unsafe extern "C-unwind" fn auth_event_consumer_main(_arg: pg_sys::Datum) {
 
         if !processed {
             BackgroundWorker::wait_latch(Some(Duration::from_millis(25)));
-            check_for_interrupts!();
+            // NOTE: check_for_interrupts!() omitted here intentionally – see comment above.
+            // wait_latch already yields control and SIGTERM is checked at the top of the
+            // loop via sigterm_received().
         }
     }
 
