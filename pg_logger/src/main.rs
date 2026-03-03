@@ -1,11 +1,16 @@
 use chrono::{Datelike, Local};
+use config::{Config, File as ConfigFile};
 use glob::glob;
 use polars::prelude::*;
 use regex::Regex;
+use serde::Deserialize;
+use sqlx::mysql::MySqlPoolOptions;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{MySqlPool, PgPool};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::SeekFrom;
-use std::path::{PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::fs as afs;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
@@ -16,11 +21,11 @@ const SINCEDB_DIR: &str = "./sincedb/";
 const OUTPUT_DIR: &str = "./output/";
 const LOG_PATTERN: &str = "/var/log/postgresql/postgresql*.log";
 
-
 #[derive(Clone, Copy)]
 enum OutputMode {
     Parquet,
     Postgresql,
+    Mysql,
 }
 
 #[derive(Deserialize)]
@@ -69,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let db_url = app_config
                 .db_url
                 .as_deref()
-                .ok_or("output_mode=postgresql  db_url should be given")?;
+                .ok_or("output_mode=postgresql iken db_url zorunlu")?;
             let pool = PgPoolOptions::new()
                 .max_connections(5)
                 .connect(db_url)
@@ -77,7 +82,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ensure_postgres_table(&pool, &app_config.db_table).await?;
             Some(pool)
         }
-        OutputMode::Parquet => None,
+        OutputMode::Parquet | OutputMode::Mysql => None,
+    };
+    let mysql_pool = match output_mode {
+        OutputMode::Mysql => {
+            let db_url = app_config
+                .db_url
+                .as_deref()
+                .ok_or("output_mode=mysql/mariadb iken db_url zorunlu")?;
+            let pool = MySqlPoolOptions::new()
+                .max_connections(5)
+                .connect(db_url)
+                .await?;
+            ensure_mysql_table(&pool, &app_config.db_table).await?;
+            Some(pool)
+        }
+        OutputMode::Parquet | OutputMode::Postgresql => None,
     };
     let db_table = app_config.db_table.clone();
     let hostname = app_config.hostname.clone();
@@ -109,6 +129,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let _ = flush_postgres(pool, &db_table, &mut buffer).await;
                         }
                     }
+                    OutputMode::Mysql => {
+                        if let Some(pool) = &mysql_pool {
+                            let _ = flush_mysql(pool, &db_table, &mut buffer).await;
+                        }
+                    }
                 }
                 last_flush = std::time::Instant::now();
             }
@@ -124,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for entry in entries.filter_map(|e| e.ok()) {
                 let mut tracked = tracked_files.lock().unwrap();
                 if !tracked.contains(&entry) {
-                    println!("Found: {:?}", entry);
+                    println!("Kesfedildi: {:?}", entry);
                     tracked.insert(entry.clone());
                     let tx_c = tx.clone();
                     let re_c = re.clone();
@@ -150,8 +175,12 @@ fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     let mode = match raw.output_mode.to_lowercase().as_str() {
         "parquet" => OutputMode::Parquet,
         "postgresql" | "postgres" => OutputMode::Postgresql,
+        "mysql" | "mariadb" => OutputMode::Mysql,
         other => {
-            return Err(format!("Invalid output_mode: {other}. Possible values: parquet/postgresql").into())
+            return Err(
+                format!("Gecersiz output_mode: {other}. Beklenen: parquet/postgresql/mysql/mariadb")
+                    .into(),
+            )
         }
     };
 
@@ -172,7 +201,7 @@ fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
 fn validate_table_name(table_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let valid = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$")?;
     if !valid.is_match(table_name) {
-        return Err(format!("Invalid db_table: {table_name}").into());
+        return Err(format!("Gecersiz db_table: {table_name}").into());
     }
     Ok(())
 }
@@ -217,7 +246,52 @@ async fn flush_postgres(
     }
 
     tx.commit().await?;
-    println!("Written to PostgreSQL: {} records -> {}", entries.len(), table_name);
+    println!("PostgreSQL'e yazildi: {} kayit -> {}", entries.len(), table_name);
+    entries.clear();
+    Ok(())
+}
+
+async fn ensure_mysql_table(pool: &MySqlPool, table_name: &str) -> Result<(), sqlx::Error> {
+    let stmt = format!(
+        "CREATE TABLE IF NOT EXISTS {table_name} (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            log_timestamp varchar(100) NOT NULL,
+            user_name varchar(100) NOT NULL,
+            database_name varchar(100) NOT NULL,
+            hostname varchar(100) NOT NULL,
+            ip_address varchar(100) NOT NULL,
+            message varchar(1000) NOT NULL,
+            inserted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )"
+    );
+    sqlx::query(&stmt).execute(pool).await?;
+    Ok(())
+}
+
+async fn flush_mysql(
+    pool: &MySqlPool,
+    table_name: &str,
+    entries: &mut Vec<LogEntry>,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let insert_stmt = format!(
+        "INSERT INTO {table_name} (log_timestamp, user_name, database_name, hostname, ip_address, message) VALUES (?, ?, ?, ?, ?, ?)"
+    );
+
+    for entry in entries.iter() {
+        sqlx::query(&insert_stmt)
+            .bind(&entry.timestamp)
+            .bind(&entry.user)
+            .bind(&entry.db)
+            .bind(&entry.hostname)
+            .bind(&entry.ip)
+            .bind(&entry.message)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    tx.commit().await?;
+    println!("MySQL/MariaDB'ye yazildi: {} kayit -> {}", entries.len(), table_name);
     entries.clear();
     Ok(())
 }
@@ -243,7 +317,7 @@ async fn tail_file(
     // logrotate truncate kontrolu
     let meta = afs::metadata(&path).await?;
     if meta.len() < current_offset {
-        println!("Truncate detected ({:?}), resetting.", path);
+        println!("Truncate tespit edildi ({:?}), basa donuluyor.", path);
         current_offset = 0;
     }
     reader.seek(SeekFrom::Start(current_offset)).await?;
@@ -259,7 +333,7 @@ async fn tail_file(
         if len == 0 {
             if let Ok(m) = afs::metadata(&path).await {
                 if m.len() < current_offset {
-                    println!("File reset detected: {:?}", path);
+                    println!("Dosya sifirlandi: {:?}", path);
                     current_offset = 0;
                     reader.seek(SeekFrom::Start(0)).await?;
                     continue;
@@ -325,7 +399,8 @@ fn flush_common_parquet(entries: &mut Vec<LogEntry>) -> Result<(), Box<dyn std::
         .with_compression(ParquetCompression::Snappy)
         .finish(&mut df)?;
 
-    println!("Written to Parquet: {} records -> {:?}", entries.len(), full_path);
+    println!("Parquet'e yazildi: {} kayit -> {:?}", entries.len(), full_path);
     entries.clear();
     Ok(())
 }
+

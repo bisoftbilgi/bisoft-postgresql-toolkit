@@ -9,6 +9,6 @@ tokio = { version = "1.0", features = ["full"] }
 glob = "0.3"
 polars = { version = "0.36", features = ["parquet"] }
 chrono = "0.4"
-sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono"] }
+sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "chrono"] }
 config = "0.13"
 serde = { version = "1.0", features = ["derive"] }

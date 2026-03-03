@@ -1,8 +1,10 @@
-# PostgreSQL Log Exporter (Parquet or PostgreSQL)
+# PostgreSQL Log Exporter (Parquet, PostgreSQL, MySQL, MariaDB)
 
 This project tails PostgreSQL log files, parses log entries, and exports them in batches to:
 
-- Parquet files or a PostgreSQL table
+- Parquet files
+- a PostgreSQL table
+- a MySQL/MariaDB table
 
 The export target is selected from `config.toml`.
 
@@ -15,7 +17,8 @@ The export target is selected from `config.toml`.
 - Config-driven output mode:
   - `parquet`
   - `postgresql` / `postgres`
-- Auto-creates destination PostgreSQL table if it does not exist
+  - `mysql` / `mariadb`
+- Auto-creates destination SQL table if it does not exist
 - Adds `hostname` and `ip` from config to every exported record
 
 ## Project Structure
@@ -29,7 +32,8 @@ The export target is selected from `config.toml`.
 
 - Rust toolchain (stable)
 - Cargo
-- Optional: PostgreSQL server (required only for `output_mode = "postgresql"`)
+- Optional: PostgreSQL server (for `output_mode = "postgresql"`)
+- Optional: MySQL or MariaDB server (for `output_mode = "mysql"` or `output_mode = "mariadb"`)
 
 ## Installation
 
@@ -89,10 +93,10 @@ Note:
 Example:
 
 ```toml
-# Export target: parquet | postgresql
+# Export target: parquet | postgresql | mysql | mariadb
 output_mode = "postgresql"
 
-# Used only when output_mode is postgresql
+# Used when output_mode is postgresql/mysql/mariadb
 db_url = "postgres://postgres:password@localhost:5432/logs_db"
 db_table = "postgres_logs"
 hostname = "postgres-node-1"
@@ -103,10 +107,16 @@ flush_interval_secs = 10
 batch_size = 1000
 ```
 
+Example MySQL/MariaDB URL:
+
+```toml
+db_url = "mysql://user:password@localhost:3306/logs_db"
+```
+
 ### Fields
 
-- `output_mode`: `parquet` or `postgresql` (`postgres` is also accepted)
-- `db_url`: PostgreSQL connection string (required for PostgreSQL mode)
+- `output_mode`: `parquet`, `postgresql` (`postgres`), `mysql`, or `mariadb`
+- `db_url`: Database connection string (required for PostgreSQL/MySQL/MariaDB modes)
 - `db_table`: Destination table name (`postgres_logs` by default)
 - `hostname`: Host label added to each log record
 - `ip`: IP label added to each log record
@@ -147,6 +157,20 @@ Multi-line log messages are merged into a single record until the next timestamp
   - `message`
   - `inserted_at`
 
+### MySQL / MariaDB mode
+
+- Creates a DB pool from `db_url`
+- Ensures destination table exists (`CREATE TABLE IF NOT EXISTS`)
+- Inserts buffered records in a transaction
+- Table columns:
+  - `log_timestamp`
+  - `user_name`
+  - `database_name`
+  - `hostname`
+  - `ip_address`
+  - `message`
+  - `inserted_at`
+
 ## Offset Tracking (`sincedb`)
 
 For each tailed file, the current byte offset is stored in:
@@ -158,6 +182,6 @@ If a file is truncated, offset resets to `0`.
 
 ## Notes
 
-- If `output_mode = "postgresql"` and `db_url` is missing, the app exits with an error.
+- If `output_mode = "postgresql"`, `mysql`, or `mariadb` and `db_url` is missing, the app exits with an error.
 - `db_table` must match `[A-Za-z_][A-Za-z0-9_]*`.
-- Ensure the PostgreSQL user has table create/insert permissions.
+- Ensure the DB user has table create/insert permissions.
