@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 db.push(entry.db); msg.push(entry.message);
             }
 
-            if !ts.is_empty() && (last_flush.elapsed() >= Duration::from_secs(10) || ts.len() >= 1000) {
+            if !ts.is_empty() && (last_flush.elapsed() >= Duration::from_secs(60) || ts.len() >= 100000) {
                 let _ = flush_common_parquet(&mut ts, &mut us, &mut db, &mut msg);
                 last_flush = std::time::Instant::now();
             }
