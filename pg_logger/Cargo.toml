@@ -1,0 +1,11 @@
+[package]
+name = "pg_logger"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+regex = "1.10"
+tokio = { version = "1.0", features = ["full"] }
+glob = "0.3"
+polars = { version = "0.36", features = ["parquet"] }
+chrono = "0.4"
