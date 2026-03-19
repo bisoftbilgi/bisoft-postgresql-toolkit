@@ -367,14 +367,16 @@ pub fn register() {
             GucContext::Suset,
             GucFlags::default(),
         );
-        GucRegistry::define_string_guc(
-            cstr(b"sql_firewall.approval_worker_database\0"),
-            cstr(b"Database for approval worker to connect to.\0"),
-            cstr(b"Background worker will record pending approvals in this database. If not set, uses 'postgres'.\0"),
-            &APPROVAL_WORKER_DATABASE,
-            GucContext::Postmaster,
-            GucFlags::default(),
-        );
+        if !pg_sys::IsUnderPostmaster {
+            GucRegistry::define_string_guc(
+                cstr(b"sql_firewall.approval_worker_database\0"),
+                cstr(b"Database for approval worker to connect to.\0"),
+                cstr(b"Background worker will record pending approvals in this database. If not set, uses 'postgres'.\0"),
+                &APPROVAL_WORKER_DATABASE,
+                GucContext::Postmaster,
+                GucFlags::default(),
+            );
+        }
         GucRegistry::define_int_guc(
             cstr(b"sql_firewall.activity_log_max_rows\0"),
             cstr(b"Target maximum row count for sql_firewall_activity_log.\0"),

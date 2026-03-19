@@ -54,8 +54,15 @@ pub unsafe extern "C-unwind" fn approval_worker_main(_arg: pg_sys::Datum) {
         match extra_str.parse::<u32>() {
             Ok(oid_u32) => {
                 let oid = pg_sys::Oid::from(oid_u32);
-                pgrx::log!("sql_firewall: worker connecting to DB OID: {}", oid);
+
+                // Connect to the target database first.
+                // NOTE: get_database_name() / any syscache call MUST NOT be used
+                // before BackgroundWorkerInitializeConnectionByOid – syscache is
+                // not yet initialised and will assert-fail (SIGABRT / crash
+                // recovery) if called here.
+                pgrx::log!("sql_firewall: worker connecting to DB OID: {}", oid_u32);
                 pg_sys::BackgroundWorkerInitializeConnectionByOid(oid, pg_sys::InvalidOid, 0);
+                pgrx::log!("sql_firewall: worker connected to DB OID: {}", oid_u32);
                 oid_u32
             }
             Err(e) => {
@@ -66,13 +73,10 @@ pub unsafe extern "C-unwind" fn approval_worker_main(_arg: pg_sys::Datum) {
     
     pgrx::log!("sql_firewall: worker connected to DB OID: {}", target_oid);
     
-    // Force SIGTERM to default handler (terminate process) to ensure clean shutdown
-    unsafe {
-        #[cfg(any(feature = "pg16", feature = "pg17"))]
-        pg_sys::pqsignal(pg_sys::SIGTERM as i32, None);
-        pg_sys::BackgroundWorkerUnblockSignals();
-    }
-    
+    // Keep pgrx-managed signal handlers; overriding SIGTERM to default handler can
+    // make postmaster treat worker termination as abnormal during shutdown/reload.
+    // Note: attach_signal_handlers already called BackgroundWorkerUnblockSignals().
+
     set_status(WorkerStatus::Running);
 
     pgrx::log!("sql_firewall: approval worker started (launcher-based, processes all databases)");
@@ -91,6 +95,18 @@ pub unsafe extern "C-unwind" fn approval_worker_main(_arg: pg_sys::Datum) {
     }
     
     pgrx::log!("sql_firewall: Extension found active in DB OID {}. Shield ON 🛡️", target_oid);
+
+    // Determine this worker's own database name so we can filter ring-buffer
+    // events that belong to a different database's worker.
+    // Extract from bgw_name which the launcher sets to "sql_firewall_worker_{dbname}".
+    let my_db_name: String = {
+        let bgw_name = BackgroundWorker::get_name();
+        bgw_name.strip_prefix("sql_firewall_worker_")
+            .unwrap_or(bgw_name)
+            .to_string()
+    };
+
+    pgrx::log!("sql_firewall: worker serving database '{}'", my_db_name);
 
     // Initialize cursor to current write position (start reading from now)
     // Alternatively: start from 0 to process all existing events
@@ -138,7 +154,41 @@ pub unsafe extern "C-unwind" fn approval_worker_main(_arg: pg_sys::Datum) {
                     }
                 };
 
-                // Process event based on type (launcher processes all databases)
+                // Process event based on type.
+                // CRITICAL: Each worker is connected to a specific database and must only
+                // process events that belong to its own database.  Without this filter,
+                // a worker for database A would write blocked-query rows into database A's
+                // table even though the event originated in database B, and the worker for
+                // database B would never see those rows.
+                let event_db = match event.event_type {
+                    pending_approvals::EventType::Approval => {
+                        let d = &event.data.approval;
+                        pending_approvals::string_from_bytes(&d.database_name)
+                    },
+                    pending_approvals::EventType::BlockedQuery => {
+                        let d = &event.data.blocked_query;
+                        pending_approvals::string_from_bytes(&d.database_name)
+                    },
+                    pending_approvals::EventType::FingerprintHit => {
+                        // FingerprintHit has no embedded database_name; use db_oid
+                        // from the outer FirewallEvent to route to the correct worker.
+                        let event_oid = u32::from(event.db_oid);
+                        if event_oid != target_oid {
+                            my_cursor += 1;
+                            continue;
+                        }
+                        None   // Passed OID check; proceed to processing
+                    },
+                };
+
+                if let Some(ref db) = event_db {
+                    if db.as_str() != my_db_name.as_str() {
+                        // This event belongs to a different database – skip it.
+                        my_cursor += 1;
+                        continue;
+                    }
+                }
+
                 match event.event_type {
                 pending_approvals::EventType::Approval => unsafe {
                     let approval_data = &event.data.approval;
@@ -154,7 +204,6 @@ pub unsafe extern "C-unwind" fn approval_worker_main(_arg: pg_sys::Datum) {
                         );
 
                         // Directly call SECURITY DEFINER function
-                        // Note: Worker is connected to default database, approval table should exist there
                         let result = BackgroundWorker::transaction(|| {
                             // SECURITY FIX: Use prepared statement instead of string formatting
                             Spi::run_with_args(
@@ -199,39 +248,32 @@ pub unsafe extern "C-unwind" fn approval_worker_main(_arg: pg_sys::Datum) {
                         
                         pgrx::log!("sql_firewall: worker processing blocked query: role={}, db={}, cmd={}", role, db, cmd);
                         
-                        use crate::sql::text_arg;
+                        use crate::sql::{name_arg, text_arg};
                         
                         pgrx::log!("sql_firewall: worker preparing blocked query INSERT");
                         
                         // MUST use BackgroundWorker::transaction for SPI operations in background worker
                         let result = BackgroundWorker::transaction(|| {
-                            // Real schema: query_text, username, database_name, client_info, block_reason
                             let query_sql = 
-                                "INSERT INTO firewall.blocked_queries 
-                                 (query_text, username, database_name, client_info, block_reason) 
-                                 VALUES ($1, $2, $3, $4, $5)";
-                            
-                            // Build client_info string
-                            let client_info = if let Some(addr) = client_addr {
-                                format!("app={}, addr={}", app, addr)
-                            } else {
-                                format!("app={}", app)
-                            };
-                            
-                            // Build block_reason string
-                            let block_reason = format!("command={}, reason={}", cmd, rsn);
-                            
-                            pgrx::log!("sql_firewall: worker executing INSERT");
-                            
-                            // Use Spi::run_with_args inside BackgroundWorker::transaction
+                                "INSERT INTO public.sql_firewall_blocked_queries 
+                                 (role_name, database_name, query_text, query_truncated, application_name, client_addr, command_type, reason, blocked_at) 
+                                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)";
+
+                            let truncated = blocked_data.query_truncated;
+
+                            pgrx::log!("sql_firewall: worker executing blocked query INSERT");
+
                             Spi::run_with_args(
                                 query_sql, 
                                 &[
+                                    name_arg(&role),
+                                    name_arg(&db),
                                     text_arg(&q),
-                                    text_arg(&role),
-                                    text_arg(&db),
-                                    text_arg(&client_info),
-                                    text_arg(&block_reason),
+                                    bool_arg(truncated),
+                                    text_arg(&app),
+                                    text_arg(client_addr.as_deref().unwrap_or("")),
+                                    text_arg(&cmd),
+                                    text_arg(&rsn),
                                 ]
                             )
                         });
@@ -294,9 +336,19 @@ pub unsafe extern "C-unwind" fn approval_worker_main(_arg: pg_sys::Datum) {
             my_cursor += 1;
             }
         } else {
-            // No new events - sleep briefly
-            BackgroundWorker::wait_latch(Some(Duration::from_millis(100)));
-            check_for_interrupts!();
+            // No new events – wait on latch with a short timeout.
+            // WaitLatch + CHECK_FOR_INTERRUPTS is the canonical PostgreSQL
+            // way to sleep in a BGW; it ensures SIGTERM triggers proc_exit.
+            unsafe {
+                pg_sys::WaitLatch(
+                    pg_sys::MyLatch,
+                    (pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_POSTMASTER_DEATH) as i32,
+                    500,                    // 500 ms idle poll
+                    pg_sys::PG_WAIT_EXTENSION,
+                );
+                pg_sys::ResetLatch(pg_sys::MyLatch);
+                pg_sys::check_for_interrupts!();
+            }
         }
     }
 
@@ -319,7 +371,16 @@ fn wait_while_paused() {
         if !pause_requested() || BackgroundWorker::sigterm_received() {
             break;
         }
-        BackgroundWorker::wait_latch(Some(Duration::from_millis(200)));
+        unsafe {
+            pg_sys::WaitLatch(
+                pg_sys::MyLatch,
+                (pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_POSTMASTER_DEATH) as i32,
+                200,
+                pg_sys::PG_WAIT_EXTENSION,
+            );
+            pg_sys::ResetLatch(pg_sys::MyLatch);
+            pg_sys::check_for_interrupts!();
+        }
     }
     set_status(WorkerStatus::Starting);
     if !BackgroundWorker::sigterm_received() {
@@ -344,6 +405,15 @@ pub fn request_worker_resume() {
 }
 
 pub fn worker_status() -> WorkerStatus {
+    // Shared-memory-free status check: detect active dynamic worker in current DB.
+    if let Ok(Some(count)) = Spi::get_one::<i64>(
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND backend_type LIKE 'sql_firewall_worker_%'"
+    ) {
+        if count > 0 {
+            return WorkerStatus::Running;
+        }
+    }
+
     match WORKER_STATUS.load(Ordering::SeqCst) {
         value if value == WorkerStatus::Starting as u32 => WorkerStatus::Starting,
         value if value == WorkerStatus::Waiting as u32 => WorkerStatus::Waiting,

@@ -124,9 +124,9 @@ FOR EACH ROW EXECUTE FUNCTION validate_firewall_regex_pattern();
 -- Users can query via SECURITY DEFINER functions but cannot modify
 
 INSERT INTO public.sql_firewall_regex_rules (pattern, description)
-SELECT '(or|--|#)\s+\d+\s*=\s*\d+', 'Block simple SQL injection pattern'
+SELECT '(or|--|#)\s+([[:alpha:]_][[:alnum:]_]*|''[^'']*''|[0-9]+)\s*=\s*([[:alpha:]_][[:alnum:]_]*|''[^'']*''|[0-9]+)', 'Block simple SQL injection pattern'
 WHERE NOT EXISTS (
-    SELECT 1 FROM public.sql_firewall_regex_rules WHERE pattern = '(or|--|#)\s+\d+\s*=\s*\d+'
+    SELECT 1 FROM public.sql_firewall_regex_rules WHERE pattern = '(or|--|#)\s+([[:alpha:]_][[:alnum:]_]*|''[^'']*''|[0-9]+)\s*=\s*([[:alpha:]_][[:alnum:]_]*|''[^'']*''|[0-9]+)'
 );
 
 CREATE TABLE IF NOT EXISTS public.sql_firewall_query_fingerprints (

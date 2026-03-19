@@ -31,6 +31,12 @@ static mut PREV_SHMEM_STARTUP_HOOK: Option<unsafe extern "C-unwind" fn()> = None
 
 #[pgrx::pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    unsafe {
+        if !pg_sys::process_shared_preload_libraries_in_progress {
+            return;
+        }
+    }
+
     pgrx::warning!("🚀 DEBUG: sql_firewall_rs _PG_init called - ENTRY POINT");
     
     unsafe {
@@ -135,6 +141,16 @@ fn sql_firewall_resume_approval_worker() -> String {
 #[pg_extern]
 fn sql_firewall_approval_worker_status() -> String {
     approval_worker::worker_status().as_str().to_string()
+}
+
+/// Immediately invalidate the in-process approval cache.
+/// Call this after TRUNCATE / bulk-DELETE on sql_firewall_command_approvals
+/// so that enforce-mode decisions reflect the cleared table without waiting
+/// for the 60-second TTL to expire.
+#[pg_extern]
+fn sql_firewall_clear_approval_cache() -> &'static str {
+    approval_cache::invalidate_all();
+    "approval cache cleared"
 }
 
 

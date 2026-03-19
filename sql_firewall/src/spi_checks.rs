@@ -15,7 +15,7 @@ use crate::{
 };
 
 pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) -> Option<String> {
-    if !guc::regex_scan_enabled() || query.is_empty() || !in_transaction() {
+    if query.is_empty() || !in_transaction() {
         return None;
     }
 
@@ -27,6 +27,21 @@ pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) ->
             || lower.contains("sql_firewall_query_fingerprints")
             || lower.contains("sql_firewall_regex_rules"))
     {
+        return None;
+    }
+
+    // Built-in injection patterns always run regardless of enable_regex_scan.
+    // This ensures tautology-style injections (e.g. "WHERE 1=1 OR x=10") are
+    // always caught even when the regex-rule table is not used.
+    if matches_builtin_injection(&lower) {
+        let reason = "Built-in injection pattern match".to_string();
+        log_activity(ctx, command, "BLOCKED", Some(&reason), query);
+        log_blocked_query(ctx, command, Some(&reason), query);
+        return Some("sql_firewall: Query matched default injection pattern.".to_string());
+    }
+
+    // DB-level regex rules are only evaluated when the GUC is on.
+    if !guc::regex_scan_enabled() {
         return None;
     }
 
@@ -87,15 +102,7 @@ pub fn regex_block_reason(ctx: &ExecutionContext, command: &str, query: &str) ->
         log_blocked_query(ctx, command, Some(&reason), query);
         Some("sql_firewall: Query blocked by security regex pattern.".to_string())
     } else {
-        let normalized = query.to_ascii_lowercase();
-        if matches_builtin_injection(&normalized) {
-            let reason = "Built-in injection pattern match".to_string();
-            log_activity(ctx, command, "BLOCKED", Some(&reason), query);
-            log_blocked_query(ctx, command, Some(&reason), query);
-            Some("sql_firewall: Query matched default injection pattern.".to_string())
-        } else {
-            None
-        }
+        None
     }
 }
 
@@ -629,8 +636,40 @@ fn maybe_prune_activity_log() {
 }
 
 fn matches_builtin_injection(lower: &str) -> bool {
-    lower.contains(" or '1'='1'")
+    // Classic: OR directly followed by a numeric/string tautology
+    // e.g., "... OR 1=1", "... OR '1'='1'"
+    if lower.contains(" or '1'='1'")
         || lower.contains(" or 1=1")
         || lower.contains("' or '1'='1")
         || lower.contains("\" or \"1\"=\"1\"")
+    {
+        return true;
+    }
+
+    // WHERE / AND clause that IS itself a numeric or string tautology,
+    // which attackers append before an OR to widen result sets.
+    // e.g., "SELECT * FROM t WHERE 1=1 OR x=10"
+    //        "SELECT * FROM t WHERE '1'='1' OR id=1"
+    //
+    // NOTE: The old "OR ident=literal" heuristic (e.g., "OR x=10") was
+    // removed because it produces false positives for legitimate queries
+    // like "WHERE status='active' OR priority=1".  DB-level regex rules
+    // (sql_firewall_regex_rules table) cover those patterns when
+    // enable_regex_scan=on.
+    for kw in &["where ", "and "] {
+        if let Some(pos) = lower.find(kw) {
+            let tail = lower[pos + kw.len()..].trim_start();
+            if tail.starts_with("1=1")
+                || tail.starts_with("1 =1")
+                || tail.starts_with("1= 1")
+                || tail.starts_with("1 = 1")
+                || tail.starts_with("'1'='1'")
+                || tail.starts_with("'1' = '1'")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }
