@@ -2,7 +2,7 @@ use pgrx::prelude::*;
 use pgrx::bgworkers::*;
 use pgrx::pg_sys;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::Instant;
 
 /// Firewall Launcher - Supervisor Worker
 /// Monitors pg_database and spawns per-database workers
@@ -11,7 +11,7 @@ use std::time::Duration;
 pub extern "C-unwind" fn firewall_launcher_main(_arg: pg_sys::Datum) {
     unsafe {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    
+
     pgrx::log!("sql_firewall: launcher starting");
     
     // Track which databases have workers spawned
@@ -22,25 +22,91 @@ pub extern "C-unwind" fn firewall_launcher_main(_arg: pg_sys::Datum) {
     
     pgrx::log!("sql_firewall: launcher connected to postgres, monitoring databases");
     
+    let scan_interval_secs = 5u64;
+    // Set last_scan far enough in the past so the first scan runs immediately
+    let mut last_scan = Instant::now() - std::time::Duration::from_secs(scan_interval_secs + 1);
+
     loop {
-        // Check for shutdown signal
+        // ── Wait using PostgreSQL latch (canonical BGW sleep) ──────────
+        // WaitLatch honours WL_POSTMASTER_DEATH and, after ResetLatch +
+        // CHECK_FOR_INTERRUPTS, guarantees that SIGTERM triggers proc_exit
+        // automatically.  SPI sinval messages may set the latch early; we
+        // handle that by only running the SPI scan when enough wall-clock
+        // time has elapsed.
+        let rc = pg_sys::WaitLatch(
+            pg_sys::MyLatch,
+            (pg_sys::WL_LATCH_SET | pg_sys::WL_TIMEOUT | pg_sys::WL_POSTMASTER_DEATH) as i32,
+            1000,                       // wake every 1 s at most
+            pg_sys::PG_WAIT_EXTENSION,
+        );
+        pg_sys::ResetLatch(pg_sys::MyLatch);
+
+        // CHECK_FOR_INTERRUPTS will call proc_exit() if ShutdownRequestPending
+        // is set (SIGTERM during fast shutdown).  This is the canonical way for
+        // a BGW to honour SIGTERM; the Rust-side GOT_SIGTERM flag is a backup.
+        pg_sys::check_for_interrupts!();
+
         if BackgroundWorker::sigterm_received() {
-            pgrx::log!("sql_firewall: launcher shutting down");
+            pgrx::log!("sql_firewall: launcher received SIGTERM, shutting down");
             break;
         }
+
+        // Postmaster died – exit immediately
+        if (rc & pg_sys::WL_POSTMASTER_DEATH as i32) != 0 {
+            pgrx::log!("sql_firewall: postmaster died, launcher exiting");
+            break;
+        }
+
+        // Only perform the SPI scan once per scan_interval_secs
+        if last_scan.elapsed().as_secs() < scan_interval_secs {
+            continue;
+        }
+        last_scan = Instant::now();
         
         // Scan for databases and spawn workers
-        pgrx::log!("sql_firewall: launcher scanning databases...");
         let managed_clone = managed_dbs.clone();  // Clone for use in closure
         
         let scan_result = BackgroundWorker::transaction(move || {
-            pgrx::log!("sql_firewall: launcher inside transaction");
-            
+            let mut stale_oids = Vec::new();
             let mut new_databases = Vec::new();
+
+            // Prune stale managed workers:
+            // 1) Database no longer exists
+            // 2) Worker no longer appears active for that DB
+            for oid in &managed_clone {
+                let oid_u32 = u32::from(*oid);
+
+                let db_exists_query = format!(
+                    "SELECT EXISTS(SELECT 1 FROM pg_database WHERE oid = {} AND datallowconn = true AND datistemplate = false AND datname != 'postgres')",
+                    oid_u32
+                );
+
+                let worker_active_query = format!(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datid = {} AND backend_type LIKE 'sql_firewall_worker_%')",
+                    oid_u32
+                );
+
+                let db_exists = Spi::get_one::<bool>(&db_exists_query)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+
+                let worker_active = Spi::get_one::<bool>(&worker_active_query)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+
+                if !db_exists || !worker_active {
+                    stale_oids.push(*oid);
+                }
+            }
             
             // Build exclusion list for SQL - exclude managed databases from query
             let mut excluded_oids = String::new();
             for oid in &managed_clone {
+                if stale_oids.contains(oid) {
+                    continue;
+                }
                 if !excluded_oids.is_empty() {
                     excluded_oids.push(',');
                 }
@@ -48,45 +114,47 @@ pub extern "C-unwind" fn firewall_launcher_main(_arg: pg_sys::Datum) {
             }
             
             let query = if excluded_oids.is_empty() {
-                "SELECT oid::int4, datname::text FROM pg_database WHERE datallowconn = true AND datistemplate = false AND datname != 'postgres'".to_string()
+                "SELECT d.oid::int4, d.datname::text \
+                 FROM pg_database d \
+                 WHERE d.datallowconn = true AND d.datistemplate = false AND d.datname != 'postgres' \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM pg_stat_activity a \
+                     WHERE a.datid = d.oid AND a.backend_type LIKE 'sql_firewall_worker_%' \
+                 ) \
+                 ORDER BY d.oid \
+                 LIMIT 1".to_string()
             } else {
-                format!("SELECT oid::int4, datname::text FROM pg_database WHERE datallowconn = true AND datistemplate = false AND datname != 'postgres' AND oid NOT IN ({})", excluded_oids)
+                format!(
+                    "SELECT d.oid::int4, d.datname::text \
+                     FROM pg_database d \
+                     WHERE d.datallowconn = true AND d.datistemplate = false AND d.datname != 'postgres' \
+                     AND d.oid NOT IN ({}) \
+                     AND NOT EXISTS ( \
+                         SELECT 1 FROM pg_stat_activity a \
+                         WHERE a.datid = d.oid AND a.backend_type LIKE 'sql_firewall_worker_%' \
+                     ) \
+                     ORDER BY d.oid \
+                     LIMIT 1",
+                    excluded_oids
+                )
             };
             
-            pgrx::log!("sql_firewall: launcher executing SPI query: {}", query);
-            
-            // Fetch ALL new databases - repeatedly query until no more found
-            loop {
-                let results = Spi::get_two::<i32, String>(&query);
-                
-                if let Ok((Some(oid_i32), Some(name))) = results {
-                    let oid = pg_sys::Oid::from(oid_i32 as u32);
-                    
-                    // Check if already in our new_databases list this iteration
-                    if new_databases.iter().any(|(existing_oid, _)| *existing_oid == oid) {
-                        break; // We've cycled back, stop
-                    }
-                    
-                    pgrx::log!("sql_firewall: Found new DB '{}' (oid={})", name, oid);
-                    new_databases.push((oid, name.clone()));
-                    
-                    // Update exclusion list for next iteration
-                    if !excluded_oids.is_empty() {
-                        excluded_oids.push(',');
-                    }
-                    excluded_oids.push_str(&(oid_i32 as u32).to_string());
-                } else {
-                    break; // No more databases found
-                }
+            if let Ok((Some(oid_i32), Some(name))) = Spi::get_two::<i32, String>(&query) {
+                let oid = pg_sys::Oid::from(oid_i32 as u32);
+                pgrx::log!("sql_firewall: Found new DB '{}' (oid={})", name, oid);
+                new_databases.push((oid, name));
             }
             
-            pgrx::log!("sql_firewall: launcher found {} new databases", new_databases.len());
-            Ok::<Vec<(pg_sys::Oid, String)>, spi::Error>(new_databases)
+            Ok::<(Vec<pg_sys::Oid>, Vec<(pg_sys::Oid, String)>), spi::Error>((stale_oids, new_databases))
         });
         
         // Spawn workers for new databases
         match scan_result {
-            Ok(new_dbs) => {
+            Ok((stale_oids, new_dbs)) => {
+                for oid in stale_oids {
+                    managed_dbs.remove(&oid);
+                }
+
                 for (oid, name) in new_dbs {
                     pgrx::log!("sql_firewall: launcher spawning worker for database '{}' (oid={})", name, oid);
                     
@@ -104,12 +172,23 @@ pub extern "C-unwind" fn firewall_launcher_main(_arg: pg_sys::Datum) {
                         worker.bgw_name.as_mut_ptr() as *mut u8,
                         std::cmp::min(worker_name.len(), pg_sys::BGW_MAXLEN as usize - 1),
                     );
-                    
+
+                    // CRITICAL: Set bgw_type so pg_stat_activity.backend_type is populated.
+                    // Without this, backend_type stays as the default "background worker" and
+                    // the launcher's worker_active_query never finds the worker, causing it
+                    // to mark every managed DB as stale and re-spawn a new worker every second.
+                    // That flood of workers exhausts max_worker_processes and makes pg_ctl stop hang.
+                    std::ptr::copy_nonoverlapping(
+                        worker_name_cstr.as_ptr() as *const u8,
+                        worker.bgw_type.as_mut_ptr() as *mut u8,
+                        std::cmp::min(worker_name.len(), pg_sys::BGW_MAXLEN as usize - 1),
+                    );
+
                     // Worker needs shared memory and database connection
                     worker.bgw_flags = pg_sys::BGWORKER_SHMEM_ACCESS as i32 
                         | pg_sys::BGWORKER_BACKEND_DATABASE_CONNECTION as i32;
                     worker.bgw_start_time = pg_sys::BgWorkerStartTime::BgWorkerStart_RecoveryFinished;
-                    worker.bgw_restart_time = 10; // Restart after 10 seconds if crashes
+                    worker.bgw_restart_time = pg_sys::BGW_NEVER_RESTART;
                     
                     // Set library and function
                     std::ptr::copy_nonoverlapping(
@@ -138,7 +217,15 @@ pub extern "C-unwind" fn firewall_launcher_main(_arg: pg_sys::Datum) {
                     worker.bgw_extra[copy_len] = 0;
                     
                     worker.bgw_main_arg = pg_sys::Datum::from(0_usize); // Not used
-                    worker.bgw_notify_pid = pg_sys::MyProcPid;
+                    // Do NOT set bgw_notify_pid: if set to MyProcPid the
+                    // postmaster signals the launcher latch the instant the
+                    // worker process starts, causing wait_latch to return
+                    // before the new worker has had time to register in
+                    // pg_stat_activity.  The next scan would then find the
+                    // database "uncovered", spawn a duplicate, hit the
+                    // max_worker_processes limit, and crash.  Polling every
+                    // 1 s is sufficient for our use-case.
+                    worker.bgw_notify_pid = 0;
                     
                     // Register the dynamic worker
                     let mut handle: *mut pg_sys::BackgroundWorkerHandle = std::ptr::null_mut();
@@ -155,15 +242,6 @@ pub extern "C-unwind" fn firewall_launcher_main(_arg: pg_sys::Datum) {
             Err(e) => {
                 pgrx::warning!("sql_firewall: launcher scan failed: {:?}", e);
             }
-        }
-        
-        // Wait 1 second before next scan (shorter for faster shutdown)
-        BackgroundWorker::wait_latch(Some(Duration::from_secs(1)));
-        
-        // Check for shutdown signal immediately after wait
-        if BackgroundWorker::sigterm_received() {
-            pgrx::log!("sql_firewall: launcher received SIGTERM, shutting down");
-            break;
         }
     }
     
