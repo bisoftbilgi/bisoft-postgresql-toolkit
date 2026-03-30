@@ -135,15 +135,14 @@ sudo chown postgres:postgres /var/lib/pgsql/16/data/password_profile_blacklist.t
 echo "shared_preload_libraries = 'password_profile'" \
 | sudo tee -a /var/lib/pgsql/16/data/postgresql.conf
 
+# Enable in postgresql.conf
+echo \"shared_preload_libraries = 'password_profile_pure'\" | sudo tee -a /var/lib/pgsql/16/data/postgresql.conf
 sudo systemctl restart postgresql-16
 ```
 
-### Create Extension in Database
-
-```bash
-psql -d mydb -c "CREATE EXTENSION password_profile;"
-psql -d mydb -c "SELECT init_login_attempts_table();"
-```
+# Create in each database where you need it
+psql -d mydb -c \"CREATE EXTENSION password_profile_pure;\"
+psql -d mydb -c \"SELECT init_login_attempts_table();\"
 
 ### Load Common Password Blacklist
 

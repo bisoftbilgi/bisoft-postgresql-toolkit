@@ -1,0 +1,12 @@
+# Export target: parquet | postgresql | mysql | mariadb
+output_mode = "postgresql"
+
+# PostgreSQL config (output_mode=postgresql)
+db_url = "postgres://user:pass@localhost:5432/logs_db"
+db_table = "postgres_logs"
+hostname = "postgres-node-1"
+ip = "192.168.1.10"
+
+# Batch config
+flush_interval_secs = 10
+batch_size = 1000
