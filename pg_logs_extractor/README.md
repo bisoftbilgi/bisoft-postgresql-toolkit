@@ -31,7 +31,7 @@
 - [Security Notes](#security-notes)
 ## Overview
 
-`pg_logs_extractor` is a Logstash-based pipeline that reads PostgreSQL log files, classifies events (connection events and audit events), parses and normalizes fields, and writes the results into a destination PostgreSQL database via the JDBC output plugin.
+`pg_logs_extractor` is a Logstash-based pipeline that reads PostgreSQL log files, classifies events (connection events , audit events, error logs and autoxplain logs), parses and normalizes fields, and writes the results into a destination PostgreSQL database via the JDBC output plugin.
 
 It supports both single-source setups (one PostgreSQL instance writing logs into a single directory) and multi-source folder-based setups where each source is represented by a subfolder. In the folder-based mode, the pipeline derives a `server_id` from the log file path and enriches each event with `cluster_name`, `server_name`, and `server_ip` using a `servers.yml` mapping.
 
