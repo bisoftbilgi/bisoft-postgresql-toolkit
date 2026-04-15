@@ -211,6 +211,35 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   client_ip        TEXT,
   application_name TEXT
 );
+
+CREATE TABLE auto_explain_logs (
+    id SERIAL PRIMARY KEY,
+    log_time TIMESTAMPTZ,
+    username TEXT,
+    database_name TEXT,
+    client_ip TEXT,
+    duration_ms DOUBLE PRECISION,
+    sql_statement TEXT,   -- SELECT customer_id... buraya gelecek
+    execution_plan TEXT,  -- GroupAggregate... buraya gelecek
+    cluster_name TEXT,
+    server_name TEXT,
+    server_ip TEXT,
+    application_name TEXT
+);
+
+CREATE TABLE error_logs (
+    id SERIAL PRIMARY KEY,
+    log_time TIMESTAMPTZ,
+    username TEXT,
+    database_name TEXT,
+    client_ip TEXT,
+    error_level TEXT,
+    message_text TEXT,
+    cluster_name TEXT,
+    server_name TEXT,
+    server_ip TEXT,
+    application_name TEXT
+);
 ```   
 ## servers.yml Mapping
 
