@@ -130,13 +130,24 @@ log_line_prefix = '%m [%p] user=%u,db=%d, client_ip=%h app=%a '
 log_truncate_on_rotation = off
 
 # Load pgaudit and timescaledb extensions at server startup
-shared_preload_libraries = 'pgaudit,timescaledb'
+shared_preload_libraries = 'auto_explain,pgaudit,timescaledb'
 
 # Enable full audit logging (DDL, DML, etc.)
 pgaudit.log = 'all'
 
 # Skip catalog object logging (less noise)
 pgaudit.log_catalog = off
+
+# Log plans for queries taking longer than 1  ms
+auto_explain.log_min_duration: '1ms'
+
+# Include the SQL statement in the log
+auto_explain.log_analyze: on
+auto_explain.log_buffers: on
+auto_explain.log_timing: on
+auto_explain.log_verbose: on
+auto_explain.log_nested_statements: on
+
 ```
 ### Restart PostgreSQL
 
