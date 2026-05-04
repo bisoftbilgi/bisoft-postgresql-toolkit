@@ -1,0 +1,5 @@
+output_mode = "postgresql"
+db_url = "postgres://postgres:Bisoft2026!!@127.0.0.1:5433/postgres"
+hostname = "bfm01"
+log_pattern = "/var/log/postgresql/postgresql*.log"
+flush_interval_secs = 2
