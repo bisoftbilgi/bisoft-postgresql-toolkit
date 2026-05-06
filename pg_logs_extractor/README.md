@@ -31,7 +31,7 @@
 - [Security Notes](#security-notes)
 ## Overview
 
-`pg_logs_extractor` is a Logstash-based pipeline that reads PostgreSQL log files, classifies events (connection events and audit events), parses and normalizes fields, and writes the results into a destination PostgreSQL database via the JDBC output plugin.
+`pg_logs_extractor` is a Logstash-based pipeline that reads PostgreSQL log files, classifies events (connection events , audit events, error logs and autoxplain logs), parses and normalizes fields, and writes the results into a destination PostgreSQL database via the JDBC output plugin.
 
 It supports both single-source setups (one PostgreSQL instance writing logs into a single directory) and multi-source folder-based setups where each source is represented by a subfolder. In the folder-based mode, the pipeline derives a `server_id` from the log file path and enriches each event with `cluster_name`, `server_name`, and `server_ip` using a `servers.yml` mapping.
 
@@ -130,13 +130,24 @@ log_line_prefix = '%m [%p] user=%u,db=%d, client_ip=%h app=%a '
 log_truncate_on_rotation = off
 
 # Load pgaudit and timescaledb extensions at server startup
-shared_preload_libraries = 'pgaudit,timescaledb'
+shared_preload_libraries = 'auto_explain,pgaudit,timescaledb'
 
 # Enable full audit logging (DDL, DML, etc.)
 pgaudit.log = 'all'
 
 # Skip catalog object logging (less noise)
 pgaudit.log_catalog = off
+
+# Log plans for queries taking longer than 1  ms
+auto_explain.log_min_duration: '1ms'
+
+# Include the SQL statement in the log
+auto_explain.log_analyze: on
+auto_explain.log_buffers: on
+auto_explain.log_timing: on
+auto_explain.log_verbose: on
+auto_explain.log_nested_statements: on
+
 ```
 ### Restart PostgreSQL
 
@@ -210,6 +221,35 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   server_ip        TEXT,
   client_ip        TEXT,
   application_name TEXT
+);
+
+CREATE TABLE auto_explain_logs (
+    id SERIAL PRIMARY KEY,
+    log_time TIMESTAMPTZ,
+    username TEXT,
+    database_name TEXT,
+    client_ip TEXT,
+    duration_ms DOUBLE PRECISION,
+    sql_statement TEXT,   -- SELECT customer_id... buraya gelecek
+    execution_plan TEXT,  -- GroupAggregate... buraya gelecek
+    cluster_name TEXT,
+    server_name TEXT,
+    server_ip TEXT,
+    application_name TEXT
+);
+
+CREATE TABLE error_logs (
+    id SERIAL PRIMARY KEY,
+    log_time TIMESTAMPTZ,
+    username TEXT,
+    database_name TEXT,
+    client_ip TEXT,
+    error_level TEXT,
+    message_text TEXT,
+    cluster_name TEXT,
+    server_name TEXT,
+    server_ip TEXT,
+    application_name TEXT
 );
 ```   
 ## servers.yml Mapping
