@@ -7,6 +7,7 @@ use pgrx::prelude::*;
 use rand::Rng;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
+use std::ptr;
 use std::sync::Once;
 use std::time::Duration;
 
@@ -55,6 +56,93 @@ impl Drop for SpinLockGuard {
     fn drop(&mut self) {
         unsafe { pg_sys::SpinLockRelease(self.lock_ptr) }
     }
+}
+
+/// Name of the single named LWLock tranche that backs both the lock cache
+/// and the authentication event ring. A named tranche is requested during
+/// `shmem_request_hook` and its locks are retrieved from PostgreSQL-owned
+/// shared memory during `shmem_startup_hook` -- unlike the old
+/// `SpinLockGuard`, these locks put a waiting backend to sleep instead of
+/// busy-spinning, so a stuck holder can no longer trip PostgreSQL's
+/// stuck-spinlock detector and abort the process.
+const LWLOCK_TRANCHE_NAME: &CStr = c"password_profile_locks";
+const LWLOCK_TRANCHE_COUNT: c_int = 2;
+
+/// Lock guarding [`lock_cache::LOCK_CACHE`]. Populated by
+/// [`init_named_lwlock_tranche`]; null until then.
+pub(crate) static mut LOCK_CACHE_LWLOCK: *mut pg_sys::LWLock = ptr::null_mut();
+/// Lock guarding the auth event ring. Populated by
+/// [`init_named_lwlock_tranche`]; null until then.
+pub(crate) static mut AUTH_EVENT_LWLOCK: *mut pg_sys::LWLock = ptr::null_mut();
+
+pub(crate) enum LwLockMode {
+    Shared,
+    Exclusive,
+}
+
+/// RAII guard that acquires a named PostgreSQL LWLock on construction and
+/// releases it on drop (normal Rust scope exit).
+///
+/// # Safety / longjmp hazard
+/// Same rule as [`SpinLockGuard`]: never call SPI, `pgrx::error!()`,
+/// `pgrx::warning!()`, or anything else that can `longjmp` while a guard is
+/// live -- doing so skips the `Drop` impl and leaves the lock held forever.
+pub(crate) struct LwLockGuard {
+    lock_ptr: *mut pg_sys::LWLock,
+}
+
+impl LwLockGuard {
+    /// # Safety
+    /// `lock_ptr` must be a non-null pointer to an LWLock obtained from the
+    /// `password_profile_locks` named tranche after PostgreSQL has
+    /// initialized it (i.e. after [`init_named_lwlock_tranche`] has run).
+    pub(crate) unsafe fn acquire(lock_ptr: *mut pg_sys::LWLock, mode: LwLockMode) -> Self {
+        let raw_mode = match mode {
+            LwLockMode::Shared => pg_sys::LWLockMode::LW_SHARED,
+            LwLockMode::Exclusive => pg_sys::LWLockMode::LW_EXCLUSIVE,
+        };
+        pg_sys::LWLockAcquire(lock_ptr, raw_mode);
+        LwLockGuard { lock_ptr }
+    }
+}
+
+impl Drop for LwLockGuard {
+    fn drop(&mut self) {
+        // Mirrors pgrx's own `PgLwLock` guard (pgrx-0.16.1/src/lwlock.rs,
+        // `release_unless_elog_unwinding`): `LWLockAcquire` calls
+        // `HOLD_INTERRUPTS()`, so `InterruptHoldoffCount > 0` here in the
+        // normal case. If PostgreSQL's own error/interrupt handling has
+        // already unwound through this lock (resetting the holdoff count to
+        // zero as part of its cleanup), the lock has already been released
+        // by that cleanup and calling `LWLockRelease` again here would
+        // double-release it and corrupt PostgreSQL's per-process
+        // `held_lwlocks` bookkeeping.
+        unsafe {
+            if pg_sys::InterruptHoldoffCount > 0 {
+                pg_sys::LWLockRelease(self.lock_ptr);
+            }
+        }
+    }
+}
+
+/// Reserves space for the named LWLock tranche. Must run from
+/// `shmem_request_hook`, alongside `RequestAddinShmemSpace`.
+unsafe fn request_named_lwlock_tranche() {
+    pg_sys::RequestNamedLWLockTranche(LWLOCK_TRANCHE_NAME.as_ptr(), LWLOCK_TRANCHE_COUNT);
+}
+
+/// Retrieves the two locks PostgreSQL initialized for our named tranche and
+/// makes them available to postmaster children (via fork) and the
+/// background worker. Must run from `shmem_startup_hook`, after PostgreSQL
+/// has initialized the tranche -- never initialize an LWLock manually
+/// without a valid tranche.
+unsafe fn init_named_lwlock_tranche() {
+    let tranche = pg_sys::GetNamedLWLockTranche(LWLOCK_TRANCHE_NAME.as_ptr());
+    if tranche.is_null() {
+        pgrx::error!("password_profile: failed to retrieve named LWLock tranche");
+    }
+    LOCK_CACHE_LWLOCK = ptr::addr_of_mut!((*tranche.add(0)).lock);
+    AUTH_EVENT_LWLOCK = ptr::addr_of_mut!((*tranche.add(1)).lock);
 }
 
 static CLIENT_AUTH_HOOK_INIT: Once = Once::new();
@@ -194,7 +282,7 @@ fn check_lockout_from_db(username: &str) -> Option<i64> {
 
         Ok(table.first().get_one::<i64>()?)
     });
-    
+
     match result {
         Ok(Some(secs)) if secs > 0 => Some(secs),
         Ok(_) => None,
@@ -212,7 +300,7 @@ unsafe extern "C-unwind" fn client_auth_hook(port: *mut pg_sys::Port, status: c_
         if let Ok(username_str) = CStr::from_ptr(username_ptr).to_str() {
             let remaining_secs = unsafe { lock_cache::remaining_seconds(username_str) }
                 .or_else(|| check_lockout_from_db(username_str));
-            
+
             if let Some(seconds) = remaining_secs {
                 if seconds > 0 {
                     add_timing_jitter();
@@ -295,6 +383,7 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         pg_sys::RequestAddinShmemSpace(lock_cache::shared_memory_bytes());
         pg_sys::RequestAddinShmemSpace(blacklist::shared_memory_bytes());
         pg_sys::RequestAddinShmemSpace(auth_event::shared_memory_bytes());
+        request_named_lwlock_tranche();
     }
 
     PREV_SHMEM_REQUEST_HOOK = pg_sys::shmem_request_hook;
@@ -306,6 +395,7 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         if let Some(prev) = PREV_SHMEM_STARTUP_HOOK {
             prev();
         }
+        init_named_lwlock_tranche();
         lock_cache::init();
         blacklist::init();
         auth_event::init();
@@ -580,7 +670,7 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
     }
 
     let user_args = [text_arg(username)];
-    
+
     let min_length = Spi::get_one_with_args::<i32>(
         "SELECT COALESCE(
             (SELECT split_part(config, '=', 2)::int
@@ -590,8 +680,9 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
              LIMIT 1),
             current_setting('password_profile.min_length', false)::int
         )",
-        &user_args
-    )?.unwrap_or(PASSWORD_MIN_LENGTH.get());
+        &user_args,
+    )?
+    .unwrap_or(PASSWORD_MIN_LENGTH.get());
 
     let require_uppercase = Spi::get_one_with_args::<bool>(
         "SELECT COALESCE(
@@ -602,8 +693,9 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
              LIMIT 1),
             current_setting('password_profile.require_uppercase', false)::bool
         )",
-        &user_args
-    )?.unwrap_or(REQUIRE_UPPERCASE.get());
+        &user_args,
+    )?
+    .unwrap_or(REQUIRE_UPPERCASE.get());
 
     let require_lowercase = Spi::get_one_with_args::<bool>(
         "SELECT COALESCE(
@@ -614,8 +706,9 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
              LIMIT 1),
             current_setting('password_profile.require_lowercase', false)::bool
         )",
-        &user_args
-    )?.unwrap_or(REQUIRE_LOWERCASE.get());
+        &user_args,
+    )?
+    .unwrap_or(REQUIRE_LOWERCASE.get());
 
     let require_digit = Spi::get_one_with_args::<bool>(
         "SELECT COALESCE(
@@ -626,8 +719,9 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
              LIMIT 1),
             current_setting('password_profile.require_digit', false)::bool
         )",
-        &user_args
-    )?.unwrap_or(REQUIRE_DIGIT.get());
+        &user_args,
+    )?
+    .unwrap_or(REQUIRE_DIGIT.get());
 
     let require_special = Spi::get_one_with_args::<bool>(
         "SELECT COALESCE(
@@ -638,8 +732,9 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
              LIMIT 1),
             current_setting('password_profile.require_special', false)::bool
         )",
-        &user_args
-    )?.unwrap_or(REQUIRE_SPECIAL.get());
+        &user_args,
+    )?
+    .unwrap_or(REQUIRE_SPECIAL.get());
 
     let prevent_username = Spi::get_one_with_args::<bool>(
         "SELECT COALESCE(
@@ -650,8 +745,9 @@ fn check_password(username: &str, password: &str) -> Result<String, Box<dyn std:
              LIMIT 1),
             current_setting('password_profile.prevent_username', false)::bool
         )",
-        &user_args
-    )?.unwrap_or(PREVENT_USERNAME.get());
+        &user_args,
+    )?
+    .unwrap_or(PREVENT_USERNAME.get());
 
     if password.len() < min_length as usize {
         add_timing_jitter();
@@ -868,7 +964,7 @@ fn record_failed_login(username: &str) -> Result<String, Box<dyn std::error::Err
         &username_arg,
     )?
     .unwrap_or(false);
-    
+
     if is_super {
         return Ok("Superuser bypassed".to_string());
     }
@@ -886,7 +982,7 @@ fn record_failed_login(username: &str) -> Result<String, Box<dyn std::error::Err
         &username_arg,
     )?
     .unwrap_or(false);
-    
+
     if bypass {
         return Ok("Bypassed failed login tracking".to_string());
     }
@@ -965,7 +1061,10 @@ fn clear_login_attempts(username: &str) -> Result<String, Box<dyn std::error::Er
     Ok("Login attempts cleared".to_string())
 }
 
-fn clear_login_attempts_internal(username: &str, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn clear_login_attempts_internal(
+    username: &str,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if force {
         Spi::run_with_args(
             "DELETE FROM password_profile.login_attempts WHERE username = $1",
@@ -1057,7 +1156,7 @@ fn record_password_change(
     let pwd_hash =
         hash(new_password, cost).map_err(|e| format!("Failed to hash password: {}", e))?;
     Spi::run_with_args(
-        "INSERT INTO password_profile.password_history (username, password_hash, changed_at) 
+        "INSERT INTO password_profile.password_history (username, password_hash, changed_at)
          VALUES ($1, $2, now())",
         &[text_arg(username), text_arg(&pwd_hash)],
     )?;
@@ -1129,9 +1228,7 @@ fn remove_from_blacklist(password: &str) -> Result<String, Box<dyn std::error::E
 }
 
 #[pg_extern]
-fn load_blacklist_from_file(
-    file_path: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn load_blacklist_from_file(file_path: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
@@ -1140,13 +1237,13 @@ fn load_blacklist_from_file(
         p.to_string()
     } else {
         // Try to get PGDATA
-        let pgdata = std::env::var("PGDATA").unwrap_or_else(|_| "/var/lib/pgsql/16/data".to_string());
+        let pgdata =
+            std::env::var("PGDATA").unwrap_or_else(|_| "/var/lib/pgsql/16/data".to_string());
         format!("{}/password_profile_blacklist.txt", pgdata)
     };
 
-    let file = File::open(&path).map_err(|e| {
-        format!("Failed to open blacklist file '{}': {}", path, e)
-    })?;
+    let file = File::open(&path)
+        .map_err(|e| format!("Failed to open blacklist file '{}': {}", path, e))?;
 
     let reader = BufReader::new(file);
     let mut count = 0;

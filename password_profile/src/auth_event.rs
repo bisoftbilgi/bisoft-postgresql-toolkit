@@ -1,4 +1,4 @@
-use crate::{encode_username, SpinLockGuard, LOCK_USERNAME_BYTES};
+use crate::{encode_username, LwLockGuard, LwLockMode, AUTH_EVENT_LWLOCK, LOCK_USERNAME_BYTES};
 use pgrx::pg_sys;
 use std::ptr;
 
@@ -12,7 +12,6 @@ pub(crate) struct SharedAuthEvent {
 
 #[repr(C)]
 struct AuthEventRing {
-    lock: pg_sys::slock_t,
     head: u32,
     tail: u32,
     dropped: u64,
@@ -43,8 +42,6 @@ pub(crate) unsafe fn init() {
     }
 
     if !found {
-        (*ring_ptr).lock = 0;
-        pg_sys::SpinLockInit(&mut (*ring_ptr).lock);
         (*ring_ptr).head = 0;
         (*ring_ptr).tail = 0;
         (*ring_ptr).dropped = 0;
@@ -66,18 +63,21 @@ pub(crate) unsafe fn init() {
 
 pub(crate) fn enqueue(username: &str, is_failure: bool) {
     unsafe {
-        if AUTH_EVENT_RING.is_null() {
+        if AUTH_EVENT_RING.is_null() || AUTH_EVENT_LWLOCK.is_null() {
             pgrx::warning!("password_profile: auth event ring not initialized");
             return;
         }
 
         let encoded = encode_username(username);
+        // Computed before acquiring the ring lock so the protected region
+        // only ever touches fixed ring state (Phase 4).
+        let now = pg_sys::GetCurrentTimestamp();
         let ring = &mut *AUTH_EVENT_RING;
 
         let mut dropped_event = false;
 
         {
-            let _guard = SpinLockGuard::new(&mut ring.lock);
+            let _guard = LwLockGuard::acquire(AUTH_EVENT_LWLOCK, LwLockMode::Exclusive);
             let next_head = (ring.head + 1) % crate::AUTH_EVENT_RING_SIZE as u32;
             if next_head == ring.tail {
                 ring.tail = (ring.tail + 1) % crate::AUTH_EVENT_RING_SIZE as u32;
@@ -87,7 +87,7 @@ pub(crate) fn enqueue(username: &str, is_failure: bool) {
 
             ring.events[ring.head as usize] = SharedAuthEvent {
                 username: encoded,
-                timestamp: pg_sys::GetCurrentTimestamp(),
+                timestamp: now,
                 is_failure,
             };
             ring.head = next_head;
@@ -101,14 +101,14 @@ pub(crate) fn enqueue(username: &str, is_failure: bool) {
 
 pub(crate) fn dequeue() -> Option<SharedAuthEvent> {
     unsafe {
-        if AUTH_EVENT_RING.is_null() {
+        if AUTH_EVENT_RING.is_null() || AUTH_EVENT_LWLOCK.is_null() {
             return None;
         }
 
         let mut event = None;
         {
             let ring = &mut *AUTH_EVENT_RING;
-            let _guard = SpinLockGuard::new(&mut ring.lock);
+            let _guard = LwLockGuard::acquire(AUTH_EVENT_LWLOCK, LwLockMode::Exclusive);
             if ring.tail != ring.head {
                 event = Some(ring.events[ring.tail as usize]);
                 ring.tail = (ring.tail + 1) % crate::AUTH_EVENT_RING_SIZE as u32;

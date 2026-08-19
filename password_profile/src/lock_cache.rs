@@ -1,5 +1,8 @@
 use crate::sql::{spi_update, text_arg};
-use crate::{encode_username, SpinLockGuard, LOCK_CACHE_SIZE, LOCK_USERNAME_BYTES, MICROS_PER_SEC};
+use crate::{
+    encode_username, LwLockGuard, LwLockMode, LOCK_CACHE_LWLOCK, LOCK_CACHE_SIZE,
+    LOCK_USERNAME_BYTES, MICROS_PER_SEC,
+};
 use pgrx::pg_sys;
 use pgrx::spi::Spi;
 use std::error::Error;
@@ -23,7 +26,6 @@ impl LockEntry {
 
 #[repr(C)]
 pub(crate) struct LockCache {
-    pub(crate) lock: pg_sys::slock_t,
     pub(crate) entries: [LockEntry; LOCK_CACHE_SIZE],
 }
 
@@ -51,8 +53,6 @@ pub(crate) unsafe fn init() {
     }
 
     if !found {
-        (*cache_ptr).lock = 0;
-        pg_sys::SpinLockInit(&mut (*cache_ptr).lock);
         for entry in (*cache_ptr).entries.iter_mut() {
             entry.username = [0; LOCK_USERNAME_BYTES];
             entry.expires_at = 0;
@@ -69,7 +69,7 @@ pub(crate) unsafe fn init() {
 }
 
 pub(crate) unsafe fn set(username: &str, expires_at: pg_sys::TimestampTz) {
-    if LOCK_CACHE.is_null() {
+    if LOCK_CACHE.is_null() || LOCK_CACHE_LWLOCK.is_null() {
         pgrx::log!(
             "password_profile: lock_cache_set skipped (cache not initialized) for {}",
             username
@@ -87,13 +87,16 @@ pub(crate) unsafe fn set(username: &str, expires_at: pg_sys::TimestampTz) {
     enum CacheOp {
         Updated,
         Inserted,
-        Evicted(String),
+        // Fixed-size byte copy of the evicted username; converted to a
+        // `String` only after the lock is released (Phase 4: no allocation
+        // while protected).
+        Evicted([u8; LOCK_USERNAME_BYTES]),
         OverwriteSlot0,
     }
     let operation: CacheOp;
 
     {
-        let _guard = SpinLockGuard::new(&mut cache.lock);
+        let _guard = LwLockGuard::acquire(LOCK_CACHE_LWLOCK, LwLockMode::Exclusive);
 
         if let Some(entry) = cache
             .entries
@@ -111,13 +114,10 @@ pub(crate) unsafe fn set(username: &str, expires_at: pg_sys::TimestampTz) {
             entry.expires_at = expires_at;
             operation = CacheOp::Inserted;
         } else if let Some(oldest_entry) = cache.entries.iter_mut().min_by_key(|e| e.expires_at) {
-            let old_username = std::str::from_utf8(&oldest_entry.username)
-                .unwrap_or("(invalid)")
-                .trim_end_matches('\0')
-                .to_string();
+            let old_username_bytes = oldest_entry.username;
             oldest_entry.username = encoded;
             oldest_entry.expires_at = expires_at;
-            operation = CacheOp::Evicted(old_username);
+            operation = CacheOp::Evicted(old_username_bytes);
         } else {
             cache.entries[0].username = encoded;
             cache.entries[0].expires_at = expires_at;
@@ -136,11 +136,15 @@ pub(crate) unsafe fn set(username: &str, expires_at: pg_sys::TimestampTz) {
             username,
             expires_at
         ),
-        CacheOp::Evicted(old_user) => {
+        CacheOp::Evicted(old_bytes) => {
+            let old_username = std::str::from_utf8(&old_bytes)
+                .unwrap_or("(invalid)")
+                .trim_end_matches('\0')
+                .to_string();
             pgrx::warning!(
                 "password_profile: LockCache full ({} entries), evicting oldest entry: {}",
                 LOCK_CACHE_SIZE,
-                old_user
+                old_username
             );
             pgrx::log!(
                 "password_profile: lock cache evicted and set user={} expires_at={}",
@@ -157,14 +161,14 @@ pub(crate) unsafe fn set(username: &str, expires_at: pg_sys::TimestampTz) {
 }
 
 pub(crate) unsafe fn clear(username: &str) {
-    if LOCK_CACHE.is_null() {
+    if LOCK_CACHE.is_null() || LOCK_CACHE_LWLOCK.is_null() {
         return;
     }
     let encoded = encode_username(username);
     let cache = &mut *LOCK_CACHE;
 
     {
-        let _guard = SpinLockGuard::new(&mut cache.lock);
+        let _guard = LwLockGuard::acquire(LOCK_CACHE_LWLOCK, LwLockMode::Exclusive);
 
         for entry in cache.entries.iter_mut() {
             if entry.username[0] != 0 && entry.username == encoded {
@@ -177,19 +181,19 @@ pub(crate) unsafe fn clear(username: &str) {
 }
 
 pub(crate) unsafe fn remaining_seconds(username: &str) -> Option<i64> {
-    if LOCK_CACHE.is_null() {
+    if LOCK_CACHE.is_null() || LOCK_CACHE_LWLOCK.is_null() {
         return None;
     }
 
     // CRITICAL: NO catch_unwind - conflicts with PostgreSQL signal handling!
-    // Spinlock operations are panic-safe via RAII guard
+    // Lock operations are panic-safe via RAII guard
     let encoded = encode_username(username);
-    let cache = &mut *LOCK_CACHE;
+    let cache = &*LOCK_CACHE;
     let now = pg_sys::GetCurrentTimestamp();
     let mut remaining = None;
 
     {
-        let _guard = SpinLockGuard::new(&mut cache.lock);
+        let _guard = LwLockGuard::acquire(LOCK_CACHE_LWLOCK, LwLockMode::Shared);
 
         for entry in cache.entries.iter() {
             if entry.username[0] == 0 {
@@ -204,7 +208,10 @@ pub(crate) unsafe fn remaining_seconds(username: &str) -> Option<i64> {
 
     let filtered = remaining.filter(|secs| *secs > 0);
     if filtered.is_none() {
-        pgrx::log!(
+        // This is the normal, expected outcome for every unlocked login and
+        // fires on the per-connection hot path, so it stays at DEBUG1
+        // (disabled by default) rather than flooding the LOG level.
+        pgrx::debug1!(
             "password_profile: lock cache miss for {} (entry expired or not present)",
             username
         );
@@ -271,11 +278,14 @@ pub(crate) fn sync(username: &str, max_fails: i32) -> Result<(), Box<dyn Error>>
 pub(crate) fn collect_stats() -> Result<Vec<(String, i64, String)>, Box<dyn Error>> {
     let mut stats = Vec::new();
 
-    unsafe {
-        if !LOCK_CACHE.is_null() {
+    // Only primitive numeric counters are computed while the lock is held;
+    // all Vec/String construction happens afterward (Phase 4: no allocation
+    // while protected).
+    let cache_counts: Option<(i64, i64)> = unsafe {
+        if !LOCK_CACHE.is_null() && !LOCK_CACHE_LWLOCK.is_null() {
             let cache = &*LOCK_CACHE;
             let now = pg_sys::GetCurrentTimestamp();
-            let _guard = SpinLockGuard::new(&mut (*LOCK_CACHE).lock);
+            let _guard = LwLockGuard::acquire(LOCK_CACHE_LWLOCK, LwLockMode::Shared);
 
             let active_count = cache
                 .entries
@@ -285,6 +295,14 @@ pub(crate) fn collect_stats() -> Result<Vec<(String, i64, String)>, Box<dyn Erro
 
             let used_count = cache.entries.iter().filter(|e| e.username[0] != 0).count() as i64;
 
+            Some((active_count, used_count))
+        } else {
+            None
+        }
+    };
+
+    match cache_counts {
+        Some((active_count, used_count)) => {
             stats.push((
                 "lock_cache_total_size".to_string(),
                 LOCK_CACHE_SIZE as i64,
@@ -314,7 +332,8 @@ pub(crate) fn collect_stats() -> Result<Vec<(String, i64, String)>, Box<dyn Erro
                 (used_count * 100) / (LOCK_CACHE_SIZE as i64),
                 "Cache utilization percentage".to_string(),
             ));
-        } else {
+        }
+        None => {
             stats.push((
                 "lock_cache_status".to_string(),
                 0,
